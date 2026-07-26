@@ -24,7 +24,8 @@ import yaml
 import db as histdb
 import paths
 from models import Opportunity
-from quality import evidence_rejection, is_tradeable
+from quality import (evidence_rejection, is_tradeable,
+                     tradeability_rejection)
 from report import write_report
 from scrapers import ALL_SCRAPERS
 from valuation import ValuationEngine
@@ -318,7 +319,8 @@ def plan_targeted_comp_queries(listings: list, engine: ValuationEngine,
     ]
 
 
-def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportunity]:
+def run_live(config: dict, engine: ValuationEngine, mode: str,
+             diagnostics: dict | None = None) -> list[Opportunity]:
     sites = config.get("sites", ["ebay"])
     max_results = config.get("scraping", {}).get("max_results_per_query", 40)
     flt = config.get("filters", {})
@@ -461,6 +463,12 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
     # tabs may still show these rows, but trends and learning never see them.
     import collections
     evidence_skips: collections.Counter = collections.Counter()
+    relevance_skips: collections.Counter = collections.Counter()
+    raw_by_site: collections.Counter = collections.Counter(
+        listing.site
+        for _, _, _, listings in results
+        for listing in listings)
+    raw_count = sum(raw_by_site.values())
     n_comp_junk = [0]        # list so the loop below can accumulate into it
     t_val = time.monotonic()
     prepared = []
@@ -505,32 +513,41 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
             m = histdb.ITEM_ID_RE.search(listing.url or "")
             key = m.group(1) if m else (listing.listing_id or listing.url)
             if key in seen_ids:
+                relevance_skips["duplicate within query"] += 1
                 continue
             seen_ids.add(key)
             if _excluded(listing.title, exclude):
+                relevance_skips["excluded keyword"] += 1
                 continue
             # relevance guard: wrong grade or barely-matching title = out
             # (Japanese titles can't fuzzy-match English; they're exempt
             # and handled by the engine's JP confidence rule instead)
             if grade_conflict(query, listing.title):
+                relevance_skips["grade conflict"] += 1
                 continue
             # foreign-language versions price differently - not our market
             if listing.site != "yahoo_jp" and language_conflict(query, listing.title):
+                relevance_skips["language conflict"] += 1
                 continue
             # holo/non-holo, 1st ed/unlimited/shadowless = different cards
             if variant_conflict(query, listing.title):
+                relevance_skips["variant conflict"] += 1
                 continue
             if (listing.site != "yahoo_jp" and not discovery
                     and not listing.misspell_from):  # typo'd titles can't match
                 # wrong-subject guard: a Magneton is not a Gengar no matter
                 # how well the set/grade context matches
                 if subject_missing(query, listing.title):
+                    relevance_skips["wrong subject"] += 1
                     continue
                 if title_match_score(query, listing.title) < min_match:
+                    relevance_skips["title match below threshold"] += 1
                     continue
             if cap and listing.total_cost_now > cap:
+                relevance_skips["over query price cap"] += 1
                 continue
             if listing.total_cost_now > price_max:
+                relevance_skips["over global price cap"] += 1
                 continue
             listing.priority = priority
             listing.discovery = discovery
@@ -687,6 +704,29 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
                  "(%s)", sum(evidence_skips.values()),
                  "; ".join(f"{reason} x{n}"
                            for reason, n in evidence_skips.most_common()))
+    relevant_count = sum(len(rows) for _, _, rows, _ in prepared)
+    if diagnostics is not None:
+        diagnostics.update({
+            "queries": len(plans),
+            "raw_listings": raw_count,
+            "raw_by_site": dict(raw_by_site),
+            "relevance_removed": sum(relevance_skips.values()),
+            "relevance_reasons": dict(relevance_skips),
+            "relevant_listings": relevant_count,
+            "valued_listings": len(opps),
+            "evidence_quarantined": sum(evidence_skips.values()),
+            "evidence_reasons": dict(evidence_skips),
+            "comp_junk_removed": n_comp_junk[0],
+        })
+    log.info(
+        "scan funnel: %d raw listing hits -> %d relevant -> %d valued "
+        "(sources: %s; relevance drops: %s)",
+        raw_count, relevant_count, len(opps),
+        ", ".join(f"{site}={count}"
+                  for site, count in sorted(raw_by_site.items())) or "none",
+        "; ".join(f"{reason} x{count}"
+                  for reason, count in relevance_skips.most_common())
+        or "none")
     if comps_mod.UNPARSEABLE_GRADES:
         log.info("grade parser: ignored %d impossible grade token(s): %s",
                  sum(comps_mod.UNPARSEABLE_GRADES.values()),
@@ -709,6 +749,105 @@ def run_demo(config: dict, engine: ValuationEngine) -> list[Opportunity]:
         for listing in demo_data.demo_listings(query):
             opps.append(engine.evaluate(listing, comps))
     return opps
+
+
+def classify_report_rows(opps: list[Opportunity], config: dict
+                         ) -> tuple[list[Opportunity], list[dict], dict]:
+    """Apply report filters once, preserving every rejected valued row.
+
+    Decision tabs remain strict.  The returned research records explain why
+    a valued listing disappeared before the workbook, and also identify rows
+    that remain browsable but are quarantined from Action/Today/alerts.
+    """
+    import collections
+
+    min_value = config.get("filters", {}).get("min_value", 0)
+    by_cat = config.get("filters", {}).get("min_value_by_category") or {}
+    max_roi = config.get("filters", {}).get("max_roi", 2.0)
+    min_ev = config.get("output", {}).get("min_expected_value", 0)
+    poke_floor = config.get("filters", {}).get("pokemon_grade_floor", 3.0)
+    max_rows = config.get("output", {}).get("max_rows", 1000)
+
+    counts: collections.Counter = collections.Counter()
+    reasons: collections.Counter = collections.Counter()
+    research: list[dict] = []
+    kept: list[Opportunity] = []
+
+    def reject(o: Opportunity, stage: str, reason: str) -> None:
+        counts[stage] += 1
+        reasons[reason] += 1
+        research.append({
+            "stage": stage,
+            "reason": reason,
+            "opportunity": o,
+        })
+
+    for o in opps:
+        floor = max(
+            by_cat.get(_category(o.listing.query), min_value), 0.01)
+        if o.valuation.fair_value < floor:
+            reject(
+                o, "Fair-value floor",
+                "fair value $%s below %s floor $%s" % (
+                    f"{o.valuation.fair_value:,.0f}",
+                    _category(o.listing.query),
+                    f"{floor:,.0f}"))
+            continue
+        if o.valuation.roi > max_roi:
+            reject(
+                o, "ROI sanity ceiling",
+                "ROI %.0f%% above %.0f%% ceiling"
+                % (o.valuation.roi * 100, max_roi * 100))
+            continue
+
+        collection_drops: collections.Counter = collections.Counter()
+        if not collection_ok(o, config, drops=collection_drops):
+            reason = next(iter(collection_drops), "outside collection standards")
+            reject(o, "Collection standards", reason)
+            continue
+
+        output_drops: collections.Counter = collections.Counter()
+        if not output_ok(
+                o, min_ev=min_ev, poke_floor=poke_floor,
+                drops=output_drops):
+            reason = next(iter(output_drops), "output rule")
+            reject(o, "Output economics", reason)
+            continue
+        kept.append(o)
+
+    if len(kept) > max_rows:
+        grails = [o for o in kept if o.listing.grail]
+        ranked = sorted(
+            (o for o in kept if not o.listing.grail),
+            key=lambda o: o.valuation.opportunity_score,
+            reverse=True)
+        keep_ids = {
+            id(o) for o in
+            grails + ranked[:max(0, max_rows - len(grails))]
+        }
+        trimmed = [o for o in kept if id(o) not in keep_ids]
+        kept = [o for o in kept if id(o) in keep_ids]
+        for o in trimmed:
+            reject(o, "Report row cap", "below configured report row cap")
+
+    # A row can remain visible in a category or Grails tab but still be
+    # barred from Action/Today/alerts.  Put a copy in Research/Filtered so
+    # an empty Action tab always has a row-by-row explanation.
+    for o in kept:
+        reason = tradeability_rejection(o)
+        if reason:
+            research.append({
+                "stage": "Decision-only quarantine",
+                "reason": reason,
+                "opportunity": o,
+            })
+            counts["Decision-only quarantine"] += 1
+            reasons[reason] += 1
+
+    return kept, research, {
+        "stage_counts": dict(counts),
+        "reason_counts": dict(reasons),
+    }
 
 
 def main() -> int:
@@ -842,8 +981,23 @@ def main() -> int:
         return 0
 
     engine = ValuationEngine(config)
+    scan_diagnostics: dict = {}
     opps = (run_demo(config, engine) if args.demo
-            else run_live(config, engine, args.mode))
+            else run_live(
+                config, engine, args.mode, diagnostics=scan_diagnostics))
+    if args.demo:
+        scan_diagnostics.update({
+            "queries": len(getattr(__import__("demo_data"), "MARKET", {})),
+            "raw_listings": len(opps),
+            "raw_by_site": {"demo": len(opps)},
+            "relevance_removed": 0,
+            "relevance_reasons": {},
+            "relevant_listings": len(opps),
+            "valued_listings": len(opps),
+            "evidence_quarantined": 0,
+            "evidence_reasons": {},
+            "comp_junk_removed": 0,
+        })
     health_rows = []
     if not args.demo:
         try:
@@ -859,80 +1013,118 @@ def main() -> int:
         except Exception:
             log.exception("source-health snapshot failed - continuing")
 
-    # The report shows the whole ranked book (everything above the fair-value
-    # floor), not just positive-EV rows - alerts remain strictly gated, and
-    # EV/score columns make the winners obvious.
-    min_value = config.get("filters", {}).get("min_value", 0)
-    max_rows = config.get("output", {}).get("max_rows", 1000)
-    # ROI above this is almost always a data error (wrong variant, mixed
-    # comps, typo'd price) rather than a real deal - drop as too-good-to-be-true
-    max_roi = config.get("filters", {}).get("max_roi", 2.0)
-    # Per-category value floor: a sealed graded NES game worth $400 is a
-    # real opportunity even though $400 would be noise for a card. Games
-    # keep their own (lower) floor; the quality bar for them is sealed or
-    # graded, enforced in collection_ok - not the dollar amount.
-    by_cat = config.get("filters", {}).get("min_value_by_category") or {}
+    valued_opps = list(opps)
+    kept, research_rows, report_diagnostics = classify_report_rows(
+        valued_opps, config)
+    stage_counts = report_diagnostics["stage_counts"]
 
-    def _floor(o):
-        return max(by_cat.get(_category(o.listing.query), min_value), 0.01)
+    raw = int(scan_diagnostics.get("raw_listings", len(valued_opps)))
+    relevant = int(scan_diagnostics.get(
+        "relevant_listings", len(valued_opps)))
+    valued = len(valued_opps)
+    remaining = valued
+    waterfall_rows = [{
+        "stage": "Raw marketplace hits",
+        "starting": raw,
+        "removed": 0,
+        "remaining": raw,
+        "detail": ", ".join(
+            f"{site}={count}" for site, count in sorted(
+                (scan_diagnostics.get("raw_by_site") or {}).items()))
+            or "no source returned listings",
+    }, {
+        "stage": "Relevance and identity",
+        "starting": raw,
+        "removed": max(0, raw - relevant),
+        "remaining": relevant,
+        "detail": "; ".join(
+            f"{reason} x{count}" for reason, count in sorted(
+                (scan_diagnostics.get("relevance_reasons") or {}).items(),
+                key=lambda item: -item[1])) or "none",
+    }, {
+        "stage": "Valuation completed",
+        "starting": relevant,
+        "removed": max(0, relevant - valued),
+        "remaining": valued,
+        "detail": "sold comps / guides / cost and exit economics evaluated",
+    }]
+    for stage in (
+            "Fair-value floor", "ROI sanity ceiling",
+            "Collection standards", "Output economics", "Report row cap"):
+        removed = int(stage_counts.get(stage, 0))
+        waterfall_rows.append({
+            "stage": stage,
+            "starting": remaining,
+            "removed": removed,
+            "remaining": remaining - removed,
+            "detail": "; ".join(
+                f"{reason} x{count}"
+                for reason, count in
+                report_diagnostics["reason_counts"].items()
+                if any(row["stage"] == stage and row["reason"] == reason
+                       for row in research_rows)) or "none",
+        })
+        remaining -= removed
+    waterfall_rows.extend([{
+        "stage": "Final workbook rows",
+        "starting": remaining,
+        "removed": 0,
+        "remaining": len(kept),
+        "detail": "kept in category/Grails tabs",
+    }, {
+        "stage": "Evidence-only quarantine",
+        "starting": valued,
+        "removed": int(scan_diagnostics.get(
+            "evidence_quarantined", 0)),
+        "remaining": valued,
+        "detail": "does not remove workbook rows; blocks learning/history: "
+                  + ("; ".join(
+                      f"{reason} x{count}" for reason, count in sorted(
+                          (scan_diagnostics.get("evidence_reasons")
+                           or {}).items(),
+                          key=lambda item: -item[1])) or "none"),
+    }, {
+        "stage": "Decision-only quarantine",
+        "starting": len(kept),
+        "removed": int(stage_counts.get(
+            "Decision-only quarantine", 0)),
+        "remaining": len(kept) - int(stage_counts.get(
+            "Decision-only quarantine", 0)),
+        "detail": "still browsable; blocked from Action/Today/alerts",
+    }])
 
-    dropped_tgtbt = sum(1 for o in opps if o.valuation.roi > max_roi)
-    kept = [o for o in opps
-            if o.valuation.fair_value >= _floor(o)
-            and o.valuation.roi <= max_roi]
-    if dropped_tgtbt:
-        log.info("dropped %d too-good-to-be-true rows (ROI > %.0f%%)",
-                 dropped_tgtbt, max_roi * 100)
-
-    # Andrew's output rules - the report only shows actionable rows:
-    #  - NOTHING with negative expected value, any listing type (config:
-    #    output.min_expected_value, default 0)
-    #  - pure auctions (no buy-it-now option) need >= 1 bid: with zero bids
-    #    the "current price" is just the seller's opening ask, not a market.
-    #    Hybrid auction+BIN rows are exempt (the BIN is takeable), and so is
-    #    yahoo_jp (Buyee does not expose bid counts).
-    min_ev = config.get("output", {}).get("min_expected_value", 0)
-    # Pokemon grade floor (Andrew's rule): graded Pokemon cards at an
-    # effective PSA 3 or below are never interesting - drop them. Applies
-    # to Pokemon ONLY (sports/games/watches untouched), grails exempt,
-    # ungraded listings unaffected (they're assumed PSA 5 and can be raw
-    # gems). Effective grade means shift applied: a CGC 4 (= PSA 3) drops.
-    poke_floor = config.get("filters", {}).get("pokemon_grade_floor", 3.0)
-
-    import collections
-    drops: collections.Counter = collections.Counter()
-    if not kept and opps:
-        # nothing got a usable fair value: valuation sources are broken -
-        # this is a diagnosis problem, not "no deals"
-        log.warning("no rows had usable fair values - check valuation "
-                    "sources in the log above")
-    n_before = len(kept)
-    kept = [o for o in kept if collection_ok(o, config, drops=drops)]
-    kept = [o for o in kept
-            if output_ok(o, min_ev=min_ev, poke_floor=poke_floor, drops=drops)]
-    if n_before != len(kept):
-        log.info("output rules dropped %d rows: %s", n_before - len(kept),
-                 "; ".join(f"{reason} x{n}"
-                           for reason, n in drops.most_common()))
-    log.info("report: %d actionable rows", len(kept))
-    if len(kept) > max_rows:   # trim lowest-scoring rows, keep the best
-        # grails are never trimmed - their value isn't the score column
-        g = [o for o in kept if o.listing.grail]
-        rest = sorted((o for o in kept if not o.listing.grail),
-                      key=lambda o: o.valuation.opportunity_score,
-                      reverse=True)[:max(0, max_rows - len(g))]
-        kept = g + rest
+    log.info(
+        "filter waterfall: raw %d -> relevant %d -> valued %d -> "
+        "fair floor %d -> ROI %d -> collection %d -> output %d -> "
+        "row cap %d -> final %d",
+        raw, relevant, valued,
+        stage_counts.get("Fair-value floor", 0),
+        stage_counts.get("ROI sanity ceiling", 0),
+        stage_counts.get("Collection standards", 0),
+        stage_counts.get("Output economics", 0),
+        stage_counts.get("Report row cap", 0), len(kept))
+    if report_diagnostics["reason_counts"]:
+        log.info(
+            "filter reasons: %s",
+            "; ".join(
+                f"{reason} x{count}" for reason, count in sorted(
+                    report_diagnostics["reason_counts"].items(),
+                    key=lambda item: -item[1])))
+    log.info(
+        "report: %d kept row(s), %d decision-tradeable, "
+        "%d Research/Filtered explanation row(s)",
+        len(kept),
+        len(kept) - int(stage_counts.get(
+            "Decision-only quarantine", 0)),
+        len(research_rows))
     if not kept:
-        # NEVER pad the report with non-actionable rows - an empty run is
-        # an honest answer ("no deals right now"), not an error
-        if opps:
-            log.info("scanned %d listings; none passed the output rules "
-                     "(positive EV, bids on pure auctions) - no actionable "
-                     "deals this run", len(opps))
+        if valued_opps:
+            log.info("scanned %d valued listings; none passed the strict "
+                     "decision/output rules - writing a diagnostic workbook",
+                     len(valued_opps))
         else:
-            log.error("nothing scanned at all - check network/API keys/"
-                      "scan.log")
-        return 1
+            log.error("nothing scanned at all - writing source-health "
+                      "diagnostics; check network/API keys/scan.log")
 
     out = args.output or config.get("output", {}).get("file", "opportunities.xlsx")
     # portfolio: mark positions to market with this run's fair values,
@@ -954,11 +1146,13 @@ def main() -> int:
             portfolio_rows = pf.build_rows(config, fairs, pf_dir)
         except Exception:
             log.exception("portfolio marking failed - continuing")
-    write_report(kept, out, portfolio=portfolio_rows, config=config,
-                 source_health=health_rows)
+    write_report(
+        kept, out, portfolio=portfolio_rows, config=config,
+        source_health=health_rows, research=research_rows,
+        filter_waterfall=waterfall_rows)
     opps = kept
 
-    if not args.demo:
+    if not args.demo and opps:
         from alerts import send_alerts
         db_file = config.get("database", {}).get("file", "history.db")
         n_alerts = send_alerts(opps, config, db_file)
@@ -996,11 +1190,14 @@ def main() -> int:
                 db_file, directory=paths.folder(paths.base_dir(config),
                                                 paths.MODEL),
                 config=config))
-    best = max(opps, key=lambda o: o.valuation.opportunity_score)
-    log.info("wrote %d opportunities -> %s", len(opps), out)
-    log.info("top: %s | edge $%.0f | score %.1f%%", best.listing.title[:60],
-             best.valuation.edge_now, best.valuation.opportunity_score * 100)
-    return 0
+    log.info("wrote %d kept opportunities and %d research explanations -> %s",
+             len(opps), len(research_rows), out)
+    if opps:
+        best = max(opps, key=lambda o: o.valuation.opportunity_score)
+        log.info("top: %s | edge $%.0f | score %.1f%%",
+                 best.listing.title[:60], best.valuation.edge_now,
+                 best.valuation.opportunity_score * 100)
+    return 1 if not valued_opps else 0
 
 
 def _format_duration(seconds: float) -> str:

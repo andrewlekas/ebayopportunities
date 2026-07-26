@@ -646,10 +646,113 @@ def _source_health_tab(wb, rows: list[dict]) -> None:
     ws.auto_filter.ref = f"A1:I{len(rows) + 1}"
 
 
+def _filter_waterfall_tab(wb, rows: list[dict]) -> None:
+    """Visible count reconciliation from source hits to decision rows."""
+    if not rows:
+        return
+    ws = wb.create_sheet("Filter Waterfall")
+    cols = [("Stage", 27), ("Starting", 12), ("Removed", 12),
+            ("Remaining", 12), ("Detail", 88)]
+    header_fill = PatternFill("solid", fgColor="7F6000")
+    for col, (name, width) in enumerate(cols, 1):
+        cell = ws.cell(row=1, column=col, value=name)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+        ws.column_dimensions[get_column_letter(col)].width = width
+    band = PatternFill("solid", fgColor="FFF8E7")
+    warning = PatternFill("solid", fgColor="FCE4D6")
+    for row_i, row in enumerate(rows, 2):
+        values = [row.get("stage"), row.get("starting"),
+                  row.get("removed"), row.get("remaining"),
+                  row.get("detail")]
+        for col, value in enumerate(values, 1):
+            cell = ws.cell(row=row_i, column=col, value=value)
+            if row_i % 2 == 0:
+                cell.fill = band
+        if (row.get("removed") or 0) > 0:
+            ws.cell(row=row_i, column=3).fill = warning
+            ws.cell(row=row_i, column=3).font = Font(
+                bold=True, color="9C0006")
+        ws.cell(row=row_i, column=5).alignment = Alignment(
+            wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:E{len(rows) + 1}"
+
+
+def _research_tab(wb, rows: list[dict]) -> None:
+    """Every valued row rejected or quarantined, with its exact reason."""
+    if not rows:
+        return
+    ws = wb.create_sheet("Research-Filtered")
+    cols = [
+        ("Stage", 24), ("Reason", 46), ("Type", 11), ("Site", 12),
+        ("Title", 58), ("Query", 40), ("Price", 12), ("Ship", 10),
+        ("Bids", 8), ("Timing", 18), ("Fair Value", 13),
+        ("Exp Cost", 13), ("Expected Value", 15), ("Edge Now", 13),
+        ("ROI", 10), ("Conf", 9), ("#Comps", 9), ("Best Exit", 14),
+        ("Notes", 70), ("Model Detail", 70),
+    ]
+    header_fill = PatternFill("solid", fgColor="9C5700")
+    for col, (name, width) in enumerate(cols, 1):
+        cell = ws.cell(row=1, column=col, value=name)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.freeze_panes = "E2"
+    ws.auto_filter.ref = f"A1:T{len(rows) + 1}"
+
+    band = PatternFill("solid", fgColor="FFF4E6")
+    quarantine = PatternFill("solid", fgColor="FFF2CC")
+    for row_i, record in enumerate(rows, 2):
+        o = record["opportunity"]
+        l, v = o.listing, o.valuation
+        ltype = ("BIN+OBO" if l.listing_type == "fixed" and l.best_offer
+                 else "BIN" if l.listing_type == "fixed" else "AUCTION")
+        timing, _ = _timing(l)
+        values = [
+            record.get("stage"), record.get("reason"), ltype, l.site,
+            l.title, l.query, l.current_price, l.shipping, l.bid_count,
+            timing, v.fair_value, v.expected_cost, v.expected_value,
+            v.edge_now, v.roi, v.confidence, v.n_comps,
+            _exit_name(v.resale_channel), "; ".join(v.notes),
+            "; ".join(getattr(v, "audit_notes", [])),
+        ]
+        for col, value in enumerate(values, 1):
+            cell = ws.cell(row=row_i, column=col, value=value)
+            if row_i % 2 == 0:
+                cell.fill = band
+        if record.get("stage") == "Decision-only quarantine":
+            for col in range(1, len(cols) + 1):
+                ws.cell(row=row_i, column=col).fill = quarantine
+        for col in (7, 8, 11, 12, 13, 14):
+            ws.cell(row=row_i, column=col).number_format = _money_fmt(
+                ws.cell(row=row_i, column=col).value or 0)
+        ws.cell(row=row_i, column=15).number_format = "0.0%"
+        ws.cell(row=row_i, column=16).number_format = "0%"
+        title = ws.cell(row=row_i, column=5)
+        if l.url:
+            title.hyperlink = l.url
+            title.font = Font(color="0563C1", underline="single")
+        for col in (2, 19, 20):
+            ws.cell(row=row_i, column=col).alignment = Alignment(
+                wrap_text=True, vertical="top")
+
+    last = len(rows) + 1
+    ws.conditional_formatting.add(
+        f"M2:M{last}",
+        ColorScaleRule(start_type="min", start_color="F8696B",
+                       mid_type="num", mid_value=0, mid_color="FFEB84",
+                       end_type="max", end_color="63BE7B"))
+
+
 def write_report(opps: list[Opportunity], path: str,
                  portfolio: list[dict] | None = None,
                  config: dict | None = None,
-                 source_health: list[dict] | None = None) -> str:
+                 source_health: list[dict] | None = None,
+                 research: list[dict] | None = None,
+                 filter_waterfall: list[dict] | None = None) -> str:
     grail_rows = [o for o in opps if o.listing.grail]
     main = [o for o in opps if not o.listing.discovery and not o.listing.grail]
     disc = [o for o in opps
@@ -693,6 +796,9 @@ def write_report(opps: list[Opportunity], path: str,
     if "Today" in wb.sheetnames:
         wb.move_sheet("Today", offset=-len(wb.sheetnames) + 1)
         wb.active = wb["Today"]
+
+    _filter_waterfall_tab(wb, filter_waterfall or [])
+    _research_tab(wb, research or [])
 
     # category tabs
     by_cat: dict[str, list] = {}
@@ -764,6 +870,8 @@ def write_report(opps: list[Opportunity], path: str,
         ("Pri (star)", "query names a specific grade; alerts enabled"),
         ("Crossover tab", "restricted to configured card categories and graders (default CGC/BGS/SGC/BVG Pokemon and sports cards). Profit = edge now minus the PSA grading tier; risk: the card comes back below the modeled shift grade"),
         ("Source Health", "this run's persisted source readiness: request and parser successes/failures, breaker skips, disabled sources and comp-cache freshness"),
+        ("Filter Waterfall", "complete count reconciliation from raw marketplace hits through relevance, valuation, value/ROI/collection/economics rules and final kept rows"),
+        ("Research-Filtered", "valued listings rejected before the main report plus browsable rows quarantined from Action/Today/alerts; Stage and Reason explain every row"),
         ("Hidden columns", "expand M-P for valuation inputs; Model Detail diagnostics are hidden in AD"),
         ("Grails tab", "personal-collection matches by significance (Sig 40-100), cheapest 5 per grail - NOT a profit view"),
         ("Discovery tab", "broad theme searches; values are mixed medians, NOT bid targets"),

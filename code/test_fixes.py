@@ -17,6 +17,8 @@ import random
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -1240,6 +1242,7 @@ class TestApiThrottling(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         cfg = {"_config_dir": tmp,
                "scraping": {"request_delay_seconds": 0,
+                            "api_request_delay_seconds": 0,
                             "circuit_breaker_failures": 3}}
         s = BaseScraper(cfg)
         s.site = "testsite"
@@ -1266,6 +1269,64 @@ class TestApiThrottling(unittest.TestCase):
                          "should have hit the wire exactly 3 times")
         self.assertEqual(API_STATS[("testsite/api", "skipped")], 17)
         self.assertTrue(s.lane_tripped("api"))
+
+    def test_parallel_api_failures_have_atomic_breaker_admission(self):
+        """Queued workers must stop at three wire calls, not all fail at once."""
+        from concurrent.futures import ThreadPoolExecutor
+        from scrapers.base import API_STATS
+
+        s = self._scraper()
+        calls = 0
+        calls_lock = threading.Lock()
+        original_get = s.session.get
+
+        def counted_get(*args, **kwargs):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            return original_get(*args, **kwargs)
+
+        s.session.get = counted_get
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            list(pool.map(
+                lambda _: s._get("https://example.invalid/x", api=True),
+                range(40)))
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(API_STATS[("testsite/api", "failed")], 3)
+        self.assertEqual(API_STATS[("testsite/api", "skipped")], 37)
+
+    def test_parallel_api_calls_are_one_per_site_at_a_time(self):
+        """Successful API calls share one per-scraper admission lane."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        s = self._scraper(failing=False)
+        in_flight = 0
+        peak = 0
+        calls_lock = threading.Lock()
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+        def successful_get(*args, **kwargs):
+            nonlocal in_flight, peak
+            with calls_lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            time.sleep(0.005)
+            with calls_lock:
+                in_flight -= 1
+            return Response()
+
+        s.session.get = successful_get
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            rows = list(pool.map(
+                lambda _: s._get("https://example.invalid/x", api=True),
+                range(40)))
+
+        self.assertTrue(all(row is not None for row in rows))
+        self.assertEqual(peak, 1)
 
     def test_lanes_trip_independently(self):
         s = self._scraper()
@@ -1584,6 +1645,75 @@ class TestUnifiedTrustGates(unittest.TestCase):
             self.assertNotIn(risky.listing.title, action_titles)
             self.assertNotIn(risky.listing.title, today_titles)
             self.assertIn(risky.listing.title, category_titles)
+            wb.close()
+
+    def test_report_classifier_preserves_rejections_and_quarantines(self):
+        config = {
+            "filters": {"min_value": 1000, "max_roi": 2.0},
+            "output": {"min_expected_value": 0, "max_rows": 1000},
+        }
+        clean = self._opp(item_id="123456789020")
+        low = self._opp(fair=500, item_id="123456789021")
+        negative = self._opp(item_id="123456789022")
+        negative.valuation.expected_value = -25
+        negative.valuation.roi = -0.05
+        risky = self._opp(
+            note="MIXED POOL: broad set median",
+            item_id="123456789023")
+
+        kept, research, diagnostics = scanner.classify_report_rows(
+            [clean, low, negative, risky], config)
+
+        self.assertEqual({id(o) for o in kept}, {id(clean), id(risky)})
+        by_stage = {
+            (row["stage"], row["reason"])
+            for row in research
+        }
+        self.assertTrue(any(
+            stage == "Fair-value floor" for stage, _ in by_stage))
+        self.assertIn(
+            ("Output economics", "expected value < $0"), by_stage)
+        self.assertIn(
+            ("Decision-only quarantine", "mixed comp pool"), by_stage)
+        self.assertEqual(
+            diagnostics["stage_counts"]["Fair-value floor"], 1)
+        self.assertEqual(
+            diagnostics["stage_counts"]["Output economics"], 1)
+        self.assertEqual(
+            diagnostics["stage_counts"]["Decision-only quarantine"], 1)
+
+    def test_diagnostic_workbook_exists_even_with_zero_kept_rows(self):
+        from openpyxl import load_workbook
+
+        rejected = self._opp(fair=500, item_id="123456789024")
+        research = [{
+            "stage": "Fair-value floor",
+            "reason": "fair value $500 below Sports Cards floor $1,000",
+            "opportunity": rejected,
+        }]
+        waterfall = [{
+            "stage": "Raw marketplace hits", "starting": 1,
+            "removed": 0, "remaining": 1, "detail": "ebay=1",
+        }, {
+            "stage": "Fair-value floor", "starting": 1,
+            "removed": 1, "remaining": 0,
+            "detail": "fair value below floor x1",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "diagnostic.xlsx")
+            report_mod.write_report(
+                [], path, research=research,
+                filter_waterfall=waterfall, config={})
+            wb = load_workbook(path, read_only=True)
+            self.assertIn("Action", wb.sheetnames)
+            self.assertIn("Filter Waterfall", wb.sheetnames)
+            self.assertIn("Research-Filtered", wb.sheetnames)
+            self.assertEqual(wb["Action"].max_row, 1)
+            self.assertEqual(
+                wb["Research-Filtered"].cell(2, 2).value,
+                research[0]["reason"])
+            self.assertEqual(
+                wb["Filter Waterfall"].cell(3, 3).value, 1)
             wb.close()
 
     def test_phone_outputs_use_the_tradeability_gate(self):

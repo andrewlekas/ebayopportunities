@@ -144,6 +144,18 @@ class BaseScraper:
         # lock keeps the HTML lane strictly one-request-at-a-time per site,
         # so politeness (delay between hits to the same host) is preserved
         self._html_lock = threading.Lock()
+        # API calls share the same scraper too.  They used to run fully
+        # concurrently, so ten outer query workers x three eBay
+        # marketplaces could all pass the breaker before the first 429
+        # response arrived.  The result was 30 wire calls after a
+        # trip-after-3 policy and an unnecessarily escalated cross-run
+        # cooldown.  One lock is both the rate gate and the atomic breaker
+        # admission point: queued work re-checks the breaker after acquiring
+        # it, so exactly three consecutive failures can reach the wire.
+        self._api_lock = threading.Lock()
+        self._api_delay = max(
+            0.0, float(scraping.get("api_request_delay_seconds", 0.25)))
+        self._last_api_request = 0.0
         # circuit breaker PER CHANNEL: html scraping and authenticated API
         # calls fail independently (eBay can block scraping while the API
         # is fine), so each lane trips on its own
@@ -307,8 +319,8 @@ class BaseScraper:
     def _get(self, url: str, api: bool = False, **kwargs) -> requests.Response | None:
         """GET with delay, graceful failure, and per-channel circuit breaker.
 
-        api=True marks authenticated API calls: rate-limited by quota, not
-        by politeness, so the anti-bot delay is skipped (tiny jitter only).
+        api=True marks authenticated API calls: they use their own short,
+        serialized pacing lane instead of the slower HTML politeness delay.
         """
         lane = "api" if api else "html"
         if self.lane_tripped(lane):
@@ -335,8 +347,17 @@ class BaseScraper:
             if self.lane_tripped(lane):
                 note_api(f"{self.site}/{lane}", "skipped")
                 return None
-            time.sleep(random.uniform(0.05, 0.2) if api
-                       else self.delay * (0.5 + random.random()))
+            if api:
+                # Minimum start-to-start spacing, shared by every query and
+                # marketplace using this scraper instance.  Sleep while
+                # holding _api_lock so another worker cannot jump the queue.
+                wait = self._api_delay - (
+                    time.monotonic() - self._last_api_request)
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_api_request = time.monotonic()
+            else:
+                time.sleep(self.delay * (0.5 + random.random()))
             try:
                 r = self.session.get(
                     url, timeout=(30 if api else self.html_timeout),
@@ -358,8 +379,9 @@ class BaseScraper:
                         lane, "%d consecutive failures" % self._streaks[lane])
                 return None
 
-        if api:                     # quota-limited, safe to run concurrently
-            return do_request()
+        if api:
+            with self._api_lock:
+                return do_request()
         with self._html_lock:       # politeness: serial per site
             if not self._warmed and self.warmup_url:
                 self._warmed = True  # once per session, success or not
@@ -381,25 +403,43 @@ class BaseScraper:
         if self.lane_tripped(lane):
             note_api(f"{self.site}/{lane}", "skipped")
             return None
-        time.sleep(random.uniform(0.05, 0.2) if api
-                   else self.delay * (0.5 + random.random()))
-        try:
-            r = self.session.post(
-                url, timeout=(30 if api else self.html_timeout), **kwargs)
-            r.raise_for_status()
-            self._streaks[lane] = 0
-            note_api(f"{self.site}/{lane}", "ok")
-            return r
-        except _HTTP_ERRORS as e:
-            note_api(f"{self.site}/{lane}", "failed")
-            self._streaks[lane] += 1
-            log.warning("%s/%s: POST failed (%d/%d) for %s (%s)",
-                        self.site, lane, self._streaks[lane],
-                        self.trip_after, redact_url(url), redact_text(e))
-            if self._streaks[lane] == self.trip_after:
-                self._persist_trip(
-                    lane, "%d consecutive failures" % self._streaks[lane])
-            return None
+
+        def do_request():
+            if self.lane_tripped(lane):
+                note_api(f"{self.site}/{lane}", "skipped")
+                return None
+            if api:
+                wait = self._api_delay - (
+                    time.monotonic() - self._last_api_request)
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_api_request = time.monotonic()
+            else:
+                time.sleep(self.delay * (0.5 + random.random()))
+            try:
+                r = self.session.post(
+                    url, timeout=(30 if api else self.html_timeout), **kwargs)
+                r.raise_for_status()
+                self._streaks[lane] = 0
+                note_api(f"{self.site}/{lane}", "ok")
+                return r
+            except _HTTP_ERRORS as e:
+                note_api(f"{self.site}/{lane}", "failed")
+                self._streaks[lane] += 1
+                log.warning("%s/%s: POST failed (%d/%d) for %s (%s)",
+                            self.site, lane, self._streaks[lane],
+                            self.trip_after, redact_url(url), redact_text(e))
+                if self._streaks[lane] == self.trip_after:
+                    self._persist_trip(
+                        lane, "%d consecutive failures"
+                        % self._streaks[lane])
+                return None
+
+        if api:
+            with self._api_lock:
+                return do_request()
+        with self._html_lock:
+            return do_request()
 
     def search_auctions(self, query: str, max_results: int = 50):
         """Return list[Listing] of live auctions matching query."""
