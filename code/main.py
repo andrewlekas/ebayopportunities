@@ -534,6 +534,10 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
                 continue
             listing.priority = priority
             listing.discovery = discovery
+            listing.resale_channel = str(
+                entry.get("resale_channel")
+                or config.get("algorithm", {}).get(
+                    "default_resale_channel", "ebay"))
             # grail tagging: any listing from any query can be a grail -
             # but only at grail money ($3k+ default; cheap "matches" on
             # generic names are noise, not grails)
@@ -839,6 +843,20 @@ def main() -> int:
     engine = ValuationEngine(config)
     opps = (run_demo(config, engine) if args.demo
             else run_live(config, engine, args.mode))
+    health_rows = []
+    if not args.demo:
+        try:
+            from source_health import capture as capture_source_health
+            health_rows = capture_source_health(config, args.mode)
+            unhealthy = [r["source"] for r in health_rows
+                         if r["status"] in {
+                             "degraded", "cooling", "failing",
+                             "stale", "empty"}]
+            if unhealthy:
+                log.warning("source health needs attention: %s",
+                            ", ".join(unhealthy))
+        except Exception:
+            log.exception("source-health snapshot failed - continuing")
 
     # The report shows the whole ranked book (everything above the fair-value
     # floor), not just positive-EV rows - alerts remain strictly gated, and
@@ -935,7 +953,8 @@ def main() -> int:
             portfolio_rows = pf.build_rows(config, fairs, pf_dir)
         except Exception:
             log.exception("portfolio marking failed - continuing")
-    write_report(kept, out, portfolio=portfolio_rows, config=config)
+    write_report(kept, out, portfolio=portfolio_rows, config=config,
+                 source_health=health_rows)
     opps = kept
 
     if not args.demo:

@@ -23,6 +23,8 @@ from openpyxl.formatting.rule import CellIsRule, ColorScaleRule, DataBarRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from economics import (item_price_for_total_cost, resale_fee_rate,
+                       sales_tax_rate)
 from models import Opportunity
 from quality import is_tradeable
 from textutil import fold
@@ -328,24 +330,21 @@ def _bid_levels(o, config: dict) -> tuple[float | None, float | None]:
     if v.fair_value <= 0:
         return None, None
     algo = config.get("algorithm", {})
-    sell_fee = algo.get("resale_fee_rate", 0.1325)
-    tax = algo.get("sales_tax_rate", 0.0)
+    sell_fee = resale_fee_rate(config, l)
     vault = algo.get("psa_vault", {}) or {}
     vault_on = vault.get("enabled", True) and l.site == "ebay"
     vault_min = vault.get("min_price", 500)
     vault_fee = vault.get("sell_fee_rate", 0.07)
     target = (config.get("output", {}).get("today") or {}).get(
         "max_bid_target_roi", 0.15)
-    if (l.marketplace or "").upper() in {str(m).upper() for m in
-                                         algo.get("tax_free_marketplaces") or []}:
-        tax = 0.0
-    ship = l.shipping or 0.0
+    tax = sales_tax_rate(config, l)
     resale = v.fair_value
 
     def _levels(net_proceeds: float, taxed: bool):
-        divisor = (1 + tax) if taxed else 1.0
-        be = net_proceeds / divisor - ship
-        mb = (net_proceeds / (1 + max(target, 0.0))) / divisor - ship
+        route_tax = tax if taxed else 0.0
+        be = item_price_for_total_cost(l, net_proceeds, route_tax)
+        mb = item_price_for_total_cost(
+            l, net_proceeds / (1 + max(target, 0.0)), route_tax)
         return mb, be
 
     normal = _levels(resale * (1 - sell_fee), taxed=True)
@@ -359,12 +358,12 @@ def _bid_levels(o, config: dict) -> tuple[float | None, float | None]:
         # Normal checkout is valid strictly below the all-in vault boundary.
         # If its mathematical ceiling crosses the boundary, the highest
         # whole-dollar normal-route bid is the dollar immediately below it.
-        normal_cap = vault_min - ship
+        normal_cap = l.item_price_for_landed_cost(vault_min)
         if normal_cap > 0:
             candidates.append(min(normal_value, normal_cap - 1e-9))
         # Vault economics are valid only when THIS candidate—not the
         # breakeven from the same route—actually reaches the threshold.
-        if vault_value + ship >= vault_min:
+        if l.landed_cost(vault_value) >= vault_min:
             candidates.append(vault_value)
         valid = [value for value in candidates if value > 0]
         return math.floor(max(valid)) if valid else None
@@ -461,6 +460,12 @@ def _crossover_tab(wb, opps: list[Opportunity], config: dict) -> None:
         return
     tiers = cfg.get("fee_tiers") or DEFAULT_CROSSOVER_TIERS
     min_profit = cfg.get("min_profit", 100)
+    allowed_graders = {str(g).lower() for g in
+                       (cfg.get("allowed_graders")
+                        or ["cgc", "bgs", "sgc", "bvg"])}
+    allowed_categories = {str(cat) for cat in
+                          (cfg.get("allowed_categories")
+                           or ["Pokemon Cards", "Sports Cards"])}
 
     def grading_fee(value: float) -> float:
         for cap, fee in tiers:
@@ -474,11 +479,11 @@ def _crossover_tab(wb, opps: list[Opportunity], config: dict) -> None:
         if not is_tradeable(o):
             continue
         gi = grade_info(l.title)
-        if not gi or gi[0] == "psa":
+        if not gi or gi[0].lower() not in allowed_graders:
             continue
         if v.fair_value <= 0 or v.disputed:
             continue
-        if _category(l.query) == "Watches":
+        if _category(l.query) not in allowed_categories:
             continue
         fee = grading_fee(v.fair_value)
         profit = v.edge_now - fee
@@ -589,9 +594,47 @@ def _portfolio_tab(wb, rows: list[dict]) -> None:
         r_i += 1
 
 
+def _source_health_tab(wb, rows: list[dict]) -> None:
+    """Per-run source readiness, including deliberately disabled sources."""
+    if not rows:
+        return
+    ws = wb.create_sheet("Source Health")
+    cols = [("Source", 28), ("Status", 12), ("OK", 9),
+            ("Failed", 9), ("Skipped", 9), ("Freshness (h)", 14),
+            ("Mode", 10), ("Checked", 21), ("Detail", 56)]
+    for col, (name, width) in enumerate(cols, 1):
+        cell = ws.cell(row=1, column=col, value=name)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="385723")
+        ws.column_dimensions[get_column_letter(col)].width = width
+    status_fill = {
+        "healthy": "C6EFCE", "idle": "E2F0D9", "disabled": "D9E1F2",
+        "degraded": "FFEB9C", "cooling": "F4B183",
+        "failing": "FFC7CE", "stale": "FFC7CE", "empty": "FFC7CE",
+    }
+    for row_i, row in enumerate(rows, 2):
+        checked = str(row.get("run_at") or "")
+        if "T" in checked:
+            checked = checked.replace("T", " ")[:19] + " UTC"
+        values = [row.get("source"), row.get("status"), row.get("ok", 0),
+                  row.get("failed", 0), row.get("skipped", 0),
+                  row.get("freshness_hours"), row.get("mode"), checked,
+                  row.get("detail")]
+        for col, value in enumerate(values, 1):
+            ws.cell(row=row_i, column=col, value=value)
+        status = str(row.get("status") or "").lower()
+        ws.cell(row=row_i, column=2).fill = PatternFill(
+            "solid", fgColor=status_fill.get(status, "E7E6E6"))
+        if row.get("freshness_hours") is not None:
+            ws.cell(row=row_i, column=6).number_format = "0.0"
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:I{len(rows) + 1}"
+
+
 def write_report(opps: list[Opportunity], path: str,
                  portfolio: list[dict] | None = None,
-                 config: dict | None = None) -> str:
+                 config: dict | None = None,
+                 source_health: list[dict] | None = None) -> str:
     grail_rows = [o for o in opps if o.listing.grail]
     main = [o for o in opps if not o.listing.discovery and not o.listing.grail]
     disc = [o for o in opps
@@ -652,6 +695,9 @@ def write_report(opps: list[Opportunity], path: str,
     if portfolio:
         _portfolio_tab(wb, portfolio)
 
+    if source_health:
+        _source_health_tab(wb, source_health)
+
     if disc:
         _fill_sheet(wb.create_sheet("Discovery"), _sorted(disc))
 
@@ -687,20 +733,21 @@ def write_report(opps: list[Opportunity], path: str,
     rows = [
         ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
         ("Today tab", "the end-of-day decision list: auctions ending within 24h in DEADLINE order, then fresh BINs. Floors: EV >= $75, conf >= 25% (output.today in config). Disputed, suspicious, mixed-pool and ask-based values are excluded"),
-        ("Max Bid", "the highest all-in price that still leaves your target return (output.today.max_bid_target_roi, default 15%) after fees, tax and the vault route. This is the number to bid to"),
+        ("Max Bid", "the highest ITEM bid/offer that still leaves your target return (output.today.max_bid_target_roi, default 15%) after adding shipping, buyer/proxy fees, international shipping, duty, FX, insurance, tax and the vault route"),
         ("Breakeven", "the price where profit is exactly zero. A wall, not a target - winning there earns nothing, and fair value is an estimate (see Conf)"),
         ("Action tab", "tradeable top-scored rows + anything ending/fresh within 6h with positive EV (watches excluded - see Watches tab); duplicate cards collapsed to the best listing"),
         ("Expected Value", "fair value net of resale fees, minus expected all-in cost"),
-        ("Edge Now", "fair value net of fees minus CURRENT price+shipping"),
+        ("Edge Now", "fair value net of exit-channel fees minus CURRENT landed cost (price, shipping, buyer/proxy fee, international shipping, insurance, duty, FX and tax where applicable)"),
         ("Capture", "how capturable the edge is (auction: time left; BIN: freshness)"),
         ("Score", "ROI x Confidence x Capture - the sort key"),
         ("Targeted comps", "numbered cards discovered by broad searches are repriced from a separate sold pool for that exact card number and listing grade; thin exact pools remain browse-only"),
         ("Sales/mo", "how many of this card sell per month (comp velocity) - the liquidity dimension"),
         ("Ann ROI", "ROI annualized by turnover: same edge on a faster-trading card = higher capital velocity"),
         ("Pri (star)", "query names a specific grade; alerts enabled"),
+        ("Crossover tab", "restricted to configured card categories and graders (default CGC/BGS/SGC/BVG Pokemon and sports cards). Profit = edge now minus the PSA grading tier; risk: the card comes back below the modeled shift grade"),
+        ("Source Health", "this run's persisted source readiness: request successes/failures, breaker skips, disabled sources and comp-cache freshness"),
         ("Hidden columns", "expand the M-P group for valuation audit detail"),
         ("Grails tab", "personal-collection matches by significance (Sig 40-100), cheapest 5 per grail - NOT a profit view"),
-        ("Crossover tab", "CGC/BGS/SGC cards cheap in PSA-equivalent terms: buy, crack, regrade to PSA at the -1 shift grade, sell. Profit = edge now minus PSA grading fee. Risk: card comes back below the shift grade"),
         ("Discovery tab", "broad theme searches; values are mixed medians, NOT bid targets"),
         ("Movers tab", "30-day fair value changes (fills in as history accumulates)"),
     ]

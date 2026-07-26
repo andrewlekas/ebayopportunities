@@ -4,7 +4,9 @@
 - **eBay (official API)**: auctions + Buy It Now/Best Offer across US/UK/DE
   marketplaces, FX-converted to USD; seller feedback, listing age, end times
 - **Yahoo Auctions Japan**: auto-translated queries (query_ja override per
-  watchlist entry), Buyee purchase links, proxy-fee estimate in costs
+  watchlist entry), Buyee purchase links, full configurable landed-cost
+  estimate (domestic + international shipping, proxy fee, insurance,
+  import duty and FX spread)
 - **Sold comps chain**: 130point (includes hidden Best Offer amounts) →
   eBay sold pages (auto-resume after bot-block cooldown) → cached history
 - **PriceCharting API**: graded-card guide values (Pokemon, sports, games)
@@ -24,6 +26,8 @@
   with listing age (fresh underpriced BIN = the prize)
 - Opportunity Score = ROI × Confidence × Capture (capped ROI so
   too-good-to-be-true can't top the board)
+- One landed-cost equation drives live EV and Excel bid ceilings; watchlist
+  entries can select an exit marketplace with `resale_channel`
 - Scam defense: exclude keywords (reprint/proxy/pick-a-card/...), price
   <35% of market flag, low seller feedback penalty
 - Self-improving loop: predictions vs actual closes logged every scan;
@@ -35,11 +39,12 @@
 - Telegram alerts: edge ≥ $150, ROI ≥ 15%, capture ≥ 50%, confidence floor;
   per-listing dedupe; failed sends retry
 - Excel: Action tab (decide-now items), category tabs (Pokemon/Sports/
-  Watches/Games/Pop Culture), Discovery quarantine, Movers (30d trends),
+  Watches/Games/Pop Culture), card-only Crossover, Source Health,
+  Discovery quarantine, Movers (trusted 30d trends),
   human timing ("ends 2h 59m", amber <6h), hyperlinked titles, hidden
   audit column group (M–P)
-- SQLite history.db: comp cache (48h), fair-value trend lines, calibration
-  data, 7-day guide-price cache
+- SQLite history.db: comp cache (48h), trusted fair-value trend lines,
+  calibration data, persistent source readiness, 7-day guide-price cache
 
 ## Config quick reference (config.yaml)
 - `watchlist:` queries; `priority` auto-set by grade; `discovery: true` for
@@ -55,8 +60,15 @@
 - **Exact-card comp routing**: broad searches discover inventory, then
   cache-first, rate-capped sold searches price numbered cards using their
   card number and listing grade instead of a set-wide median.
+- **Historical quarantine**: legacy fair-history rows are preserved with
+  `trusted=NULL` and backed up during migration, but cannot drive Movers or
+  portfolio marks. New rows pass the central evidence gate first.
+- **Crossover allowlist**: only configured card categories and graders
+  (default CGC/BGS/SGC/BVG Pokemon and sports cards) can enter.
+- **Source readiness**: each run persists success/failure/breaker counts,
+  deliberately disabled sources and comp-cache freshness, then displays
+  them in the workbook.
 
 ## Backlog
-Fanatics Collect + Alt scrapers, Mercari JP, velocity/annualized return,
-channel-fee model (Probstein/DC Sports/COMC), sales-tax/vault cost model,
-inventory & P&L tracker.
+Revive Fanatics Collect, add Mercari JP, and expand exit-channel support
+to consignors such as Probstein/DC Sports/COMC.

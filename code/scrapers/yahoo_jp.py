@@ -22,8 +22,9 @@ Notes:
 - Queries are auto-translated (English Pokemon names -> Japanese) via the
   map below. For anything not in the map, add a `query_ja` field to the
   watchlist entry - a native Japanese query always beats auto-translation.
-- A flat proxy-fee estimate (config japan.proxy_fee_usd) is added to
-  shipping to keep EV honest. Buyee also charges intl shipping on top.
+- Proxy, domestic/international shipping, insurance, currency spread and
+  import duty are modeled separately under ``japan`` in config. These are
+  estimates: verify the final proxy quote and customs classification.
 - JP graded cards use PSA too, so grade matching works. "1st Edition"
   doesn't exist on JP vintage (the no-rarity/old-back era plays that role).
 """
@@ -75,7 +76,14 @@ class YahooJpScraper(BaseScraper):
     def __init__(self, config: dict):
         super().__init__(config)
         self.fx_jpy = (config.get("fx_rates") or {}).get("JPY", 0.0063)
-        self.proxy_fee = (config.get("japan") or {}).get("proxy_fee_usd", 10.0)
+        jp = config.get("japan") or {}
+        self.proxy_fee = jp.get("proxy_fee_usd", 10.0)
+        self.domestic_shipping = jp.get("domestic_shipping_usd", 8.0)
+        self.international_shipping = jp.get(
+            "international_shipping_usd", 35.0)
+        self.insurance_rate = jp.get("insurance_rate", 0.01)
+        self.import_duty_rate = jp.get("import_duty_rate", 0.15)
+        self.fx_spread_rate = jp.get("fx_spread_rate", 0.03)
 
     def search_auctions(self, query: str, max_results: int = 50,
                         query_ja: str | None = None) -> list[Listing]:
@@ -119,7 +127,12 @@ class YahooJpScraper(BaseScraper):
                 site="yahoo_jp", title=title,
                 url=f"https://buyee.jp{href.split('?')[0]}",
                 current_price=round(yen * self.fx_jpy, 2),
-                shipping=self.proxy_fee,     # proxy-fee estimate
+                shipping=self.domestic_shipping,
+                buyer_fees=self.proxy_fee,
+                international_shipping=self.international_shipping,
+                insurance_rate=self.insurance_rate,
+                import_duty_rate=self.import_duty_rate,
+                fx_spread_rate=self.fx_spread_rate,
                 bid_count=0,                 # not shown on Buyee cards
                 listing_id=listing_id, query=query,
                 listing_type="auction" if am else "fixed",

@@ -683,6 +683,157 @@ class TestBidLevels(unittest.TestCase):
                          "a normal-route result must stay below $500")
 
 
+class TestLandedEconomics(unittest.TestCase):
+    """International buys must not look cheap by omitting the costs between
+    the Japan hammer price and the item arriving in the US."""
+
+    def _listing(self, channel="ebay"):
+        return Listing(
+            site="yahoo_jp", title="1996 Pokemon No Rarity CGC 9",
+            url="", current_price=100.0, shipping=8.0, buyer_fees=10.0,
+            international_shipping=35.0, insurance_rate=0.01,
+            import_duty_rate=0.15, fx_spread_rate=0.03,
+            query="Pokemon No Rarity", marketplace="YAHOO_JP",
+            listing_type="fixed", resale_channel=channel)
+
+    def _config(self):
+        return {
+            "_config_dir": tempfile.mkdtemp(),
+            "algorithm": {
+                "sales_tax_rate": 0.08,
+                "tax_free_marketplaces": ["YAHOO_JP"],
+                "resale_channels": {"ebay": 0.10, "goldin": 0.20},
+                "psa_vault": {"enabled": False},
+            },
+        }
+
+    def test_listing_sums_every_landed_component(self):
+        listing = self._listing()
+        # $100 + 19% duty/FX/insurance + $53 fixed shipping/proxy.
+        self.assertAlmostEqual(listing.total_cost_now, 172.0)
+        self.assertIn("duty 15%", listing.landed_cost_note())
+
+    def test_engine_uses_landed_cost_and_selected_exit_channel(self):
+        from valuation.engine import ValuationEngine
+        engine = ValuationEngine(self._config())
+        ebay = engine.score(self._listing("ebay"),
+                            Valuation(fair_value=300.0))
+        goldin = engine.score(self._listing("goldin"),
+                              Valuation(fair_value=300.0))
+        self.assertAlmostEqual(ebay.expected_cost, 172.0)
+        self.assertAlmostEqual(ebay.edge_now, 98.0)
+        self.assertAlmostEqual(ebay.expected_value - goldin.expected_value,
+                               30.0)
+
+    def test_max_bid_inverts_the_same_landed_equation(self):
+        opp = Opportunity(self._listing(), Valuation(fair_value=300.0))
+        max_bid, breakeven = report_mod._bid_levels(opp, self._config())
+        self.assertEqual(max_bid, 152)
+        self.assertEqual(breakeven, 182)
+
+
+class TestCrossoverPolicy(unittest.TestCase):
+    """The regrade sheet is a card strategy, not a generic non-PSA grader
+    strategy: WATA games and CGC-graded games cannot leak into it."""
+
+    @staticmethod
+    def _opp(title, query):
+        return Opportunity(
+            Listing(site="ebay", title=title, url="", current_price=300.0,
+                    query=query, listing_type="fixed"),
+            Valuation(fair_value=1000.0, edge_now=500.0,
+                      expected_value=400.0, confidence=0.8))
+
+    def test_only_configured_card_graders_and_categories_appear(self):
+        from openpyxl import Workbook
+        wb = Workbook()
+        rows = [
+            self._opp("1986 Fleer Jordan CGC 9", "Michael Jordan 1986 Fleer"),
+            self._opp("Super Mario Bros WATA 9.4", "Super Mario Bros NES"),
+            self._opp("Zelda CGC 9.0", "Zelda NES"),
+        ]
+        report_mod._crossover_tab(wb, rows, {"algorithm": {
+            "crossover": {
+                "enabled": True, "min_profit": 1,
+                "allowed_graders": ["CGC", "BGS", "SGC", "BVG"],
+                "allowed_categories": ["Pokemon Cards", "Sports Cards"],
+            }}})
+        self.assertIn("Crossover", wb.sheetnames)
+        titles = [r[2] for r in wb["Crossover"].iter_rows(
+            min_row=2, values_only=True)]
+        self.assertEqual(titles, ["1986 Fleer Jordan CGC 9"])
+
+
+class TestTrustedFairHistory(unittest.TestCase):
+    """Pre-gate fair values remain auditable but cannot mark the portfolio
+    or define a 30-day trend."""
+
+    def test_legacy_rows_are_backed_up_and_quarantined(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.db")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE fair_history("
+                "query TEXT, ts TEXT, fair REAL, n_comps INTEGER)")
+            old = (datetime.now(timezone.utc)
+                   - timedelta(days=31)).isoformat()
+            conn.execute("INSERT INTO fair_history VALUES (?,?,?,?)",
+                         ("q", old, 1.0, 0))
+            conn.commit()
+            conn.close()
+
+            conn = histdb.connect(path)
+            self.assertIsNone(conn.execute(
+                "SELECT trusted FROM fair_history").fetchone()[0])
+            self.assertIsNone(histdb.trend_30d(conn, "q", 100.0))
+            histdb.record_fair(conn, "q", 100.0, 8)
+            self.assertEqual(conn.execute(
+                "SELECT trusted FROM fair_history ORDER BY rowid DESC "
+                "LIMIT 1").fetchone()[0], 1)
+            import portfolio
+            self.assertEqual(portfolio.latest_fairs(conn), {"q": 100.0})
+            conn.close()
+            backups = [name for name in os.listdir(tmp)
+                       if "-pre-fair-trust-" in name]
+            self.assertEqual(len(backups), 1)
+
+
+class TestSourceHealth(unittest.TestCase):
+    def test_snapshot_is_persisted_and_rendered(self):
+        from openpyxl import Workbook
+        from scrapers.base import note_api, reset_api_stats
+        from source_health import capture
+        with tempfile.TemporaryDirectory() as tmp:
+            reset_api_stats()
+            note_api("ebay/api", "ok")
+            note_api("ebay/api", "failed")
+            db_file = os.path.join(tmp, "history.db")
+            config = {
+                "sites": ["ebay"],
+                "database": {"file": db_file, "comp_cache_hours": 48},
+                "scraping": {
+                    "use_html_comps": True, "use_130point": False},
+                "api_keys": {},
+            }
+            rows = capture(config, "all")
+            ebay = next(r for r in rows
+                        if r["source"] == "ebay/listings")
+            yahoo = next(r for r in rows
+                         if r["source"] == "yahoo_jp/listings")
+            self.assertEqual(ebay["status"], "degraded")
+            self.assertEqual(yahoo["status"], "disabled")
+            conn = histdb.connect(db_file)
+            self.assertEqual(
+                len(histdb.latest_source_health(conn)), len(rows))
+            conn.close()
+            wb = Workbook()
+            report_mod._source_health_tab(wb, rows)
+            self.assertIn("Source Health", wb.sheetnames)
+            self.assertEqual(wb["Source Health"]["B2"].value,
+                             rows[0]["status"])
+            reset_api_stats()
+
+
 class TestCompHygiene(unittest.TestCase):
     """'Babe Ruth 1933' had 116 comps from $1 to $21,000 with a median of
     $6, because the pool mixed 1933 Goudeys with '1991 Conlon ... You Pick'

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 
+from economics import resale_fee_rate, sales_tax_rate, total_acquisition_cost
 from models import Listing, Valuation, Opportunity, SoldComp
 from . import comps as comps_mod
 from .comps import (GRADE_RE, GRADER_PREMIUM, _subject_tokens, card_number,
@@ -35,6 +36,7 @@ from .price_guide import PriceGuide
 
 class ValuationEngine:
     def __init__(self, config: dict):
+        self.config = config
         algo = config.get("algorithm", {})
         self.settle_ratio = algo.get("auction_settle_ratio", 0.92)
         self.sell_fee = algo.get("resale_fee_rate", 0.1325)   # eBay ~13.25%
@@ -195,29 +197,33 @@ class ValuationEngine:
 
     def _buy_tax(self, listing: Listing, price: float) -> float:
         """Effective buy-side sales-tax rate at this purchase price."""
-        if self.sales_tax <= 0:
-            return 0.0
-        if (listing.marketplace or "").upper() in self.tax_free_mp:
-            return 0.0
-        if self._vault_route(listing, price):
-            return 0.0
-        return self.sales_tax
+        return sales_tax_rate(
+            self.config, listing,
+            vault_route=self._vault_route(listing, price))
+
+    def _sell_fee(self, listing: Listing, vault_route: bool = False) -> float:
+        return (self.vault_sell_fee if vault_route
+                else resale_fee_rate(self.config, listing))
 
     # ---------------- EV per listing ----------------
     def score(self, listing: Listing, v: Valuation) -> Valuation:
         if v.fair_value <= 0:
             return v
-        cost_now = listing.total_cost_now
+        item_now = listing.current_price
+        cost_now = listing.landed_cost(item_now)
         # Hybrid auction with NO bids: the displayed "current price" is the
         # seller's opening ask, which nobody can transact at. The only real
         # price on the page is the Buy It Now, so that is what "take it
         # now" has to mean - otherwise the row shows edge against a number
         # that does not exist (seen live 2026-07-25: a $499 opening bid on
         # a card valued at $2,821, reported as $1,584 of expected value).
+        bin_item = 0.0
         bin_all_in = 0.0
         if listing.has_buy_now and listing.buy_now_price > 0:
-            bin_all_in = listing.buy_now_price + listing.shipping
+            bin_item = listing.buy_now_price
+            bin_all_in = listing.landed_cost(bin_item)
             if listing.bid_count < 1:
+                item_now = bin_item
                 cost_now = bin_all_in
                 v.notes.append(f"no bids yet - priced at the Buy It Now "
                                f"(${bin_all_in:,.0f}), not the opening bid")
@@ -239,10 +245,10 @@ class ValuationEngine:
         # and consignment replaces the marketplace fee on the way out
         # (one all-in rate - nets 93% by default).
         route_now = self._vault_route(listing, cost_now)
-        proceeds_now = resale * (1 - (self.vault_sell_fee if route_now
-                                      else self.sell_fee))
+        proceeds_now = resale * (1 - self._sell_fee(listing, route_now))
         tax_now = self._buy_tax(listing, cost_now)
-        v.edge_now = round(proceeds_now - cost_now * (1 + tax_now), 2)
+        acquisition_now = total_acquisition_cost(listing, item_now, tax_now)
+        v.edge_now = round(proceeds_now - acquisition_now, 2)
         proceeds = proceeds_now      # refined for EV once expected is known
 
         if listing.listing_type == "fixed":
@@ -250,7 +256,7 @@ class ValuationEngine:
             # Capture decays with listing AGE instead of time-to-close - a
             # fresh underpriced BIN is the prize; one that has sat unsold
             # for a week at that price is probably mispriced for a reason.
-            expected = cost_now
+            expected_item = item_now
             age = listing.age_hours
             if age is None:
                 capture = 0.5
@@ -260,7 +266,7 @@ class ValuationEngine:
                 if age <= 2:
                     v.notes.append(f"FRESH: listed {age:.1f}h ago")
             if listing.best_offer and resale > 0:
-                target = min(cost_now, self.offer_ratio * resale)
+                target = min(item_now, self.offer_ratio * resale)
                 v.notes.append(f"best offer - target ~${target:,.0f}")
         else:
             # Auction: expected final price interpolates between the bid
@@ -286,29 +292,29 @@ class ValuationEngine:
                 ml_pred = self.predictor.predict_ratio(
                     hrs, cost_now / resale, bids, resale)
             if ml_pred is not None:
-                expected = max(cost_now, resale * ml_pred)
+                expected_item = max(item_now, resale * ml_pred)
                 v.audit_notes.append("ML close model")
             else:
-                adj_bid = cost_now
+                adj_bid = item_now
                 if bids > 0:
-                    adj_bid = cost_now * (1 + min(self.proxy_cap,
+                    adj_bid = item_now * (1 + min(self.proxy_cap,
                                                   self.proxy_per_bid * bids))
                 if hrs is None:
-                    expected = max(cost_now, settle)
+                    expected_item = max(item_now, settle)
                 else:
                     w = 1 - math.exp(-hrs / self.tau_hours)
-                    expected = adj_bid + (settle - adj_bid) * w
+                    expected_item = adj_bid + (settle - adj_bid) * w
                     if hrs <= self.late_hours:
                         floor = settle * self.sniper_floor
-                        if expected < floor:
-                            expected = floor
+                        if expected_item < floor:
+                            expected_item = floor
                             v.audit_notes.append(
                                 f"sniper floor: close modeled >= "
                                 f"{self.sniper_floor:.0%} of settle")
-                    expected = max(cost_now, expected)
+                    expected_item = max(item_now, expected_item)
             # nobody bids an auction above a Buy It Now they could just take
-            if bin_all_in > 0 and expected > bin_all_in:
-                expected = bin_all_in
+            if bin_item > 0 and expected_item > bin_item:
+                expected_item = bin_item
                 v.audit_notes.append(
                     "expected close capped at the Buy It Now price")
             if hrs is None:
@@ -322,16 +328,19 @@ class ValuationEngine:
         # EV route: judged at the pre-tax EXPECTED price (auctions get bid
         # up - a $100 bid closing near $2k is a vault purchase, not a taxed
         # one). For BINs expected == asking, so this matches edge_now.
-        route_ev = self._vault_route(listing, expected)
-        proceeds = resale * (1 - (self.vault_sell_fee if route_ev
-                                  else self.sell_fee))
-        tax_ev = self._buy_tax(listing, expected)
+        expected_landed = listing.landed_cost(expected_item)
+        route_ev = self._vault_route(listing, expected_landed)
+        proceeds = resale * (1 - self._sell_fee(listing, route_ev))
+        tax_ev = self._buy_tax(listing, expected_landed)
+        expected = total_acquisition_cost(listing, expected_item, tax_ev)
         if tax_ev > 0:
-            expected *= (1 + tax_ev)
             v.notes.append(f"+{tax_ev:.0%} tax in")
         elif route_ev:
             v.notes.append("vault route (0% tax in / "
                            f"{self.vault_sell_fee:.0%} out)")
+        landed_note = listing.landed_cost_note(expected_item)
+        if landed_note:
+            v.notes.append(landed_note)
         v.expected_cost = round(expected, 2)
         v.expected_value = round(proceeds - expected, 2)
         v.roi = round(v.expected_value / expected, 4) if expected > 0 else 0.0

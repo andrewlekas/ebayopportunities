@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS comps(
     query TEXT, title TEXT, price REAL, sold_date TEXT, url TEXT, site TEXT,
     scanned_at TEXT, comp_key TEXT, UNIQUE(query, url, price));
 CREATE TABLE IF NOT EXISTS fair_history(
-    query TEXT, ts TEXT, fair REAL, n_comps INTEGER);
+    query TEXT, ts TEXT, fair REAL, n_comps INTEGER, trusted INTEGER);
 CREATE TABLE IF NOT EXISTS observations(
     item_id TEXT, site TEXT, query TEXT, title TEXT, listing_type TEXT,
     price REAL, shipping REAL, bids INTEGER, end_time TEXT,
@@ -36,8 +36,14 @@ CREATE TABLE IF NOT EXISTS closed(
     item_id TEXT PRIMARY KEY, actual_price REAL, closed_at TEXT);
 CREATE TABLE IF NOT EXISTS alerts(
     item_key TEXT PRIMARY KEY, alerted_at TEXT);
+CREATE TABLE IF NOT EXISTS source_health(
+    source TEXT, run_at TEXT, mode TEXT, status TEXT,
+    ok INTEGER, failed INTEGER, skipped INTEGER,
+    freshness_hours REAL, detail TEXT);
 CREATE INDEX IF NOT EXISTS idx_comps_q ON comps(query, scanned_at);
 CREATE INDEX IF NOT EXISTS idx_obs_item ON observations(item_id);
+CREATE INDEX IF NOT EXISTS idx_source_health_run
+    ON source_health(run_at, source);
 """
 
 
@@ -55,6 +61,7 @@ OBS_BASE_COLS = ("item_id", "site", "query", "title", "listing_type",
 # silently treat them as if today's safeguards had approved them.
 OBS_ADDED_COLS = (("n_comps", "INTEGER"), ("confidence", "REAL"),
                   ("trusted", "INTEGER"))
+FAIR_ADDED_COLS = (("trusted", "INTEGER"),)
 
 
 def canonical_item_id(url: str, site: str = "") -> str:
@@ -146,6 +153,25 @@ def _backup_before_comp_dedupe(conn) -> str:
     return backup
 
 
+def _backup_before_fair_quarantine(conn) -> str:
+    """Back up legacy fair history before marking it untrusted."""
+    path = _database_path(conn)
+    if not path or path == ":memory:":
+        return ""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = f"{path}-pre-fair-trust-{stamp}"
+    suffix = 1
+    while os.path.exists(backup):
+        backup = f"{path}-pre-fair-trust-{stamp}-{suffix}"
+        suffix += 1
+    target = sqlite3.connect(backup)
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+    return backup
+
+
 def _migrate_comps(conn) -> dict:
     """Populate canonical comp keys, back up, and collapse old duplicates."""
     columns = {r[1] for r in conn.execute("PRAGMA table_info(comps)")}
@@ -196,6 +222,22 @@ def _migrate(conn) -> None:
             if name not in have:
                 conn.execute(
                     f"ALTER TABLE observations ADD COLUMN {name} {decl}")
+        fair_have = {
+            r[1] for r in conn.execute("PRAGMA table_info(fair_history)")}
+        if any(name not in fair_have for name, _ in FAIR_ADDED_COLS):
+            legacy_count = conn.execute(
+                "SELECT COUNT(*) FROM fair_history").fetchone()[0]
+            backup = (_backup_before_fair_quarantine(conn)
+                      if legacy_count else "")
+            for name, decl in FAIR_ADDED_COLS:
+                if name not in fair_have:
+                    conn.execute(
+                        f"ALTER TABLE fair_history ADD COLUMN {name} {decl}")
+            if legacy_count:
+                log.warning(
+                    "fair-history migration: quarantined %d legacy rows "
+                    "(trusted=NULL); backup: %s", legacy_count,
+                    backup or "(in-memory database)")
         _migrate_comps(conn)
         conn.commit()
     except (OSError, sqlite3.Error, ValueError) as exc:
@@ -294,8 +336,10 @@ def cached_comps(conn, query: str, max_age_hours: float = 24.0,
 
 # ---------------- fair-value trend ----------------
 def record_fair(conn, query: str, fair: float, n_comps: int) -> None:
-    conn.execute("INSERT INTO fair_history VALUES (?,?,?,?)",
-                 (query, _now(), fair, n_comps))
+    conn.execute(
+        "INSERT INTO fair_history "
+        "(query,ts,fair,n_comps,trusted) VALUES (?,?,?,?,1)",
+        (query, _now(), fair, n_comps))
     conn.commit()
 
 
@@ -303,11 +347,13 @@ def trend_30d(conn, query: str, current_fair: float) -> float | None:
     """Pct change vs the fair value recorded closest to 30 days ago."""
     target = datetime.now(timezone.utc) - timedelta(days=30)
     row = conn.execute(
-        "SELECT fair FROM fair_history WHERE query=? AND ts<=? "
+        "SELECT fair FROM fair_history "
+        "WHERE query=? AND trusted=1 AND ts<=? "
         "ORDER BY ts DESC LIMIT 1", (query, target.isoformat())).fetchone()
     if not row:  # fall back to oldest record if history is <30d (>=3d old)
         row = conn.execute(
-            "SELECT fair, ts FROM fair_history WHERE query=? "
+            "SELECT fair, ts FROM fair_history "
+            "WHERE query=? AND trusted=1 "
             "ORDER BY ts ASC LIMIT 1", (query,)).fetchone()
         if not row or not row[0]:
             return None
@@ -318,6 +364,37 @@ def trend_30d(conn, query: str, current_fair: float) -> float | None:
     if not old:
         return None
     return (current_fair - old) / old
+
+
+# ---------------- persistent source health ----------------
+def record_source_health(conn, rows: list[dict]) -> None:
+    """Append one readiness snapshot for each configured data source."""
+    if not rows:
+        return
+    conn.executemany(
+        "INSERT INTO source_health "
+        "(source,run_at,mode,status,ok,failed,skipped,"
+        "freshness_hours,detail) VALUES (?,?,?,?,?,?,?,?,?)",
+        [(r.get("source", ""), r.get("run_at") or _now(),
+          r.get("mode", ""), r.get("status", "unknown"),
+          int(r.get("ok") or 0), int(r.get("failed") or 0),
+          int(r.get("skipped") or 0), r.get("freshness_hours"),
+          str(r.get("detail") or "")) for r in rows])
+    conn.commit()
+
+
+def latest_source_health(conn) -> list[dict]:
+    """Most recent persisted row per source."""
+    rows = conn.execute(
+        """SELECT source,run_at,mode,status,ok,failed,skipped,
+                  freshness_hours,detail
+           FROM source_health AS h
+           WHERE rowid IN (
+               SELECT MAX(rowid) FROM source_health GROUP BY source)
+           ORDER BY source""").fetchall()
+    keys = ("source", "run_at", "mode", "status", "ok", "failed",
+            "skipped", "freshness_hours", "detail")
+    return [dict(zip(keys, row)) for row in rows]
 
 
 # ---------------- calibration ----------------

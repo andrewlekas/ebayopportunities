@@ -82,6 +82,16 @@ def api_summary() -> str:
     return " | ".join(parts)
 
 
+def api_snapshot() -> dict[str, dict[str, int]]:
+    """Structured copy of the per-run counters for health persistence."""
+    with _stats_lock:
+        stats = dict(API_STATS)
+    endpoints: dict[str, dict[str, int]] = {}
+    for (endpoint, outcome), n in stats.items():
+        endpoints.setdefault(endpoint, {})[outcome] = int(n)
+    return endpoints
+
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",

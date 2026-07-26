@@ -1,7 +1,7 @@
 #!/bin/bash
 # Double-click to check the scanner's own safety rules still hold.
 #
-# These tests are pinned to real rows and real numbers from your data - a
+# The regression suite is pinned to real rows and real numbers from your data - a
 # failure means a bug we already fixed has come back, not that something
 # cosmetic changed. Nothing here touches the network, the database or your
 # reports; it is always safe to run.

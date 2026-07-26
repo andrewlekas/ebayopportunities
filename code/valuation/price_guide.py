@@ -39,7 +39,7 @@ RAW_FIELD = "loose-price"
 MIN_GRADED_RUNG = GUIDE_GRADE_LADDER[0][0]
 # Bump this whenever the grade->price rule changes, so cached values priced
 # under the old rule are dropped instead of being served for the whole TTL.
-GUIDE_CACHE_VERSION = "2026-07-25-grade-shift"
+GUIDE_CACHE_VERSION = "2026-07-25-landed-trust-v2"
 
 
 def _field_cents(product: dict, field: str) -> float | None:
@@ -167,9 +167,8 @@ class PriceGuide:
         self._db.execute("INSERT OR REPLACE INTO guide_meta VALUES "
                          "('cache_version', ?)", (GUIDE_CACHE_VERSION,))
         self._db.commit()
-        log.warning("price guide: cleared %d cached values - they were "
-                    "computed with the pre-%s grade mapping (non-PSA slabs "
-                    "were quoted a full grade too high)", n,
+        log.warning("price guide: cleared %d cached values from an older "
+                    "valuation-rule version (new version: %s)", n,
                     GUIDE_CACHE_VERSION)
 
     def _log_grade_route(self, gi, eff, how: str) -> None:

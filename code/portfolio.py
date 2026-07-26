@@ -17,6 +17,7 @@ portfolio.csv columns (header row required, extra columns ignored):
     cost_basis   - all-in cost in dollars (price + tax + shipping + fees)
     date_sold    - YYYY-MM-DD, blank while still held
     sale_proceeds- net dollars received, blank while still held
+    resale_channel- optional exit channel (ebay/goldin/heritage/etc.)
     notes        - free text
 """
 from __future__ import annotations
@@ -26,11 +27,13 @@ import logging
 import os
 from datetime import datetime, timezone
 
+from economics import resale_fee_rate
+
 log = logging.getLogger(__name__)
 
 CSV_FILE = "portfolio.csv"
 CSV_HEADER = ["date_bought", "description", "query", "cost_basis",
-              "date_sold", "sale_proceeds", "notes"]
+              "date_sold", "sale_proceeds", "resale_channel", "notes"]
 
 
 def _num(x) -> float | None:
@@ -65,7 +68,6 @@ def build_rows(config: dict, fair_by_query: dict[str, float],
     if not os.path.exists(path):
         return None
     algo = config.get("algorithm", {})
-    sell_fee = algo.get("resale_fee_rate", 0.1325)
     vault = algo.get("psa_vault") or {}
     vault_on = bool(vault.get("enabled", False))
     vault_min = vault.get("min_price", 500.0)
@@ -86,7 +88,10 @@ def build_rows(config: dict, fair_by_query: dict[str, float],
 
             row = {"description": desc, "query": query, "cost": cost,
                    "bought": bought, "sold": sold, "notes":
-                   (r.get("notes") or "").strip()}
+                   (r.get("notes") or "").strip(),
+                   "resale_channel": (r.get("resale_channel")
+                                      or algo.get(
+                                          "default_resale_channel", "ebay"))}
             end = sold or now
             days = max((end - bought).days, 1) if bought else None
             row["days"] = days
@@ -99,6 +104,8 @@ def build_rows(config: dict, fair_by_query: dict[str, float],
                 row["status"] = "OPEN"
                 fair = fair_by_query.get(query.lower()) if query else None
                 if fair:
+                    sell_fee = resale_fee_rate(
+                        config, channel=row["resale_channel"])
                     fee = (vault_fee if (vault_on and fair >= vault_min)
                            else sell_fee)
                     row["value"] = fair * (1 - fee)     # net liquidation value
@@ -122,6 +129,8 @@ def latest_fairs(conn) -> dict[str, float]:
     """query(lower) -> most recently recorded fair value."""
     rows = conn.execute(
         """SELECT query, fair FROM fair_history
-           WHERE rowid IN (SELECT MAX(rowid) FROM fair_history
+           WHERE trusted=1 AND rowid IN (
+                           SELECT MAX(rowid) FROM fair_history
+                           WHERE trusted=1
                            GROUP BY query)""").fetchall()
     return {q.lower(): f for q, f in rows if f}

@@ -7,9 +7,8 @@ adds the full afternoon session (crash fix verification, circuit-breaker
 overhaul, speed overhaul) and corrects anything that changed. Where the two
 disagree, this file wins.
 
-Last updated: 2026-07-25 ~16:00, end of the Fable session. Live state in §9
-is grounded in the 15:44 full-scan log (the first run on all-new code:
-2m39s end-to-end, report written, alert delivered, ML deployed).
+Last updated: 2026-07-25 evening. Live state in §9 is grounded in the
+15:44 full-scan log; later changes are summarized in §15.9.
 
 ---
 
@@ -752,3 +751,32 @@ while `engine` defaults it to False — no live effect since config sets it
 explicitly. `learner`/`ClosePredictor` read `learned_params.json` relative
 to the CWD; the `.command` files `cd` first, so this only matters if a
 scan is ever launched from elsewhere.
+
+### 15.9 Original improvement plan completed: items 7–10
+
+All four remaining improvements shipped together and are covered by the
+105-test regression suite.
+
+7. **Crossover is now a strict card allowlist.** `report._crossover_tab`
+   accepts only `algorithm.crossover.allowed_graders` (default CGC/BGS/SGC/
+   BVG) and `allowed_categories` (Pokemon/Sports). WATA and CGC-graded video
+   games cannot enter this sheet.
+8. **One complete landed-cost equation.** `Listing` now carries explicit
+   buyer/proxy fees, domestic and international shipping, insurance, import
+   duty and FX spread. Yahoo Japan populates them from `japan` config. The
+   valuation engine and Excel Max Bid/Breakeven invert the same equation.
+   Exit fees are configurable by `resale_channel` (default eBay; Goldin,
+   Heritage and Fanatics defaults included).
+9. **Historical state quarantined.** `fair_history.trusted` is additive;
+   6,261 legacy rows migrated to `NULL` and were preserved in
+   `database/history.db-pre-fair-trust-20260726T013536Z`. Only new,
+   centrally approved rows can drive trends or portfolio marks. Guide cache
+   version was bumped and stale guide values cleared.
+10. **Persistent source health.** Every live run writes a readiness snapshot
+    to SQLite: success/failure/breaker counts, disabled sources and comp-cache
+    freshness. Reports include a color-coded `Source Health` tab, and the log
+    names sources needing attention.
+
+The Japan duty assumption defaults to 15% and is deliberately configurable.
+It is a conservative planning input, not customs advice; verify the final
+proxy quote and exact HTS classification before a large order.
