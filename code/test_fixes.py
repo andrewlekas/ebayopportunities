@@ -29,7 +29,7 @@ import db as histdb                                          # noqa: E402
 import learner                                               # noqa: E402
 import main as scanner                                       # noqa: E402
 import report as report_mod                                  # noqa: E402
-from models import Listing, Opportunity, Valuation           # noqa: E402
+from models import Listing, Opportunity, SoldComp, Valuation # noqa: E402
 from report import _category                                 # noqa: E402
 from valuation.comps import (grade_conflict, grade_info,     # noqa: E402
                              grader_of)
@@ -988,6 +988,68 @@ class TestCredentialHygiene(unittest.TestCase):
             self.assertEqual(
                 config["database"]["file"],
                 os.path.join(tmp, "database", "test.db"))
+
+
+class TestCompIdentity(unittest.TestCase):
+    def test_ebay_url_variants_have_one_identity(self):
+        item_id = "123456789012"
+        urls = [
+            f"https://www.ebay.com/itm/{item_id}",
+            f"https://www.ebay.com/itm/Charizard-PSA-9/{item_id}?hash=x",
+            f"https://www.ebay.com/sch/i.html?item={item_id}&mkcid=1",
+        ]
+        self.assertEqual(
+            {histdb.canonical_item_id(url, "ebay") for url in urls},
+            {item_id})
+
+    def test_save_comps_counts_same_listing_once_and_refreshes_price(self):
+        conn = histdb.connect(":memory:")
+        sold = datetime(2026, 7, 20, tzinfo=timezone.utc)
+        first = SoldComp(
+            "Charizard PSA 9", 100.0, sold,
+            "https://www.ebay.com/itm/Charizard/123456789012?hash=old",
+            "ebay")
+        second = SoldComp(
+            "Charizard PSA 9", 110.0, sold,
+            "https://www.ebay.com/itm/123456789012?mkcid=1", "ebay")
+        histdb.save_comps(conn, "Charizard PSA 9", [first, second])
+        rows = conn.execute(
+            "SELECT price, comp_key FROM comps").fetchall()
+        self.assertEqual(rows, [(110.0, "item:123456789012")])
+
+    def test_old_database_is_backed_up_before_duplicate_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.db")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE comps(query TEXT,title TEXT,price REAL,"
+                "sold_date TEXT,url TEXT,site TEXT,scanned_at TEXT,"
+                "UNIQUE(query,url,price))")
+            urls = (
+                "https://www.ebay.com/itm/Card/123456789012?hash=one",
+                "https://www.ebay.com/itm/123456789012?mkcid=two",
+            )
+            for i, url in enumerate(urls):
+                conn.execute(
+                    "INSERT INTO comps VALUES (?,?,?,?,?,?,?)",
+                    ("q", "Card", 100.0 + i, None, url, "ebay", f"t{i}"))
+            conn.commit()
+            conn.close()
+
+            migrated = histdb.connect(path)
+            self.assertEqual(
+                migrated.execute("SELECT COUNT(*) FROM comps").fetchone()[0],
+                1)
+            migrated.close()
+            backups = [
+                name for name in os.listdir(tmp)
+                if name.startswith("history.db-pre-comp-dedupe-")]
+            self.assertEqual(len(backups), 1)
+            original = sqlite3.connect(os.path.join(tmp, backups[0]))
+            self.assertEqual(
+                original.execute("SELECT COUNT(*) FROM comps").fetchone()[0],
+                2)
+            original.close()
 
 
 class TestMLDeploymentGate(unittest.TestCase):

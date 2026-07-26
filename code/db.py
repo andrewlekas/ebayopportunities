@@ -7,18 +7,24 @@ for calibrating the model (run `python main.py --calibrate`).
 """
 from __future__ import annotations
 
+import hashlib
+import logging
+import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from models import Listing, SoldComp, Valuation
 
 ITEM_ID_RE = re.compile(r"/itm/(?:[^/]*/)?(\d{9,15})")
+ITEM_PARAM_RE = re.compile(r"(?:[?&](?:item|itemid)=)(\d{9,15})", re.I)
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS comps(
     query TEXT, title TEXT, price REAL, sold_date TEXT, url TEXT, site TEXT,
-    scanned_at TEXT, UNIQUE(query, url, price));
+    scanned_at TEXT, comp_key TEXT, UNIQUE(query, url, price));
 CREATE TABLE IF NOT EXISTS fair_history(
     query TEXT, ts TEXT, fair REAL, n_comps INTEGER);
 CREATE TABLE IF NOT EXISTS observations(
@@ -47,6 +53,136 @@ OBS_BASE_COLS = ("item_id", "site", "query", "title", "listing_type",
 OBS_ADDED_COLS = (("n_comps", "INTEGER"), ("confidence", "REAL"))
 
 
+def canonical_item_id(url: str, site: str = "") -> str:
+    """Stable marketplace item id extracted from common listing URL forms."""
+    text = str(url or "")
+    match = ITEM_ID_RE.search(text) or ITEM_PARAM_RE.search(text)
+    if match:
+        return match.group(1)
+    # eBay Browse and redirect URLs occasionally omit /itm/ but still carry
+    # the 9-15 digit item id as a path segment.  Limit this fallback to eBay
+    # so dates/order numbers on other marketplaces are not mistaken for ids.
+    if str(site).lower() == "ebay":
+        try:
+            path = urlsplit(text).path
+        except ValueError:
+            path = text
+        match = re.search(r"(?<!\d)(\d{9,15})(?!\d)", path)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _normalized_url(url: str) -> str:
+    """Remove tracking/fragment noise while preserving listing identity."""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = urlsplit(text)
+        ignored = {"hash", "var", "mkcid", "mkevt", "mkrid", "campid",
+                   "customid", "toolid"}
+        query = [(k, v) for k, v in parse_qsl(parts.query,
+                                              keep_blank_values=True)
+                 if not k.lower().startswith("utm_")
+                 and k.lower() not in ignored]
+        return urlunsplit((
+            parts.scheme.lower(), parts.netloc.lower(),
+            parts.path.rstrip("/"), urlencode(sorted(query)), ""))
+    except ValueError:
+        return text.split("#", 1)[0].rstrip("/")
+
+
+def canonical_comp_key(*, title: str, price: float,
+                       sold_date, url: str, site: str) -> str:
+    """Identity used to count a physical sold listing once per query."""
+    item_id = canonical_item_id(url, site)
+    if item_id:
+        return f"item:{item_id}"
+    normalized = _normalized_url(url)
+    if normalized:
+        return f"url:{normalized}"
+    sold = sold_date.isoformat() if hasattr(sold_date, "isoformat") \
+        else str(sold_date or "")
+    raw = "\x1f".join((
+        str(site or "").strip().lower(),
+        " ".join(str(title or "").lower().split()),
+        f"{float(price or 0):.2f}",
+        sold,
+    ))
+    return "fallback:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _database_path(conn) -> str:
+    try:
+        for _, name, path in conn.execute("PRAGMA database_list"):
+            if name == "main":
+                return path or ""
+    except sqlite3.Error:
+        pass
+    return ""
+
+
+def _backup_before_comp_dedupe(conn) -> str:
+    """Create a consistent SQLite backup before deleting duplicate rows."""
+    path = _database_path(conn)
+    if not path or path == ":memory:":
+        return ""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = f"{path}-pre-comp-dedupe-{stamp}"
+    suffix = 1
+    while os.path.exists(backup):
+        backup = f"{path}-pre-comp-dedupe-{stamp}-{suffix}"
+        suffix += 1
+    target = sqlite3.connect(backup)
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+    return backup
+
+
+def _migrate_comps(conn) -> dict:
+    """Populate canonical comp keys, back up, and collapse old duplicates."""
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(comps)")}
+    select = conn.execute(
+        "SELECT rowid, query, title, price, sold_date, url, site FROM comps"
+    ).fetchall()
+    keyed = [
+        (canonical_comp_key(title=title, price=price, sold_date=sold,
+                            url=url, site=site), rowid, query, site)
+        for rowid, query, title, price, sold, url, site in select
+    ]
+    identities: dict[tuple[str, str, str], int] = {}
+    duplicate_rows = 0
+    for key, _, query, site in keyed:
+        identity = (query or "", site or "", key)
+        duplicate_rows += int(identity in identities)
+        identities[identity] = identities.get(identity, 0) + 1
+
+    backup = _backup_before_comp_dedupe(conn) if duplicate_rows else ""
+    if "comp_key" not in columns:
+        conn.execute("ALTER TABLE comps ADD COLUMN comp_key TEXT")
+    conn.executemany("UPDATE comps SET comp_key=? WHERE rowid=?",
+                     [(key, rowid) for key, rowid, _, _ in keyed])
+    if duplicate_rows:
+        conn.execute("""
+            DELETE FROM comps
+            WHERE rowid NOT IN (
+                SELECT MAX(rowid) FROM comps
+                GROUP BY query, site, comp_key
+            )""")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_comps_identity
+        ON comps(query, site, comp_key)
+        WHERE comp_key IS NOT NULL AND comp_key <> ''""")
+    conn.commit()
+    if duplicate_rows:
+        log.warning("comp migration: removed %d duplicate rows; backup: %s",
+                    duplicate_rows, backup or "(in-memory database)")
+    return {"duplicates_removed": duplicate_rows, "backup": backup}
+
+
 def _migrate(conn) -> None:
     """Additive schema migrations. Best-effort: a failure here must never
     stop a scan - record_observation adapts to whatever columns exist."""
@@ -56,9 +192,13 @@ def _migrate(conn) -> None:
             if name not in have:
                 conn.execute(
                     f"ALTER TABLE observations ADD COLUMN {name} {decl}")
+        _migrate_comps(conn)
         conn.commit()
-    except sqlite3.Error:
-        pass
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        # Preserve the scanner's old best-effort migration behavior, but make
+        # failure visible instead of silently hiding a data-integrity issue.
+        conn.rollback()
+        log.warning("database migration skipped: %s", exc)
 
 
 def connect(path: str = "history.db") -> sqlite3.Connection:
@@ -83,10 +223,40 @@ def _now() -> str:
 
 # ---------------- comps ----------------
 def save_comps(conn, query: str, comps: list[SoldComp]) -> None:
-    rows = [(query, c.title, c.price,
-             c.sold_date.isoformat() if c.sold_date else None,
-             c.url, c.site, _now()) for c in comps]
-    conn.executemany("INSERT OR IGNORE INTO comps VALUES (?,?,?,?,?,?,?)", rows)
+    # A scraper can surface the same eBay sale through several URL shapes
+    # (title path, short /itm/ path, tracking params).  Collapse the batch
+    # before touching SQLite, then update the existing physical sale rather
+    # than counting it again at a different price or scan time.
+    unique: dict[tuple[str, str], tuple] = {}
+    scanned_at = _now()
+    for c in comps:
+        key = canonical_comp_key(
+            title=c.title, price=c.price, sold_date=c.sold_date,
+            url=c.url, site=c.site)
+        unique[(c.site or "", key)] = (
+            query, c.title, c.price,
+            c.sold_date.isoformat() if c.sold_date else None,
+            c.url, c.site, scanned_at, key)
+    try:
+        for row in unique.values():
+            cur = conn.execute(
+                "UPDATE comps SET title=?, price=?, sold_date=?, url=?, "
+                "scanned_at=? WHERE query=? AND site=? AND comp_key=?",
+                (row[1], row[2], row[3], row[4], row[6],
+                 row[0], row[5], row[7]))
+            if not cur.rowcount:
+                conn.execute(
+                    "INSERT OR IGNORE INTO comps "
+                    "(query,title,price,sold_date,url,site,scanned_at,comp_key) "
+                    "VALUES (?,?,?,?,?,?,?,?)", row)
+    except sqlite3.OperationalError:
+        # Pre-migration fallback if a read-only/locked database prevented the
+        # additive migration.  Scanning continues under the legacy identity.
+        rows = [row[:7] for row in unique.values()]
+        conn.executemany(
+            "INSERT OR IGNORE INTO comps "
+            "(query,title,price,sold_date,url,site,scanned_at) "
+            "VALUES (?,?,?,?,?,?,?)", rows)
     conn.commit()
 
 
