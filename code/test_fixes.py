@@ -304,6 +304,7 @@ class TestObservationSchema(unittest.TestCase):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(observations)")}
         self.assertIn("n_comps", cols)
         self.assertIn("confidence", cols)
+        self.assertIn("trusted", cols)
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0], 1)
         conn.close()
@@ -319,10 +320,11 @@ class TestObservationSchema(unittest.TestCase):
         histdb.record_observation(conn, listing,
                                   Valuation(fair_value=2500.0, n_comps=11,
                                             confidence=0.81))
-        row = conn.execute("SELECT n_comps, confidence FROM observations"
+        row = conn.execute("SELECT n_comps, confidence, trusted FROM observations"
                            ).fetchone()
         self.assertEqual(row[0], 11)
         self.assertAlmostEqual(row[1], 0.81)
+        self.assertEqual(row[2], 1)
         conn.close()
 
 
@@ -386,6 +388,18 @@ class TestLearnerTrustFilters(unittest.TestCase):
         params = _load_json(os.path.join(self.dir, "learned_params.json"))
         self.assertEqual(params["n"], 0)
         self.assertGreater(params["training_filter"]["dropped_thin_comps"], 0)
+
+    def test_pre_gate_rows_without_trust_attestation_are_excluded(self):
+        conn = histdb.connect(self.db)
+        self._auction(conn, "877000000001", 1200.0, 1000.0, n_comps=9)
+        conn.execute("UPDATE observations SET trusted = NULL")
+        conn.commit()
+        conn.close()
+        learner.fit(self.db, directory=self.dir)
+        params = _load_json(os.path.join(self.dir, "learned_params.json"))
+        self.assertEqual(params["n"], 0)
+        self.assertGreater(
+            params["training_filter"]["dropped_no_trust_attestation"], 0)
 
     def test_params_are_written_even_on_a_cold_start(self):
         """Returning early used to leave a stale (wrong) settle ratio and a
@@ -1050,6 +1064,144 @@ class TestCompIdentity(unittest.TestCase):
                 original.execute("SELECT COUNT(*) FROM comps").fetchone()[0],
                 2)
             original.close()
+
+
+class TestUnifiedTrustGates(unittest.TestCase):
+    def _opp(self, *, note="", disputed=False, regraded=False,
+             discovery=False, n_comps=8, fair=1000.0, item_id="123456789012",
+             grail="") -> Opportunity:
+        listing = Listing(
+            site="ebay", title=f"1986 Fleer Jordan PSA 8 {item_id}",
+            url=f"https://www.ebay.com/itm/{item_id}",
+            current_price=400.0, bid_count=3, listing_id=item_id,
+            query="1986 Fleer Michael Jordan PSA 8",
+            end_time=datetime.now(timezone.utc) + timedelta(hours=3),
+            created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            priority=True, discovery=discovery, grail=grail,
+            grail_score=90 if grail else 0)
+        valuation = Valuation(
+            fair_value=fair, comps_value=fair, n_comps=n_comps,
+            expected_cost=500.0, expected_value=350.0, edge_now=450.0,
+            roi=0.7, capture=0.8, confidence=0.75,
+            opportunity_score=0.42, disputed=disputed, regraded=regraded,
+            notes=[note] if note else [])
+        return Opportunity(listing=listing, valuation=valuation)
+
+    def test_every_hard_risk_is_blocked_by_the_same_tradeability_gate(self):
+        from quality import tradeability_rejection
+        cases = [
+            (self._opp(note="ASK-BASED estimate from 4 live asks"),
+             "ask-based valuation"),
+            (self._opp(note="MIXED POOL: no exact card sales"),
+             "mixed comp pool"),
+            (self._opp(note="SUSPICIOUS: price far below market"),
+             "suspicious listing"),
+            (self._opp(disputed=True), "disputed valuation"),
+            (self._opp(discovery=True), "discovery query"),
+        ]
+        for opp, expected in cases:
+            self.assertEqual(tradeability_rejection(opp), expected)
+        self.assertIsNone(tradeability_rejection(self._opp()))
+
+    def test_regrade_and_collection_failure_never_enter_learning(self):
+        from quality import evidence_rejection, is_tradeable
+        regraded = self._opp(regraded=True)
+        self.assertTrue(is_tradeable(regraded),
+                        "a well-comped per-listing regrade can be actionable")
+        self.assertEqual(
+            evidence_rejection(regraded, collection_passed=True),
+            "listing-specific regrade")
+        self.assertEqual(
+            evidence_rejection(self._opp(), collection_passed=False),
+            "outside collection standards")
+        self.assertEqual(
+            evidence_rejection(
+                self._opp(n_comps=2), collection_passed=True, min_comps=3),
+            "too few matched comps")
+
+    def test_persistence_writes_clean_evidence_and_rejects_contamination(self):
+        conn = histdb.connect(":memory:")
+        config = {
+            "algorithm": {"learner_min_fair": 50,
+                          "learner_min_comps": 3},
+            "filters": {},
+        }
+        recorded, reason = scanner.persist_trusted_evidence(
+            conn, self._opp(), config)
+        self.assertTrue(recorded)
+        self.assertIsNone(reason)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM fair_history").fetchone()[0], 1)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0], 1)
+
+        poisoned = self._opp(
+            note="MIXED POOL: broad set median", item_id="123456789013")
+        recorded, reason = scanner.persist_trusted_evidence(
+            conn, poisoned, config, recorded)
+        self.assertTrue(recorded)
+        self.assertEqual(reason, "mixed comp pool")
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM fair_history").fetchone()[0], 1)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0], 1)
+        conn.close()
+
+    def test_decision_sheets_exclude_risk_but_category_keeps_it_visible(self):
+        from openpyxl import load_workbook
+        clean = self._opp(item_id="123456789014")
+        clean.listing.listing_type = "fixed"
+        risky = self._opp(
+            note="SUSPICIOUS: price far below market",
+            item_id="123456789015")
+        risky.listing.listing_type = "fixed"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "quality.xlsx")
+            report_mod.write_report(
+                [clean, risky], path,
+                config={"output": {"today": {
+                    "min_expected_value": 75, "min_confidence": 0.25}}})
+            wb = load_workbook(path, read_only=True)
+            self.assertIn("Today", wb.sheetnames)
+            action_titles = [
+                row[4] for row in wb["Action"].iter_rows(
+                    min_row=2, values_only=True)]
+            today_titles = [
+                row[1] for row in wb["Today"].iter_rows(
+                    min_row=2, values_only=True)]
+            category_titles = [
+                row[4] for row in wb["Sports Cards"].iter_rows(
+                    min_row=2, values_only=True)]
+            self.assertIn(clean.listing.title, action_titles)
+            self.assertIn(clean.listing.title, today_titles)
+            self.assertNotIn(risky.listing.title, action_titles)
+            self.assertNotIn(risky.listing.title, today_titles)
+            self.assertIn(risky.listing.title, category_titles)
+            wb.close()
+
+    def test_phone_outputs_use_the_tradeability_gate(self):
+        import alerts
+        import digest
+        risky = self._opp(
+            note="ASK-BASED estimate from live asks",
+            item_id="123456789016", grail="Jordan rookie")
+        config = {
+            "alerts": {
+                "enabled": True, "priority_only": False,
+                "min_edge_now": 1, "min_roi": 0, "max_roi": 2,
+                "min_capture": 0, "min_confidence": 0,
+                "telegram": {"bot_token": "test", "chat_id": "test"},
+                "digest": {"enabled": True, "top_opportunities": 10,
+                           "top_grails": 10},
+            }
+        }
+        with mock.patch("alerts._send_telegram") as alert_send:
+            self.assertEqual(
+                alerts.send_alerts([risky], config, ":memory:"), 0)
+            alert_send.assert_not_called()
+        with mock.patch("digest._send") as digest_send:
+            self.assertEqual(digest.send_digest([risky], config), 0)
+            digest_send.assert_not_called()
 
 
 class TestMLDeploymentGate(unittest.TestCase):

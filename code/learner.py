@@ -59,24 +59,36 @@ def _training_rows(conn, *, min_fair: float = DEFAULT_MIN_FAIR,
 
     target = actual close / fair value. Rows the filters reject are counted
     in `stats` so scan.log shows WHY a training set is the size it is.
+    Only rows carrying ``trusted=1`` from the centralized evidence gate can
+    survive; legacy observations remain stored but cannot train the model.
     """
     try:
         rows = conn.execute("""
             SELECT o.item_id, o.hours_left, o.price + o.shipping, o.bids,
-                   o.fair, o.n_comps, o.observed_at, c.actual_price
+                   o.fair, o.n_comps, o.trusted, o.observed_at, c.actual_price
             FROM observations o JOIN closed c ON o.item_id = c.item_id
             WHERE o.fair > 0 AND c.actual_price > 0""").fetchall()
     except Exception:
-        # pre-migration database (no n_comps column)
-        rows = [(r[0], r[1], r[2], r[3], r[4], None, r[5], r[6])
-                for r in conn.execute("""
-            SELECT o.item_id, o.hours_left, o.price + o.shipping, o.bids,
-                   o.fair, o.observed_at, c.actual_price
-            FROM observations o JOIN closed c ON o.item_id = c.item_id
-            WHERE o.fair > 0 AND c.actual_price > 0""").fetchall()]
+        try:
+            # Intermediate schema: evidence count existed, but observations
+            # predated the centralized trust gate.
+            rows = [(r[0], r[1], r[2], r[3], r[4], r[5], None, r[6], r[7])
+                    for r in conn.execute("""
+                SELECT o.item_id, o.hours_left, o.price + o.shipping, o.bids,
+                       o.fair, o.n_comps, o.observed_at, c.actual_price
+                FROM observations o JOIN closed c ON o.item_id = c.item_id
+                WHERE o.fair > 0 AND c.actual_price > 0""").fetchall()]
+        except Exception:
+            # Original schema: neither evidence nor trust was recorded.
+            rows = [(r[0], r[1], r[2], r[3], r[4], None, None, r[5], r[6])
+                    for r in conn.execute("""
+                SELECT o.item_id, o.hours_left, o.price + o.shipping, o.bids,
+                       o.fair, o.observed_at, c.actual_price
+                FROM observations o JOIN closed c ON o.item_id = c.item_id
+                WHERE o.fair > 0 AND c.actual_price > 0""").fetchall()]
     lo, hi = ratio_band
     out, stats = [], collections.Counter()
-    for item_id, hrs, cost, bids, fair, n_comps, seen, actual in rows:
+    for item_id, hrs, cost, bids, fair, n_comps, trusted, seen, actual in rows:
         stats["joined"] += 1
         if fair < min_fair:
             stats["dropped_fair_below_floor"] += 1
@@ -92,6 +104,9 @@ def _training_rows(conn, *, min_fair: float = DEFAULT_MIN_FAIR,
             continue
         if n_comps < min_comps:
             stats["dropped_thin_comps"] += 1
+            continue
+        if trusted != 1:
+            stats["dropped_no_trust_attestation"] += 1
             continue
         target = actual / fair
         if not (lo <= target <= hi):

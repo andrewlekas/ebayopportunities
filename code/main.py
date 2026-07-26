@@ -24,6 +24,7 @@ import yaml
 import db as histdb
 import paths
 from models import Opportunity
+from quality import evidence_rejection, is_tradeable
 from report import write_report
 from scrapers import ALL_SCRAPERS
 from valuation import ValuationEngine
@@ -263,6 +264,34 @@ def output_ok(o, *, min_ev: float = 0.0, poke_floor: float = 3.0,
         return True
 
 
+def persist_trusted_evidence(conn, o: Opportunity, config: dict,
+                             fair_recorded: bool = False
+                             ) -> tuple[bool, str | None]:
+    """Persist only evidence that is safe for trends and model training.
+
+    Returns ``(fair_recorded, rejection_reason)`` so run_live can record one
+    fair-history point per query and summarize everything the gate rejected.
+    """
+    algo = config.get("algorithm", {}) or {}
+    min_fair = algo.get(
+        "learner_min_fair", algo.get("min_observation_fair", 50.0))
+    min_comps = algo.get("learner_min_comps", 3)
+    reason = evidence_rejection(
+        o, collection_passed=collection_ok(o, config),
+        min_fair=min_fair, min_comps=min_comps)
+    if reason:
+        return fair_recorded, reason
+
+    l, v = o.listing, o.valuation
+    if not fair_recorded:
+        histdb.record_fair(conn, l.query, v.fair_value, v.n_comps)
+        fair_recorded = True
+    v.trend_30d = histdb.trend_30d(conn, l.query, v.fair_value)
+    # record_observation itself ignores BINs and listings without a stable id.
+    histdb.record_observation(conn, l, v)
+    return fair_recorded, None
+
+
 def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportunity]:
     sites = config.get("sites", ["ebay"])
     max_results = config.get("scraping", {}).get("max_results_per_query", 40)
@@ -402,14 +431,10 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
     t_fetch = time.monotonic() - t_fetch
 
     # ---- phase C (main thread): DB writes, filtering, valuation
-    # Trust floor for anything we WRITE DOWN. The report's own floor
-    # (filters.min_value) is applied much later, so without this every
-    # mongrel $2.85 valuation still landed in fair_history (poisoning trends
-    # and portfolio marks) and in observations (poisoning the learner - it
-    # is what produced settle_ratio 1.276 on 2026-07-25).
-    min_obs_fair = config.get("algorithm", {}).get(
-        "min_observation_fair", 50.0)
-    n_obs_skipped = 0
+    # Rejections from the centralized evidence gate.  The report's browsing
+    # tabs may still show these rows, but trends and learning never see them.
+    import collections
+    evidence_skips: collections.Counter = collections.Counter()
     n_comp_junk = [0]        # list so the loop below can accumulate into it
     t_val = time.monotonic()
     opps: list[Opportunity] = []
@@ -504,25 +529,10 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
             asks = [c for k, c in ask_pool if k != key]
             opp = engine.evaluate(listing, comps, asks)
             v = opp.valuation
-            # discovery queries (mixed-median comps) and ask-based estimates
-            # are too soft for trend history / calibration training data
-            ask_based = any(n.startswith("ASK-BASED") for n in v.notes)
-            if v.fair_value > 0 and not discovery and not ask_based:
-                if v.fair_value < min_obs_fair:
-                    # not trustworthy enough to learn from or to mark a
-                    # position against - the row still appears in the report
-                    n_obs_skipped += 1
-                else:
-                    # regraded rows (listing grade != query grade) carry a
-                    # per-listing fair value - keep them OUT of the query's
-                    # fair_history/trend, which tracks the query's own grade
-                    if not fair_recorded and not v.regraded and not v.disputed:
-                        histdb.record_fair(conn, query, v.fair_value, v.n_comps)
-                        fair_recorded = True
-                    if not v.regraded:
-                        v.trend_30d = histdb.trend_30d(conn, query,
-                                                       v.fair_value)
-                    histdb.record_observation(conn, listing, v)
+            fair_recorded, rejected = persist_trusted_evidence(
+                conn, opp, config, fair_recorded)
+            if rejected:
+                evidence_skips[rejected] += 1
             opps.append(opp)
 
     # BIN sweeps run all day: use each one to quietly refresh a few stale
@@ -559,10 +569,11 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
         log.info("comp screen: ignored %d sold comp(s) matching an excluded "
                  "keyword (reprints, 'you pick' lots) - they were setting "
                  "fair values", n_comp_junk[0])
-    if n_obs_skipped:
-        log.info("trust floor: %d listing(s) valued below $%g were NOT "
-                 "recorded to history (kept out of the learner, trends and "
-                 "portfolio marks)", n_obs_skipped, min_obs_fair)
+    if evidence_skips:
+        log.info("evidence gate: %d valuation(s) kept out of learner/history "
+                 "(%s)", sum(evidence_skips.values()),
+                 "; ".join(f"{reason} x{n}"
+                           for reason, n in evidence_skips.most_common()))
     if comps_mod.UNPARSEABLE_GRADES:
         log.info("grade parser: ignored %d impossible grade token(s): %s",
                  sum(comps_mod.UNPARSEABLE_GRADES.values()),
@@ -811,7 +822,7 @@ def main() -> int:
             conn.close()
             for o in kept:
                 v = o.valuation
-                if v.fair_value > 0 and not o.listing.discovery:
+                if is_tradeable(o):
                     fairs[o.listing.query.lower()] = v.fair_value
             portfolio_rows = pf.build_rows(config, fairs, pf_dir)
         except Exception:

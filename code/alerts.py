@@ -29,6 +29,7 @@ import requests
 
 import db as histdb
 from models import Opportunity
+from quality import is_tradeable, tradeability_rejection
 from scrapers.base import note_api
 from security import redact_text
 
@@ -139,15 +140,11 @@ def send_alerts(opps: list[Opportunity], config: dict, db_path: str) -> int:
 
     def passes(o):
         v, l = o.valuation, o.listing
-        if not (v.edge_now >= min_edge and min_roi <= v.roi <= max_roi
+        if not (is_tradeable(o)
+                and v.edge_now >= min_edge and min_roi <= v.roi <= max_roi
                 and v.confidence >= min_conf
                 and (l.priority or not priority_only)
-                and not l.discovery
-                and not any("SUSPICIOUS" in n for n in v.notes)
-                # a set-wide median across different cards is not a price:
-                # "Michael Jordan 1984 Star" mixes #101, #288 and #195 into
-                # one $29 number. Browsable in the report, never alertable.
-                and not any("MIXED POOL" in n for n in v.notes)):
+                ):
             return False
         # Capture gates BINs only: a fresh underpriced BIN is real, a stale
         # one is stale for a reason. Auctions with a big edge are worth an
@@ -158,6 +155,15 @@ def send_alerts(opps: list[Opportunity], config: dict, db_path: str) -> int:
         return True
 
     hot = [o for o in opps if passes(o)]
+    blocked = {}
+    for o in opps:
+        reason = tradeability_rejection(o)
+        if reason:
+            blocked[reason] = blocked.get(reason, 0) + 1
+    if blocked:
+        log.info("alerts: tradeability gate blocked %d row(s): %s",
+                 sum(blocked.values()),
+                 ", ".join(f"{k}={v}" for k, v in sorted(blocked.items())))
     log.info("alerts: %d of %d rows passed gates (edge>=%s roi %s-%s "
              "conf>=%s capture>=%s priority_only=%s)", len(hot), len(opps),
              min_edge, min_roi, max_roi, min_conf, min_capture, priority_only)
@@ -175,7 +181,7 @@ def send_alerts(opps: list[Opportunity], config: dict, db_path: str) -> int:
         gh = []
         for o in opps:
             l = o.listing
-            if not l.grail:
+            if not l.grail or not is_tradeable(o):
                 continue
             if l.listing_type == "fixed":
                 age = l.age_hours

@@ -48,6 +48,10 @@
 - `alerts:` thresholds + Telegram credentials
 - `algorithm:` settle ratio, fees, grader shift/premiums, capture half-lives
 - `scraping:` delays, circuit breaker, html comps pause/resume, misspell
+- **Central trust gates**: disputed, suspicious, mixed-pool, ask-based,
+  discovery, regraded, thin-comp and collection-rejected valuations cannot
+  contaminate learning/history; decision outputs share the same tradeability
+  policy while category tabs retain questionable rows for research.
 
 ## Backlog
 Fanatics Collect + Alt scrapers, Mercari JP, velocity/annualized return,

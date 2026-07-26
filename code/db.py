@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS observations(
     item_id TEXT, site TEXT, query TEXT, title TEXT, listing_type TEXT,
     price REAL, shipping REAL, bids INTEGER, end_time TEXT,
     fair REAL, predicted_settle REAL, hours_left REAL, observed_at TEXT,
-    n_comps INTEGER, confidence REAL);
+    n_comps INTEGER, confidence REAL, trusted INTEGER);
 CREATE TABLE IF NOT EXISTS closed(
     item_id TEXT PRIMARY KEY, actual_price REAL, closed_at TEXT);
 CREATE TABLE IF NOT EXISTS alerts(
@@ -50,7 +50,11 @@ OBS_BASE_COLS = ("item_id", "site", "query", "title", "listing_type",
 # n_comps/confidence record HOW TRUSTWORTHY the fair value was at the time.
 # Without them the learner had no way to tell a well-comped $2,500 valuation
 # from a mongrel $2.85 one, and trained on both equally (2026-07-25).
-OBS_ADDED_COLS = (("n_comps", "INTEGER"), ("confidence", "REAL"))
+# trusted=1 attests that the row passed quality.evidence_rejection. Legacy
+# rows migrate as NULL and stay available for audit, but learner.py cannot
+# silently treat them as if today's safeguards had approved them.
+OBS_ADDED_COLS = (("n_comps", "INTEGER"), ("confidence", "REAL"),
+                  ("trusted", "INTEGER"))
 
 
 def canonical_item_id(url: str, site: str = "") -> str:
@@ -331,6 +335,7 @@ def record_observation(conn, listing: Listing, v: Valuation) -> None:
         "fair": v.fair_value, "predicted_settle": v.expected_cost,
         "hours_left": listing.hours_remaining, "observed_at": _now(),
         "n_comps": v.n_comps, "confidence": v.confidence,
+        "trusted": 1,
     }
     cols = observation_columns(conn)
     conn.execute(

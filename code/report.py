@@ -23,6 +23,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from models import Opportunity
+from quality import is_tradeable
 from textutil import fold
 from valuation.comps import (_subject_tokens, grade_info, title_match_score,
                              variant_conflict)
@@ -372,7 +373,7 @@ def _today_tab(wb, opps: list[Opportunity], config: dict) -> None:
     auctions, bins = [], []
     for o in opps:
         l, v = o.listing, o.valuation
-        if v.confidence < min_conf or v.disputed:
+        if not is_tradeable(o) or v.confidence < min_conf:
             continue
         if l.listing_type == "auction":
             hrs = l.hours_remaining
@@ -456,6 +457,8 @@ def _crossover_tab(wb, opps: list[Opportunity], config: dict) -> None:
     rows = []
     for o in opps:
         l, v = o.listing, o.valuation
+        if not is_tradeable(o):
+            continue
         gi = grade_info(l.title)
         if not gi or gi[0] == "psa":
             continue
@@ -588,7 +591,10 @@ def write_report(opps: list[Opportunity], path: str,
     # Watches are quarantined to their own tab: the valuation data there
     # (modifiers, box/papers, franken-watches) is less reliable than cards,
     # so they never mix into the Action view
-    action_pool = [o for o in main if _category(o.listing.query) != "Watches"]
+    action_pool = [
+        o for o in main
+        if _category(o.listing.query) != "Watches" and is_tradeable(o)
+    ]
     # same card from N sellers = one row ("+N more from $X" in Notes);
     # category tabs keep the full uncollapsed book
     action_pool = _collapse(action_pool)
@@ -666,10 +672,10 @@ def write_report(opps: list[Opportunity], path: str,
     meta = wb.create_sheet("About")
     rows = [
         ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
-        ("Today tab", "the end-of-day decision list: auctions ending within 24h in DEADLINE order, then fresh BINs. Floors: EV >= $75, conf >= 25% (output.today in config)"),
+        ("Today tab", "the end-of-day decision list: auctions ending within 24h in DEADLINE order, then fresh BINs. Floors: EV >= $75, conf >= 25% (output.today in config). Disputed, suspicious, mixed-pool and ask-based values are excluded"),
         ("Max Bid", "the highest all-in price that still leaves your target return (output.today.max_bid_target_roi, default 15%) after fees, tax and the vault route. This is the number to bid to"),
         ("Breakeven", "the price where profit is exactly zero. A wall, not a target - winning there earns nothing, and fair value is an estimate (see Conf)"),
-        ("Action tab", "top-scored rows + anything ending/fresh within 6h with positive EV (watches excluded - see Watches tab); duplicate cards collapsed to the best listing"),
+        ("Action tab", "tradeable top-scored rows + anything ending/fresh within 6h with positive EV (watches excluded - see Watches tab); duplicate cards collapsed to the best listing"),
         ("Expected Value", "fair value net of resale fees, minus expected all-in cost"),
         ("Edge Now", "fair value net of fees minus CURRENT price+shipping"),
         ("Capture", "how capturable the edge is (auction: time left; BIN: freshness)"),

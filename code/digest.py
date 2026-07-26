@@ -25,6 +25,7 @@ import logging
 import requests
 
 from models import Opportunity
+from quality import is_tradeable
 from security import redact_text
 
 log = logging.getLogger(__name__)
@@ -116,11 +117,8 @@ def send_digest(opps: list[Opportunity], config: dict,
     sent = 0
     profit = sorted(
         (o for o in opps
-         if not o.listing.discovery
+         if is_tradeable(o)
          and o.listing.query not in watch_queries
-         # mixed-pool rows carry a set-wide median, not a price for the
-         # card in front of you - they stay out of the phone digest
-         and not any("MIXED POOL" in n for n in o.valuation.notes)
          and o.valuation.expected_value > 0),
         key=lambda o: o.valuation.opportunity_score, reverse=True)[:n_opp]
     if profit:
@@ -134,6 +132,7 @@ def send_digest(opps: list[Opportunity], config: dict,
     grails = sorted(
         (o for o in opps
          if o.listing.grail and o.listing.listing_type == "auction"
+         and is_tradeable(o)
          and (o.listing.hours_remaining is None
               or o.listing.hours_remaining > 0)),
         key=lambda o: (-o.listing.grail_score,
