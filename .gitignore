@@ -1,0 +1,30 @@
+# macOS / Python
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+
+# Live configuration contains API and Telegram credentials.
+/config.yaml
+
+# Runtime databases, state, logs, reports, and learned artifacts.
+/database/
+/state/
+/logs/
+/reports/
+/test results/
+/model/
+
+# Andrew's private portfolio ledger.
+/portfolio/portfolio.csv
+
+# Generated output or scratch artifacts if they appear elsewhere.
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.pkl
+*.xlsx
+*.xls
+*.log
+

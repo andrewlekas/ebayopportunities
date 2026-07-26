@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+"""Collectibles auction/BIN arbitrage scanner.
+
+Usage:
+    python main.py                    # full scan (auctions + BINs)
+    python main.py --mode bin         # fast BIN sweep (priority queries,
+                                      #   cached comps) - cron this often
+    python main.py --mode auctions    # auctions only
+    python main.py --calibrate        # predicted-vs-actual model report
+    python main.py --demo             # synthetic data (no network/keys)
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+
+import yaml
+
+import db as histdb
+import paths
+from models import Opportunity
+from report import write_report
+from scrapers import ALL_SCRAPERS
+from valuation import ValuationEngine
+from report import _category
+import valuation.comps as comps_mod
+from valuation.comps import (GRADE_RE, grade_conflict, grade_info,
+                             language_conflict, subject_missing,
+                             title_match_score, variant_conflict)
+
+log = logging.getLogger("scanner")
+
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        config = yaml.safe_load(f)
+    # scrapers use this to keep state files (cookie jars) next to config
+    # regardless of the cwd cron happens to use
+    base = os.path.dirname(os.path.abspath(path))
+    config["_config_dir"] = base
+    # Resolve the database path against config.yaml's folder, not the
+    # current directory. A scan launched from anywhere now finds the real
+    # history.db instead of silently creating an empty one beside itself.
+    dbc = config.setdefault("database", {})
+    db_file = dbc.get("file") or paths.DEFAULT_DB
+    if not os.path.isabs(db_file):
+        db_file = os.path.join(base, db_file)
+    parent = os.path.dirname(db_file)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            pass
+    dbc["file"] = db_file
+    return config
+
+
+def _excluded(title: str, keywords: list[str]) -> bool:
+    t = title.lower()
+    return any(k.lower() in t for k in keywords)
+
+
+def collection_ok(o, config: dict, drops=None) -> bool:
+    """Andrew's collecting standards, applied per listing.
+
+    POKEMON: he only collects 1st Edition and No Rarity. Everything else
+    (unlimited, modern) is dropped - EXCEPT where the query already names a
+    specific vintage set he collects (Topsun, Carddass, Movie Promo), since
+    those are neither 1st Edition nor No Rarity but are exactly the thing
+    he asked for.
+
+    VIDEO GAMES: sealed or professionally graded only. Loose cartridges are
+    what made every game query value at $9-$70; he wants the collectible
+    tier, just with a lower dollar floor than cards.
+    """
+    def _drop(reason):
+        if drops is not None:
+            try:
+                drops[reason] = drops.get(reason, 0) + 1
+            except Exception:
+                pass
+        return False
+
+    l = o.listing
+    if l.grail:
+        return True
+    flt = config.get("filters", {}) or {}
+    cat = _category(l.query)
+
+    if cat == "Pokemon Cards" and flt.get("pokemon_eras_only", True):
+        markers = [str(m).lower() for m in
+                   (flt.get("pokemon_accepted_eras")
+                    or ["1st edition", "first edition", "1st ed", "no rarity"])]
+        exempt = [str(m).lower() for m in
+                  (flt.get("pokemon_era_exempt_queries")
+                   or ["topsun", "carddass", "movie promo", "no rarity"])]
+        q = (l.query or "").lower()
+        if not any(x in q for x in exempt):
+            t = (l.title or "").lower()
+            if not any(m in t for m in markers):
+                return _drop("Pokemon that is not 1st Edition / No Rarity")
+
+    if cat == "Video Games" and flt.get("video_games_sealed_or_graded", True):
+        t = (l.title or "").lower()
+        sealed = any(k in t for k in ("sealed", "new in box", "nib",
+                                      "shrink wrap", "shrinkwrap"))
+        if not (sealed or grade_info(l.title)):
+            return _drop("video game that is neither sealed nor graded")
+    return True
+
+
+def run_self_test(config: dict) -> tuple[bool, str]:
+    """Run the regression suite before scanning. (passed, one-line summary).
+
+    Run as a SUBPROCESS on purpose: the tests patch logging, build throwaway
+    databases and import half the codebase, none of which should touch the
+    state of a real scan. Costs about two seconds.
+
+    Fails CLOSED - if the suite cannot be run at all (missing file, import
+    error, timeout) that is itself a reason not to trust a live scan, so it
+    counts as a failure rather than being waved through.
+    """
+    cfg = config.get("self_test") or {}
+    timeout = cfg.get("timeout_seconds", 180)
+    code_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "unittest", "discover",
+             "-s", code_dir, "-p", "test_*.py"],
+            capture_output=True, text=True, timeout=timeout,
+            cwd=os.path.dirname(code_dir) or ".")
+    except subprocess.TimeoutExpired:
+        return False, f"self-test timed out after {timeout}s"
+    except (OSError, ValueError) as e:
+        return False, f"self-test could not be started ({e})"
+
+    out = f"{proc.stderr or ''}\n{proc.stdout or ''}"
+    m = re.search(r"Ran (\d+) tests?", out)
+    n = m.group(1) if m else "?"
+    if proc.returncode == 0:
+        return True, f"self-test: all {n} checks passed"
+    problems = [ln.strip() for ln in out.splitlines()
+                if ln.startswith(("FAIL:", "ERROR:"))]
+    detail = "; ".join(problems[:3]) or (
+        out.strip().splitlines()[-1] if out.strip() else "no output")
+    return False, f"self-test: {n} checks ran, FAILED - {detail}"
+
+
+def output_ok(o, *, min_ev: float = 0.0, poke_floor: float = 3.0,
+              drops=None) -> bool:
+    """Andrew's output rules - the report only shows actionable rows:
+
+      - grails are always kept (they have their own tab; profit is not the
+        point of that view)
+      - graded POKEMON at or below `poke_floor` in PSA-EQUIVALENT terms are
+        dropped. Pokemon only (sports/games/watches untouched); ungraded
+        listings are unaffected - a raw card is assumed PSA 5 but can still
+        be a gem
+      - nothing with negative expected value or negative ROI
+      - pure auctions (no buy-it-now) need >= 1 bid: at zero bids the
+        "current price" is the seller's opening ask, not a market. Hybrid
+        auction+BIN rows are exempt (the BIN is takeable), as is yahoo_jp
+        (Buyee does not expose bid counts).
+
+    Module-level ON PURPOSE. This logic used to be a closure inside main(),
+    which is how a stray `from report import _category` inside main() made
+    `_category` a local of the whole function and killed every run on
+    2026-07-25 with a NameError. Nothing here can be shadowed by a local
+    import somewhere else in main().
+    """
+    if drops is None:
+        drops = {}
+
+    def _drop(reason):
+        try:
+            drops[reason] = drops.get(reason, 0) + 1
+        except Exception:
+            pass
+        return False
+
+    try:
+        l, v = o.listing, o.valuation
+        if l.grail:
+            return True
+        gi = grade_info(l.title)
+        if (gi and float(gi[2]) <= poke_floor
+                and _category(l.query) == "Pokemon Cards"):
+            return _drop("graded Pokemon at or below PSA %g" % poke_floor)
+        if v.expected_value < min_ev:
+            return _drop("expected value < $%g" % min_ev)
+        if v.roi < 0:
+            return _drop("negative ROI")
+        # A zero-bid auction has no market yet. The hybrid exemption only
+        # holds when we actually KNOW the buy-it-now price - otherwise the
+        # row would be priced off the seller's opening ask.
+        takeable_bin = l.has_buy_now and getattr(l, "buy_now_price", 0) > 0
+        if (l.listing_type == "auction" and l.bid_count < 1
+                and not takeable_bin and l.site != "yahoo_jp"):
+            return _drop("zero-bid auction with no takeable buy-it-now")
+        return True
+    except Exception:
+        # a bad row must never kill the whole report - log it loudly (with
+        # the listing so it's findable) and keep the row visible
+        log.exception("output_ok crashed on listing %r (site=%s, query=%r)"
+                      " - keeping row",
+                      getattr(o.listing, "title", "?"),
+                      getattr(o.listing, "site", "?"),
+                      getattr(o.listing, "query", "?"))
+        return True
+
+
+def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportunity]:
+    sites = config.get("sites", ["ebay"])
+    max_results = config.get("scraping", {}).get("max_results_per_query", 40)
+    flt = config.get("filters", {})
+    price_max = flt.get("max_price") or float("inf")
+    exclude = flt.get("exclude_keywords") or []
+    dbc = config.get("database", {})
+    conn = histdb.connect(dbc.get("file", "history.db"))
+    cache_hours = dbc.get("comp_cache_hours", 24)
+
+    scrapers = {s: ALL_SCRAPERS[s](config) for s in sites if s in ALL_SCRAPERS}
+    ebay = scrapers.get("ebay")
+
+    scfg = config.get("scraping", {})
+    p130 = None
+    if scfg.get("use_130point", True):
+        from scrapers.point130 import Point130Scraper
+        p130 = Point130Scraper(config)
+    # eBay sold-page fetching can be paused (bot-block cooldown) with an
+    # automatic resume time so nobody has to remember to flip it back
+    use_html = scfg.get("use_html_comps", True)
+    resume = scfg.get("html_comps_resume")
+    if not use_html and resume:
+        from datetime import datetime
+        if datetime.now() >= datetime.fromisoformat(str(resume)):
+            use_html = True
+            log.info("eBay sold-page fetching auto-resumed (cooldown over)")
+
+    entries = config.get("watchlist", [])
+    if mode == "bin" and config.get("bin", {}).get("priority_only", True):
+        entries = [e for e in entries
+                   if e.get("priority") or GRADE_RE.search(e["query"])]
+        log.info("BIN sweep: %d priority queries", len(entries))
+
+    # grail hunt: full scans also search every personal-collection grail as
+    # its own soft-valued query (discovery -> quarantined from alerts/ML),
+    # and every listing from every query gets checked against the list
+    import grails as grails_mod
+    grail_list = grails_mod.load_grails(config)
+    # grails must be substantial: below this price a "match" on a generic
+    # grail (Batman, Grant Hill...) is almost certainly not the real thing
+    grail_min = config.get("grail_min_price", 3000)
+    if mode == "all" and grail_list:
+        have = {e["query"].lower() for e in entries}
+        entries = entries + [{"query": g.name, "discovery": True}
+                             for g in grail_list
+                             if g.name.lower() not in have]
+        log.info("grail hunt: %d grail queries added", len(grail_list))
+
+    # ---- phase A (main thread): read comp caches; plan the network work
+    plans = []
+    for entry in entries:
+        cached = histdb.cached_comps(conn, entry["query"], cache_hours) or []
+        plans.append((entry, cached))
+
+    # prefetch the OAuth token once so parallel workers don't race for it
+    if ebay:
+        ebay._get_token()
+
+    # ---- phase B (parallel): all network fetching. Queries run in a small
+    # thread pool; per-site politeness is preserved because each scraper's
+    # HTML lane is a lock (one request at a time, same delays as before).
+    # No DB access happens in workers - SQLite connections aren't shared
+    # across threads.
+    mis_cfg = config.get("misspell", {})
+    intl_pri_only = config.get("scraping", {}).get(
+        "international_priority_only", True)
+
+    def fetch(plan):
+        entry, cached = plan
+        query = entry["query"]
+        discovery = bool(entry.get("discovery"))
+        priority = (not discovery) and (bool(entry.get("priority"))
+                                        or bool(GRADE_RE.search(query)))
+        log.info("query: %s", query)
+        try:
+            # comps: fresh cache -> 130point -> eBay sold pages
+            fetched = []
+            if not cached:
+                if p130:
+                    fetched = p130.search_sold(query)
+                if not fetched and ebay and use_html:
+                    fetched = ebay.search_sold(query)
+
+            # speed: international marketplaces + Yahoo JP only for priority
+            # queries (that's where the cross-market edge is), unless disabled
+            intl = priority or not intl_pri_only
+
+            listings = []
+            if mode in ("all", "auctions"):
+                for name, s in scrapers.items():
+                    if name == "yahoo_jp":
+                        if not intl:
+                            continue
+                        found = s.search_auctions(query, max_results,
+                                                  query_ja=entry.get("query_ja"))
+                    elif name == "ebay":
+                        found = s.search_auctions(query, max_results, intl=intl)
+                    else:
+                        found = s.search_auctions(query, max_results)
+                    log.info("  %s: %d auctions (%s)", name, len(found), query)
+                    listings += found
+            if mode in ("all", "bin") and ebay:
+                found = ebay.search_fixed(query, max_results, intl=intl)
+                log.info("  ebay: %d fixed-price (%s)", len(found), query)
+                listings += found
+
+            # misspelling hunter: priority queries only, full scans only (to
+            # stay inside API quota) - typo'd listings get few bidders
+            if (mode == "all" and priority and ebay
+                    and mis_cfg.get("enabled", True)):
+                from misspell import variant_queries
+                n_mis = 0
+                for vq in variant_queries(query, mis_cfg.get("max_variants", 4)):
+                    for l in (ebay.search_auctions(vq, 20, intl=False)
+                              + ebay.search_fixed(vq, 20, intl=False)):
+                        l.misspell_from = vq
+                        listings.append(l)
+                        n_mis += 1
+                if n_mis:
+                    log.info("  misspell variants: %d listings (%s)",
+                             n_mis, query)
+        except Exception:
+            # one bad query must not kill an unattended cron run
+            log.exception("query %r failed - skipping", query)
+            return entry, cached, [], []
+        return entry, cached, fetched, listings
+
+    t_fetch = time.monotonic()
+    workers = max(1, int(scfg.get("parallel_queries", 6)))
+    if workers > 1 and len(plans) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(fetch, plans))
+    else:
+        results = [fetch(p) for p in plans]
+    t_fetch = time.monotonic() - t_fetch
+
+    # ---- phase C (main thread): DB writes, filtering, valuation
+    # Trust floor for anything we WRITE DOWN. The report's own floor
+    # (filters.min_value) is applied much later, so without this every
+    # mongrel $2.85 valuation still landed in fair_history (poisoning trends
+    # and portfolio marks) and in observations (poisoning the learner - it
+    # is what produced settle_ratio 1.276 on 2026-07-25).
+    min_obs_fair = config.get("algorithm", {}).get(
+        "min_observation_fair", 50.0)
+    n_obs_skipped = 0
+    n_comp_junk = [0]        # list so the loop below can accumulate into it
+    t_val = time.monotonic()
+    opps: list[Opportunity] = []
+    for entry, cached, fetched, listings in results:
+        query = entry["query"]
+        cap = entry.get("max_buy_price")
+        discovery = bool(entry.get("discovery"))
+        priority = (not discovery) and (bool(entry.get("priority"))
+                                        or bool(GRADE_RE.search(query)))
+
+        comps = cached
+        if not comps:
+            if fetched:
+                comps = fetched
+                histdb.save_comps(conn, query, comps)
+                matched = histdb.match_closed(conn, comps)
+                if matched:
+                    log.info("  calibration: matched %d closed auctions (%s)",
+                             matched, query)
+            else:
+                comps = histdb.cached_comps(conn, query, cache_hours,
+                                            allow_stale=True) or []
+                if comps:
+                    log.info("  using stale comp cache for %s "
+                             "(fresh fetch blocked)", query)
+        # Screen the COMPS with the same keyword blacklist the listings get.
+        # It was only ever applied to listings, so 415 of 8,114 cached comps
+        # were "reprint" / "you pick" lots quietly setting fair values - the
+        # Babe Ruth 1933 pool had a median of $6 because of them.
+        if exclude and comps:
+            n_raw = len(comps)
+            comps = [c for c in comps if not _excluded(c.title, exclude)]
+            if n_raw != len(comps):
+                n_comp_junk[0] += n_raw - len(comps)
+        log.info("  %d sold comps (%s)", len(comps), query)
+
+        min_match = flt.get("min_listing_match", 0.6)
+        seen_ids: set[str] = set()
+        relevant: list[tuple[str, object]] = []
+        for listing in listings:
+            # dedupe: the same item shows up once per marketplace searched
+            m = histdb.ITEM_ID_RE.search(listing.url or "")
+            key = m.group(1) if m else (listing.listing_id or listing.url)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            if _excluded(listing.title, exclude):
+                continue
+            # relevance guard: wrong grade or barely-matching title = out
+            # (Japanese titles can't fuzzy-match English; they're exempt
+            # and handled by the engine's JP confidence rule instead)
+            if grade_conflict(query, listing.title):
+                continue
+            # foreign-language versions price differently - not our market
+            if listing.site != "yahoo_jp" and language_conflict(query, listing.title):
+                continue
+            # holo/non-holo, 1st ed/unlimited/shadowless = different cards
+            if variant_conflict(query, listing.title):
+                continue
+            if (listing.site != "yahoo_jp" and not discovery
+                    and not listing.misspell_from):  # typo'd titles can't match
+                # wrong-subject guard: a Magneton is not a Gengar no matter
+                # how well the set/grade context matches
+                if subject_missing(query, listing.title):
+                    continue
+                if title_match_score(query, listing.title) < min_match:
+                    continue
+            if cap and listing.total_cost_now > cap:
+                continue
+            if listing.total_cost_now > price_max:
+                continue
+            listing.priority = priority
+            listing.discovery = discovery
+            # grail tagging: any listing from any query can be a grail -
+            # but only at grail money ($3k+ default; cheap "matches" on
+            # generic names are noise, not grails)
+            gm = grails_mod.match(grail_list, listing.title)
+            if (gm and listing.total_cost_now >= grail_min
+                    and not (gm.max_price
+                             and listing.total_cost_now > gm.max_price)):
+                listing.grail = gm.name
+                listing.grail_score = gm.score
+            relevant.append((key, listing))
+
+        # live fixed-price asks for this query: last-resort valuation
+        # source when sold comps and guide prices are both unavailable
+        ask_pool = [(k, l.total_cost_now) for k, l in relevant
+                    if l.listing_type == "fixed" and l.total_cost_now > 0]
+
+        fair_recorded = False
+        for key, listing in relevant:
+            asks = [c for k, c in ask_pool if k != key]
+            opp = engine.evaluate(listing, comps, asks)
+            v = opp.valuation
+            # discovery queries (mixed-median comps) and ask-based estimates
+            # are too soft for trend history / calibration training data
+            ask_based = any(n.startswith("ASK-BASED") for n in v.notes)
+            if v.fair_value > 0 and not discovery and not ask_based:
+                if v.fair_value < min_obs_fair:
+                    # not trustworthy enough to learn from or to mark a
+                    # position against - the row still appears in the report
+                    n_obs_skipped += 1
+                else:
+                    # regraded rows (listing grade != query grade) carry a
+                    # per-listing fair value - keep them OUT of the query's
+                    # fair_history/trend, which tracks the query's own grade
+                    if not fair_recorded and not v.regraded and not v.disputed:
+                        histdb.record_fair(conn, query, v.fair_value, v.n_comps)
+                        fair_recorded = True
+                    if not v.regraded:
+                        v.trend_30d = histdb.trend_30d(conn, query,
+                                                       v.fair_value)
+                    histdb.record_observation(conn, listing, v)
+            opps.append(opp)
+
+    # BIN sweeps run all day: use each one to quietly refresh a few stale
+    # background comp caches so the big daily scan finds everything warm
+    warm_src = (p130 if (p130 and not p130.tripped)
+                else ebay if (ebay and use_html and not ebay.tripped) else None)
+    if mode == "bin" and warm_src:
+        warm_n = config.get("scraping", {}).get("comps_warm_per_sweep", 3)
+        active = {e["query"] for e in entries}
+        warmed = 0
+        for e in config.get("watchlist", []):
+            if warmed >= warm_n:
+                break
+            # the source can trip PART WAY through warming (this loop is the
+            # one piece of work unique to BIN sweeps) - stop asking the
+            # moment it does, instead of walking the rest of the watchlist
+            if warm_src.tripped:
+                log.info("comp warming stopped early: %s is backing off",
+                         warm_src.site)
+                break
+            q = e["query"]
+            if q in active or histdb.cached_comps(conn, q, cache_hours):
+                continue
+            c = warm_src.search_sold(q)
+            if c:
+                histdb.save_comps(conn, q, c)
+                histdb.match_closed(conn, c)
+                warmed += 1
+        if warmed:
+            log.info("warmed comp caches for %d background queries", warmed)
+
+    conn.close()
+    if n_comp_junk[0]:
+        log.info("comp screen: ignored %d sold comp(s) matching an excluded "
+                 "keyword (reprints, 'you pick' lots) - they were setting "
+                 "fair values", n_comp_junk[0])
+    if n_obs_skipped:
+        log.info("trust floor: %d listing(s) valued below $%g were NOT "
+                 "recorded to history (kept out of the learner, trends and "
+                 "portfolio marks)", n_obs_skipped, min_obs_fair)
+    if comps_mod.UNPARSEABLE_GRADES:
+        log.info("grade parser: ignored %d impossible grade token(s): %s",
+                 sum(comps_mod.UNPARSEABLE_GRADES.values()),
+                 ", ".join(f"{k} x{v}" for k, v in
+                           comps_mod.UNPARSEABLE_GRADES.most_common(8)))
+    # where did the minutes go? (network fetch vs valuation+DB) - the
+    # answer to "why was this run slow" should be one grep away
+    log.info("timing: fetch %.0fs, valuation+db %.0fs (%d queries, "
+             "%d workers)", t_fetch, time.monotonic() - t_val,
+             len(plans), workers)
+    return opps
+
+
+def run_demo(config: dict, engine: ValuationEngine) -> list[Opportunity]:
+    import demo_data
+    engine.guide.guide_value = demo_data.demo_guide_value  # stub guide API
+    opps = []
+    for query in demo_data.MARKET:
+        comps = demo_data.demo_comps(query)
+        for listing in demo_data.demo_listings(query):
+            opps.append(engine.evaluate(listing, comps))
+    return opps
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Collectibles auction EV scanner")
+    ap.add_argument("-c", "--config", default="config.yaml")
+    ap.add_argument("-o", "--output", default=None)
+    ap.add_argument("--mode", choices=["all", "auctions", "bin"], default="all")
+    ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="print predicted-vs-actual calibration report")
+    ap.add_argument("--skip-self-test", action="store_true",
+                    help="scan even if the regression suite fails "
+                         "(override - the scan is normally blocked)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(name)s: %(message)s")
+    # persistent log so cron runs leave evidence (scan.log next to config,
+    # ~2MB x 3 rotations). Every run logs start/end, comps counts, alert
+    # decisions and delivery results - "did alerts fire today?" is now
+    # answerable from the file instead of guesswork.
+    try:
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(
+            paths.file_in(paths.base_dir(config_path=args.config),
+                          paths.LOGS, "scan.log"),
+            maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        fh.setLevel(logging.INFO)
+        logging.getLogger().addHandler(fh)
+    except OSError:
+        pass
+    log.info("=== run start: mode=%s demo=%s ===", args.mode, args.demo)
+
+    config = load_config(args.config)
+
+    # --- self-test gate --------------------------------------------------
+    # Run the regression suite BEFORE touching anything. If a check fails,
+    # the valuation logic can no longer be trusted, so the scan is stopped
+    # before it takes the lock, hits eBay, writes to the database or
+    # produces a report anyone might act on. --demo and --calibrate are
+    # exempt: they are how you diagnose a failure.
+    if not (args.demo or args.calibrate or args.skip_self_test):
+        if (config.get("self_test") or {}).get("before_every_scan", True):
+            passed, summary = run_self_test(config)
+            if not passed:
+                log.error("TEST RUN FAILED - scan aborted. %s", summary)
+                log.error("Nothing was scanned, nothing was written and no "
+                          "report was produced. Double-click 'Run Tests."
+                          "command' to see which check failed. To scan "
+                          "anyway, add --skip-self-test.")
+                return 2
+            log.info("%s", summary)
+
+    # --- single-run lock -------------------------------------------------
+    # Overlapping scans (manual run + cron sweep) defeat the per-site
+    # politeness delays - two processes hitting eBay/130point at once look
+    # like a bot swarm and invite blocks - and contend on SQLite writes.
+    # BIN sweeps just skip (the next one is <=30 min away). Full scans
+    # PREEMPT whatever holds the lock: cron sweeps now take 15-20+ min
+    # (bot-challenge cooldowns), so the lock is held almost continuously
+    # and the old "wait up to 15 min" made every manual run look broken.
+    # Losing a sweep is harmless - the next one is <=30 min away.
+    lock_handle = None          # held (not closed) for the whole run
+    if not args.demo and not args.calibrate:
+        import fcntl
+        import signal
+        lock_path = paths.file_in(paths.base_dir(config_path=args.config),
+                                  paths.STATE, ".scan.lock")
+        # "a+" not "w": must NOT truncate - the holder's "<pid> <mode>
+        # <started>" line is what makes the messages below informative.
+        lock_handle = open(lock_path, "a+")
+
+        def _try_lock():
+            try:
+                fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                return False
+
+        if not _try_lock():
+            try:
+                lock_handle.seek(0)
+                pid_s, h_mode, h_start = lock_handle.read().split()[:3]
+                holder_pid = int(pid_s)
+                holder = "pid %s, mode=%s, started %s" % (pid_s, h_mode,
+                                                          h_start)
+            except (ValueError, IndexError, OSError):
+                holder_pid, holder = None, "unknown holder"
+            if args.mode == "bin":
+                log.info("another scan is already running (%s) - skipping "
+                         "this sweep (next one runs in 30 min)", holder)
+                return 0
+            log.info("another scan is running (%s) - stopping it so this "
+                     "run can start now", holder)
+            acquired = False
+            if holder_pid:
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.kill(holder_pid, sig)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    deadline = time.time() + 20
+                    while time.time() < deadline:
+                        if _try_lock():
+                            acquired = True
+                            break
+                        time.sleep(1)
+                    if acquired:
+                        break
+            if not acquired and not _try_lock():
+                log.warning("could not take over the scan lock (holder: %s)"
+                            " - giving up on this run", holder)
+                return 1
+        # record who holds the lock so contenders can log something useful
+        try:
+            lock_handle.seek(0)
+            lock_handle.truncate()
+            lock_handle.write("%d %s %s\n" % (
+                os.getpid(), args.mode,
+                time.strftime("%Y-%m-%dT%H:%M:%S")))
+            lock_handle.flush()
+        except OSError:
+            pass
+
+    if args.calibrate:
+        conn = histdb.connect(config.get("database", {}).get("file", "history.db"))
+        print(histdb.calibration_report(conn))
+        return 0
+
+    engine = ValuationEngine(config)
+    opps = (run_demo(config, engine) if args.demo
+            else run_live(config, engine, args.mode))
+
+    # The report shows the whole ranked book (everything above the fair-value
+    # floor), not just positive-EV rows - alerts remain strictly gated, and
+    # EV/score columns make the winners obvious.
+    min_value = config.get("filters", {}).get("min_value", 0)
+    max_rows = config.get("output", {}).get("max_rows", 1000)
+    # ROI above this is almost always a data error (wrong variant, mixed
+    # comps, typo'd price) rather than a real deal - drop as too-good-to-be-true
+    max_roi = config.get("filters", {}).get("max_roi", 2.0)
+    # Per-category value floor: a sealed graded NES game worth $400 is a
+    # real opportunity even though $400 would be noise for a card. Games
+    # keep their own (lower) floor; the quality bar for them is sealed or
+    # graded, enforced in collection_ok - not the dollar amount.
+    by_cat = config.get("filters", {}).get("min_value_by_category") or {}
+
+    def _floor(o):
+        return max(by_cat.get(_category(o.listing.query), min_value), 0.01)
+
+    dropped_tgtbt = sum(1 for o in opps if o.valuation.roi > max_roi)
+    kept = [o for o in opps
+            if o.valuation.fair_value >= _floor(o)
+            and o.valuation.roi <= max_roi]
+    if dropped_tgtbt:
+        log.info("dropped %d too-good-to-be-true rows (ROI > %.0f%%)",
+                 dropped_tgtbt, max_roi * 100)
+
+    # Andrew's output rules - the report only shows actionable rows:
+    #  - NOTHING with negative expected value, any listing type (config:
+    #    output.min_expected_value, default 0)
+    #  - pure auctions (no buy-it-now option) need >= 1 bid: with zero bids
+    #    the "current price" is just the seller's opening ask, not a market.
+    #    Hybrid auction+BIN rows are exempt (the BIN is takeable), and so is
+    #    yahoo_jp (Buyee does not expose bid counts).
+    min_ev = config.get("output", {}).get("min_expected_value", 0)
+    # Pokemon grade floor (Andrew's rule): graded Pokemon cards at an
+    # effective PSA 3 or below are never interesting - drop them. Applies
+    # to Pokemon ONLY (sports/games/watches untouched), grails exempt,
+    # ungraded listings unaffected (they're assumed PSA 5 and can be raw
+    # gems). Effective grade means shift applied: a CGC 4 (= PSA 3) drops.
+    poke_floor = config.get("filters", {}).get("pokemon_grade_floor", 3.0)
+
+    import collections
+    drops: collections.Counter = collections.Counter()
+    if not kept and opps:
+        # nothing got a usable fair value: valuation sources are broken -
+        # this is a diagnosis problem, not "no deals"
+        log.warning("no rows had usable fair values - check valuation "
+                    "sources in the log above")
+    n_before = len(kept)
+    kept = [o for o in kept if collection_ok(o, config, drops=drops)]
+    kept = [o for o in kept
+            if output_ok(o, min_ev=min_ev, poke_floor=poke_floor, drops=drops)]
+    if n_before != len(kept):
+        log.info("output rules dropped %d rows: %s", n_before - len(kept),
+                 "; ".join(f"{reason} x{n}"
+                           for reason, n in drops.most_common()))
+    log.info("report: %d actionable rows", len(kept))
+    if len(kept) > max_rows:   # trim lowest-scoring rows, keep the best
+        # grails are never trimmed - their value isn't the score column
+        g = [o for o in kept if o.listing.grail]
+        rest = sorted((o for o in kept if not o.listing.grail),
+                      key=lambda o: o.valuation.opportunity_score,
+                      reverse=True)[:max(0, max_rows - len(g))]
+        kept = g + rest
+    if not kept:
+        # NEVER pad the report with non-actionable rows - an empty run is
+        # an honest answer ("no deals right now"), not an error
+        if opps:
+            log.info("scanned %d listings; none passed the output rules "
+                     "(positive EV, bids on pure auctions) - no actionable "
+                     "deals this run", len(opps))
+        else:
+            log.error("nothing scanned at all - check network/API keys/"
+                      "scan.log")
+        return 1
+
+    out = args.output or config.get("output", {}).get("file", "opportunities.xlsx")
+    # portfolio: mark positions to market with this run's fair values,
+    # falling back to the latest recorded history for unscanned queries
+    portfolio_rows = None
+    if not args.demo:
+        try:
+            import portfolio as pf
+            pf_dir = paths.folder(paths.base_dir(config), paths.PORTFOLIO)
+            pf.ensure_template(pf_dir)
+            conn = histdb.connect(
+                config.get("database", {}).get("file", paths.DEFAULT_DB))
+            fairs = pf.latest_fairs(conn)
+            conn.close()
+            for o in kept:
+                v = o.valuation
+                if v.fair_value > 0 and not o.listing.discovery:
+                    fairs[o.listing.query.lower()] = v.fair_value
+            portfolio_rows = pf.build_rows(config, fairs, pf_dir)
+        except Exception:
+            log.exception("portfolio marking failed - continuing")
+    write_report(kept, out, portfolio=portfolio_rows, config=config)
+    opps = kept
+
+    if not args.demo:
+        from alerts import send_alerts
+        db_file = config.get("database", {}).get("file", "history.db")
+        n_alerts = send_alerts(opps, config, db_file)
+        if n_alerts:
+            log.info("sent alert for %d new hot listing(s)", n_alerts)
+        # full-scan digest: top opportunities + top grails to Telegram
+        if args.mode in ("all", "auctions"):
+            try:
+                from digest import send_digest
+                # NOTE: _category is imported at module top. Do NOT re-import
+                # it here - a function-local `from report import _category`
+                # makes _category local to ALL of main(), so output_ok's
+                # reference crashed with NameError (killed every run 07/25
+                # 09:30-13:30 right after the too-good-to-be-true line,
+                # before the report was written).
+                watch_qs = {o.listing.query for o in opps
+                            if _category(o.listing.query) == "Watches"}
+                n_msg = send_digest(opps, config, watch_qs)
+                if n_msg:
+                    log.info("digest: sent %d telegram message(s)", n_msg)
+            except Exception:
+                log.exception("digest failed - continuing")
+        # settle recently-ended auctions -> exact calibration ground truth
+        # (every run, so 30-min sweeps keep the closed table current)
+        try:
+            from closer import settle_closes
+            t_close = time.monotonic()
+            log.info(settle_closes(config))
+            log.info("timing: closer %.0fs", time.monotonic() - t_close)
+        except Exception:
+            log.exception("closer failed - continuing")
+        if args.mode in ("all", "auctions"):
+            import learner
+            log.info(learner.fit(
+                db_file, directory=paths.folder(paths.base_dir(config),
+                                                paths.MODEL),
+                config=config))
+    best = max(opps, key=lambda o: o.valuation.opportunity_score)
+    log.info("wrote %d opportunities -> %s", len(opps), out)
+    log.info("top: %s | edge $%.0f | score %.1f%%", best.listing.title[:60],
+             best.valuation.edge_now, best.valuation.opportunity_score * 100)
+    return 0
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def _run_footer(started: float, mode: str, rc) -> None:
+    """Last thing every run prints, whatever happened to it.
+
+    Two questions this answers without digging: how long did that take,
+    and did we hammer anything that was already failing? The API line
+    shows ok/failed/skipped per endpoint - 'skipped' means the breaker was
+    open and we deliberately did not call it. Identical in every mode: the
+    full scan and the BIN sweep are the same program.
+    """
+    from scrapers.base import api_summary
+    try:
+        log.info("api calls: %s", api_summary())
+    except Exception:
+        pass
+    log.info("=== run finished in %s (mode=%s, exit=%s) ===",
+             _format_duration(time.monotonic() - started), mode, rc)
+
+
+if __name__ == "__main__":
+    _started = time.monotonic()
+    _mode = "all"
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--mode" and _i + 1 < len(sys.argv):
+            _mode = sys.argv[_i + 1]
+        elif _a.startswith("--mode="):
+            _mode = _a.split("=", 1)[1]
+        elif _a == "--demo":
+            _mode = "demo"
+    _rc = 1
+    try:
+        _rc = main()
+    except SystemExit as _e:          # argparse --help / bad arguments
+        _rc = _e.code if isinstance(_e.code, int) else 0
+    except Exception:
+        # tracebacks used to go only to the Terminal window (lost when it
+        # closes) - runs died with no trace in scan.log. Log, don't re-raise:
+        # the footer below must still run.
+        log.exception("scan crashed with an unhandled error")
+        _rc = 1
+    finally:
+        _run_footer(_started, _mode, _rc)
+    sys.exit(_rc)
