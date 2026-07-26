@@ -534,10 +534,11 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
                 continue
             listing.priority = priority
             listing.discovery = discovery
+            listing.category = _category(query)
             listing.resale_channel = str(
                 entry.get("resale_channel")
                 or config.get("algorithm", {}).get(
-                    "default_resale_channel", "ebay"))
+                    "default_resale_channel", "auto"))
             # grail tagging: any listing from any query can be a grail -
             # but only at grail money ($3k+ default; cheap "matches" on
             # generic names are noise, not grails)

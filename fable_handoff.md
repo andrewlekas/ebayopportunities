@@ -780,3 +780,62 @@ All four remaining improvements shipped together and are covered by the
 The Japan duty assumption defaults to 15% and is deliberately configurable.
 It is a conservative planning input, not customs advice; verify the final
 proxy quote and exact HTS classification before a large order.
+
+### 15.10 Production acceptance, marketplace repair, automatic exits
+
+Implemented after the original ten-item plan. The regression suite is now
+114 tests.
+
+**Acceptance evidence (live, 2026-07-25 evening).** A full production run
+proved the source-health work is doing its job, but returned no actionable
+inventory: eBay Browse hit three HTTP 429s and opened its persistent
+breaker; eBay sold HTML hit repeated bot challenges and opened its HTML
+breaker; Buyee returned pages but the legacy `li.itemCard` schema was
+absent. This is an honest exit 1, not a false "no deals" workbook.
+
+**Marketplace adapters.**
+
+- Goldin was moved from the retired `app.goldin.co` host to its current
+  public `lots_v2` search service. Live smoke test returned real lots. The
+  parser now validates `searchalgolia.lots`, records parser health and
+  captures each lot's 22% buyer premium plus the $19 minimum.
+- Heritage now uses `sports.ha.com` current live-search URLs and a
+  class-independent parser anchored to `/itm/` links plus `Current Bid`.
+  The curl_cffi browser fingerprint is required; it returned real live
+  listings in the smoke test. Acquisition math includes its 22% buyer
+  premium and $29 minimum.
+- Fanatics' old Algolia path remains disabled. Current production app code
+  points at a public search host that did not resolve during inspection,
+  while account GraphQL rejected anonymous queries. The parser has a schema
+  canary, but the scanner does not fabricate coverage while the upstream
+  inventory service is unavailable.
+- Yahoo/Buyee now records a parser failure separately from a successful
+  HTTP request. This makes "200 OK but zero cards because markup changed"
+  visible as degraded source health.
+
+**Automatic exit-channel optimizer.**
+
+- `Listing.resale_channel` now defaults to `auto`; a watchlist/portfolio
+  row can still pin a venue explicitly.
+- Eligible configured exits are compared on expected **net proceeds**,
+  including percentage fees, tiered fees and fixed costs. Eligibility can
+  require a minimum/maximum value, category and professional grading.
+- The local config enables eBay and Goldin Marketplace auto-routing.
+  Goldin is restricted to eligible graded Pokemon/Sports/Game inventory.
+  Heritage and Fanatics remain manual-only until dependable seller terms
+  and inventory access exist.
+- PSA Vault remains an exclusive tax-free route: the model cannot take the
+  0%-tax acquisition benefit and silently choose an ordinary non-vault
+  exit.
+- Engine EV, Edge Now, Max Bid, Breakeven and open-portfolio marks use the
+  same chosen route. Main sheets now show Best Exit, Exit Fee, Net Proceeds
+  and advantage vs eBay; Today shows Best Exit/Net/vs eBay beside Max Bid;
+  Portfolio shows Best Exit.
+- Main-sheet `Model Detail` moved from hidden column Z to AD because the
+  four exit columns were inserted before Notes.
+
+**Next highest-value work:** repair the current Yahoo/Buyee transport or
+replace it with a stable JP source; let the eBay breakers cool and perform
+another acceptance scan; then add real seller economics/eligibility for
+Probstein and COMC (and Fanatics when its public inventory service is
+available).

@@ -23,7 +23,7 @@ from openpyxl.formatting.rule import CellIsRule, ColorScaleRule, DataBarRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from economics import (item_price_for_total_cost, resale_fee_rate,
+from economics import (best_exit_route, item_price_for_total_cost,
                        sales_tax_rate)
 from models import Opportunity
 from quality import is_tradeable
@@ -38,12 +38,14 @@ HEADERS = [
     ("Comps Val", 11), ("Guide Val", 11), ("#Comps", 8), ("Exp Cost", 11),
     ("Expected Value", 13), ("Edge Now", 11),
     ("ROI", 8), ("Sales/mo", 9), ("Ann ROI", 9),
-    ("Capture", 8), ("Conf", 7), ("Score", 9), ("Notes", 36),
+    ("Capture", 8), ("Conf", 7), ("Score", 9),
+    ("Best Exit", 14), ("Exit Fee", 9), ("Net Proceeds", 13),
+    ("vs eBay", 11), ("Notes", 36),
     ("Model Detail", 34),          # machine diagnostics, hidden
 ]
-MONEY_COLS = (7, 8, 11, 13, 14, 16, 17, 18)
+MONEY_COLS = (7, 8, 11, 13, 14, 16, 17, 18, 27, 28)
 AUDIT_COLS = ("M", "P")           # Comps Val .. Exp Cost, grouped/hidden
-MODEL_COL = "Z"                   # Model Detail, grouped/hidden
+MODEL_COL = "AD"                  # Model Detail, grouped/hidden
 
 WATCH_KW = ["rolex", "patek", "audemars", "moonphase", "daytona",
             "submariner", "datejust", "world time", "royal oak"]
@@ -122,6 +124,12 @@ def _money_fmt(val: float) -> str:
     return '"$"#,##0' if abs(val or 0) >= 1000 else '"$"#,##0.00'
 
 
+def _exit_name(channel: str) -> str:
+    return {"psa_vault": "PSA Vault",
+            "fanatics_collect": "Fanatics Collect"}.get(
+                channel or "", (channel or "").replace("_", " ").title())
+
+
 def _fill_sheet(ws, opps: list[Opportunity]) -> None:
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(bold=True, color="FFFFFF")
@@ -152,6 +160,8 @@ def _fill_sheet(ws, opps: list[Opportunity]) -> None:
                   v.n_comps, v.expected_cost, v.expected_value, v.edge_now,
                   v.roi, v.sales_per_month, v.annualized_roi,
                   v.capture, v.confidence, v.opportunity_score,
+                  _exit_name(v.resale_channel),
+                  v.resale_fee_rate, v.net_proceeds, v.exit_advantage,
                   "; ".join(v.notes + ([getattr(o, "dupe_note")]
                                        if getattr(o, "dupe_note", None)
                                        else [])),
@@ -169,6 +179,7 @@ def _fill_sheet(ws, opps: list[Opportunity]) -> None:
         ws.cell(row=row, column=21).number_format = "0%"     # Ann ROI
         ws.cell(row=row, column=22).number_format = "0%"     # Capture
         ws.cell(row=row, column=23).number_format = "0%"     # Conf
+        ws.cell(row=row, column=26).number_format = "0.0%"   # Exit Fee
         ws.cell(row=row, column=24).number_format = "0.0%"   # Score
 
         title = ws.cell(row=row, column=5)
@@ -330,11 +341,9 @@ def _bid_levels(o, config: dict) -> tuple[float | None, float | None]:
     if v.fair_value <= 0:
         return None, None
     algo = config.get("algorithm", {})
-    sell_fee = resale_fee_rate(config, l)
     vault = algo.get("psa_vault", {}) or {}
     vault_on = vault.get("enabled", True) and l.site == "ebay"
     vault_min = vault.get("min_price", 500)
-    vault_fee = vault.get("sell_fee_rate", 0.07)
     target = (config.get("output", {}).get("today") or {}).get(
         "max_bid_target_roi", 0.15)
     tax = sales_tax_rate(config, l)
@@ -347,11 +356,13 @@ def _bid_levels(o, config: dict) -> tuple[float | None, float | None]:
             l, net_proceeds / (1 + max(target, 0.0)), route_tax)
         return mb, be
 
-    normal = _levels(resale * (1 - sell_fee), taxed=True)
+    normal_route = best_exit_route(config, l, resale, allow_vault=False)
+    normal = _levels(normal_route.net_proceeds, taxed=True)
     if not vault_on:
         return tuple(math.floor(x) if x > 0 else None for x in normal)
 
-    vault_levels = _levels(resale * (1 - vault_fee), taxed=False)
+    vault_route = best_exit_route(config, l, resale, allow_vault=True)
+    vault_levels = _levels(vault_route.net_proceeds, taxed=False)
 
     def _best_valid(normal_value: float, vault_value: float):
         candidates = []
@@ -405,9 +416,10 @@ def _today_tab(wb, opps: list[Opportunity], config: dict) -> None:
     ws = wb.create_sheet("Today")
     cols = [("Decide", 9), ("Title", 56), ("Query", 26), ("Price", 11),
             ("Ship", 8), ("Bids", 6), ("Ends / Listed", 20),
-            ("Fair Value", 12), ("Max Bid", 11), ("Breakeven", 11),
-            ("Expected Value", 13),
-            ("Edge Now", 11), ("ROI", 8), ("Conf", 7), ("Notes", 44)]
+            ("Fair Value", 12), ("Best Exit", 14), ("Net Proceeds", 13),
+            ("vs eBay", 11), ("Max Bid", 11), ("Breakeven", 11),
+            ("Expected Value", 13), ("Edge Now", 11), ("ROI", 8),
+            ("Conf", 7), ("Notes", 44)]
     for col, (name, width) in enumerate(cols, 1):
         c = ws.cell(row=1, column=col, value=name)
         c.font = Font(bold=True, color="FFFFFF")
@@ -425,20 +437,22 @@ def _today_tab(wb, opps: list[Opportunity], config: dict) -> None:
                                      if getattr(o, "dupe_note", None) else []))
         max_bid, breakeven = _bid_levels(o, config)
         vals = [ltype, l.title, l.query, l.current_price, l.shipping,
-                l.bid_count, timing, v.fair_value, max_bid, breakeven,
+                l.bid_count, timing, v.fair_value,
+                _exit_name(v.resale_channel),
+                v.net_proceeds, v.exit_advantage, max_bid, breakeven,
                 v.expected_value, v.edge_now, v.roi, v.confidence, notes]
         for col, val in enumerate(vals, 1):
             c = ws.cell(row=r, column=col, value=val)
             if r % 2 == 0:
                 c.fill = band
-        for col in (4, 5, 8, 9, 10, 11, 12):
+        for col in (4, 5, 8, 10, 11, 12, 13, 14, 15):
             cell = ws.cell(row=r, column=col)
             if cell.value is not None:
                 cell.number_format = _money_fmt(cell.value)
-        ws.cell(row=r, column=9).font = Font(bold=True)      # Max Bid pops
-        ws.cell(row=r, column=10).font = Font(color="808080")  # Breakeven
-        ws.cell(row=r, column=13).number_format = "0.0%"
-        ws.cell(row=r, column=14).number_format = "0%"
+        ws.cell(row=r, column=12).font = Font(bold=True)      # Max Bid pops
+        ws.cell(row=r, column=13).font = Font(color="808080")  # Breakeven
+        ws.cell(row=r, column=16).number_format = "0.0%"
+        ws.cell(row=r, column=17).number_format = "0%"
         t = ws.cell(row=r, column=2)
         if l.url:
             t.hyperlink = l.url
@@ -538,8 +552,8 @@ def _portfolio_tab(wb, rows: list[dict]) -> None:
     ws = wb.create_sheet("Portfolio")
     cols = [("Status", 8), ("Description", 44), ("Query", 30),
             ("Bought", 11), ("Days", 7), ("Cost Basis", 12),
-            ("Value", 12), ("P&L", 12), ("Return", 9), ("CAGR", 9),
-            ("Notes", 30)]
+            ("Value", 12), ("Best Exit", 13), ("P&L", 12),
+            ("Return", 9), ("CAGR", 9), ("Notes", 30)]
     for col, (name, width) in enumerate(cols, 1):
         c = ws.cell(row=1, column=col, value=name)
         c.font = Font(bold=True, color="FFFFFF")
@@ -558,21 +572,22 @@ def _portfolio_tab(wb, rows: list[dict]) -> None:
                if row["pnl"] is not None and row["cost"] else None)
         vals = [row["status"], row["description"], row["query"],
                 row["bought"].strftime("%Y-%m-%d") if row["bought"] else "",
-                row["days"], row["cost"], row["value"], row["pnl"],
-                ret, row["cagr"], row["notes"]]
+                row["days"], row["cost"], row["value"],
+                _exit_name(str(row.get("exit_channel") or "")),
+                row["pnl"], ret, row["cagr"], row["notes"]]
         for col, val in enumerate(vals, 1):
             c = ws.cell(row=r_i, column=col, value=val)
             if r_i % 2 == 0:
                 c.fill = band
-        for col in (6, 7, 8):
+        for col in (6, 7, 9):
             cell = ws.cell(row=r_i, column=col)
             if cell.value is not None:
                 cell.number_format = _money_fmt(cell.value)
-        for col in (9, 10):
+        for col in (10, 11):
             ws.cell(row=r_i, column=col).number_format = "0.0%"
         pnl = row["pnl"]
         if pnl is not None:
-            ws.cell(row=r_i, column=8).font = Font(
+            ws.cell(row=r_i, column=9).font = Font(
                 color="006100" if pnl >= 0 else "9C0006", bold=True)
         if row["status"] == "OPEN":
             tot_cost_open += row["cost"]
@@ -738,6 +753,9 @@ def write_report(opps: list[Opportunity], path: str,
         ("Action tab", "tradeable top-scored rows + anything ending/fresh within 6h with positive EV (watches excluded - see Watches tab); duplicate cards collapsed to the best listing"),
         ("Expected Value", "fair value net of resale fees, minus expected all-in cost"),
         ("Edge Now", "fair value net of exit-channel fees minus CURRENT landed cost (price, shipping, buyer/proxy fee, international shipping, insurance, duty, FX and tax where applicable)"),
+        ("Best Exit", "eligible configured venue with the highest expected net proceeds; a watchlist or portfolio resale_channel can pin a manual override"),
+        ("Net Proceeds", "fair value after the chosen exit's percentage/tiered fee and fixed selling costs"),
+        ("vs eBay", "extra expected net proceeds from Best Exit compared with the configured eBay route"),
         ("Capture", "how capturable the edge is (auction: time left; BIN: freshness)"),
         ("Score", "ROI x Confidence x Capture - the sort key"),
         ("Targeted comps", "numbered cards discovered by broad searches are repriced from a separate sold pool for that exact card number and listing grade; thin exact pools remain browse-only"),
@@ -745,8 +763,8 @@ def write_report(opps: list[Opportunity], path: str,
         ("Ann ROI", "ROI annualized by turnover: same edge on a faster-trading card = higher capital velocity"),
         ("Pri (star)", "query names a specific grade; alerts enabled"),
         ("Crossover tab", "restricted to configured card categories and graders (default CGC/BGS/SGC/BVG Pokemon and sports cards). Profit = edge now minus the PSA grading tier; risk: the card comes back below the modeled shift grade"),
-        ("Source Health", "this run's persisted source readiness: request successes/failures, breaker skips, disabled sources and comp-cache freshness"),
-        ("Hidden columns", "expand the M-P group for valuation audit detail"),
+        ("Source Health", "this run's persisted source readiness: request and parser successes/failures, breaker skips, disabled sources and comp-cache freshness"),
+        ("Hidden columns", "expand M-P for valuation inputs; Model Detail diagnostics are hidden in AD"),
         ("Grails tab", "personal-collection matches by significance (Sig 40-100), cheapest 5 per grail - NOT a profit view"),
         ("Discovery tab", "broad theme searches; values are mixed medians, NOT bid targets"),
         ("Movers tab", "30-day fair value changes (fills in as history accumulates)"),

@@ -37,7 +37,7 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 
 from models import Listing
-from .base import BaseScraper
+from .base import BaseScraper, note_api
 
 log = logging.getLogger(__name__)
 
@@ -96,9 +96,11 @@ class YahooJpScraper(BaseScraper):
         cards = soup.select("li.itemCard")
         if not cards:
             # empty page or layout change: make it loud enough to notice
+            note_api("yahoo_jp/parse", "failed")
             log.warning("yahoo_jp/buyee: no item cards for %r (ja: %r) - "
                         "empty result or markup changed", query, q)
             return []
+        note_api("yahoo_jp/parse", "ok")
         out = []
         for it in cards:
             title_el = it.select_one(".itemCard__itemName")

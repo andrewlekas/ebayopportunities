@@ -35,13 +35,17 @@ class Listing:
     currency: str = "USD"         # original currency (prices stored in USD)
     marketplace: str = "EBAY_US"
     seller_feedback: Optional[int] = None
-    # Intended exit marketplace. Watchlist entries may override this (for
-    # example ``resale_channel: goldin``); legacy entries default to eBay.
-    resale_channel: str = "ebay"
+    # Intended exit marketplace. ``auto`` lets the economics layer choose
+    # the eligible venue with the highest proceeds; a watchlist entry can
+    # still pin a specific channel (for example ``resale_channel: ebay``).
+    resale_channel: str = "auto"
+    category: str = ""
     # Landed-cost components. ``shipping`` is seller/domestic shipping.
     # The remaining fixed and percentage components make international
     # purchases explicit instead of hiding a proxy fee in the Ship column.
     buyer_fees: float = 0.0
+    buyer_fee_rate: float = 0.0
+    minimum_buyer_fee: float = 0.0
     international_shipping: float = 0.0
     insurance_rate: float = 0.0
     import_duty_rate: float = 0.0
@@ -70,17 +74,35 @@ class Listing:
             self.insurance_rate, self.import_duty_rate,
             self.fx_spread_rate))
 
+    def buyer_fee(self, item_price: float | None = None) -> float:
+        """Percentage buyer premium, respecting a venue minimum."""
+        price = self.current_price if item_price is None else item_price
+        rate_fee = max(0.0, price or 0.0) * max(
+            0.0, self.buyer_fee_rate or 0.0)
+        if rate_fee <= 0 and not self.minimum_buyer_fee:
+            return 0.0
+        return max(rate_fee, max(0.0, self.minimum_buyer_fee or 0.0))
+
     def landed_cost(self, item_price: float | None = None) -> float:
         """Price plus every known fee required to get the item in hand."""
         price = self.current_price if item_price is None else item_price
         return (max(0.0, price or 0.0)
                 * (1 + self.variable_acquisition_rate)
-                + self.fixed_acquisition_cost)
+                + self.fixed_acquisition_cost + self.buyer_fee(price))
 
     def item_price_for_landed_cost(self, landed_cost: float) -> float:
         """Inverse of ``landed_cost`` for bid/offer ceilings."""
-        return max(0.0, (landed_cost - self.fixed_acquisition_cost)
-                   / (1 + self.variable_acquisition_rate))
+        available = landed_cost - self.fixed_acquisition_cost
+        other_rate = self.variable_acquisition_rate
+        buyer_rate = max(0.0, self.buyer_fee_rate or 0.0)
+        minimum = max(0.0, self.minimum_buyer_fee or 0.0)
+        # Try the percentage-premium branch first. If its calculated fee
+        # clears the minimum, it is the exact inverse.
+        price = available / (1 + other_rate + buyer_rate)
+        if price * buyer_rate >= minimum:
+            return max(0.0, price)
+        # Below the crossover the buyer premium is a fixed minimum.
+        return max(0.0, (available - minimum) / (1 + other_rate))
 
     def landed_cost_note(self, item_price: float | None = None) -> str:
         """Compact audit text for reports/logs when extras are non-zero."""
@@ -90,6 +112,11 @@ class Listing:
             parts.append(f"ship ${self.shipping:,.0f}")
         if self.buyer_fees:
             parts.append(f"buyer/proxy ${self.buyer_fees:,.0f}")
+        if self.buyer_fee_rate:
+            premium = f"buyer premium {self.buyer_fee_rate:.0%}"
+            if self.minimum_buyer_fee:
+                premium += f" (${self.minimum_buyer_fee:,.0f} min)"
+            parts.append(premium)
         if self.international_shipping:
             parts.append(f"intl ship ${self.international_shipping:,.0f}")
         if self.import_duty_rate:
@@ -138,6 +165,10 @@ class Valuation:
     sales_per_month: Optional[float] = None  # comp velocity (liquidity)
     annualized_roi: Optional[float] = None   # roi x turnover (capital velocity)
     opportunity_score: float = 0.0
+    resale_channel: str = ""
+    resale_fee_rate: float = 0.0
+    net_proceeds: float = 0.0
+    exit_advantage: float = 0.0
     # True when the listing's grade differed from its query's and fair
     # value was recomputed at the LISTING's grade (raw = assumed PSA 5).
     # Regraded fair values are per-listing - excluded from the query's

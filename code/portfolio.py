@@ -27,7 +27,8 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from economics import resale_fee_rate
+from economics import best_exit_route
+from models import Listing
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +72,6 @@ def build_rows(config: dict, fair_by_query: dict[str, float],
     vault = algo.get("psa_vault") or {}
     vault_on = bool(vault.get("enabled", False))
     vault_min = vault.get("min_price", 500.0)
-    vault_fee = vault.get("sell_fee_rate", 0.07)
     now = datetime.now(timezone.utc)
 
     out = []
@@ -91,7 +91,7 @@ def build_rows(config: dict, fair_by_query: dict[str, float],
                    (r.get("notes") or "").strip(),
                    "resale_channel": (r.get("resale_channel")
                                       or algo.get(
-                                          "default_resale_channel", "ebay"))}
+                                          "default_resale_channel", "auto"))}
             end = sold or now
             days = max((end - bought).days, 1) if bought else None
             row["days"] = days
@@ -104,13 +104,25 @@ def build_rows(config: dict, fair_by_query: dict[str, float],
                 row["status"] = "OPEN"
                 fair = fair_by_query.get(query.lower()) if query else None
                 if fair:
-                    sell_fee = resale_fee_rate(
-                        config, channel=row["resale_channel"])
-                    fee = (vault_fee if (vault_on and fair >= vault_min)
-                           else sell_fee)
-                    row["value"] = fair * (1 - fee)     # net liquidation value
+                    # Import here to keep the shared category rules in one
+                    # place without making report generation depend on the
+                    # optional portfolio file at module import time.
+                    from report import _category
+                    position = Listing(
+                        site="portfolio", title=desc, url="",
+                        current_price=0, query=query,
+                        category=_category(query),
+                        resale_channel=row["resale_channel"])
+                    route = best_exit_route(
+                        config, position, fair,
+                        allow_vault=vault_on and fair >= vault_min)
+                    row["exit_channel"] = route.channel
+                    row["exit_fee_rate"] = route.fee_rate
+                    row["value"] = route.net_proceeds
                     row["pnl"] = row["value"] - cost
                 else:
+                    row["exit_channel"] = ""
+                    row["exit_fee_rate"] = None
                     row["value"] = None                 # unmarked
                     row["pnl"] = None
 

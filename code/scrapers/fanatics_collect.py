@@ -1,19 +1,17 @@
-"""Fanatics Collect scraper (Algolia-backed search).
+"""Legacy Fanatics Collect Algolia adapter with response-schema canaries.
 
-The site's search is powered by Algolia. We replicate the exact request the
-web app makes:
+The former public site used the request below. The current app no longer
+has a reachable anonymous inventory service, so this adapter stays disabled
+unless a verified current search-only key is supplied:
     POST https://{APP_ID}-dsn.algolia.net/1/indexes/*/queries
     index prod_item_state_v1, filtered to live listings.
 
-Algolia's search key is a PUBLIC, search-only key shipped to every browser -
-using it is standard and safe. Put it in config.yaml under
+If Fanatics restores the index, put its public search-only key in config under
 api_keys.fanatics (app_id + search_key). To grab the key: open
 fanaticscollect.com, DevTools > Network, search a card, click the request to
 "*-dsn.algolia.net", copy the "x-algolia-api-key" header value.
 
-Returns live auction listings. Algolia carries current bid/price and bid
-count but not the exact end time, so end_time is left unset (the engine's
-capture model handles unknown-end listings conservatively).
+The parser records a separate health failure if the response schema changes.
 """
 from __future__ import annotations
 
@@ -21,7 +19,7 @@ import logging
 
 from models import Listing
 from security import redact_text
-from .base import BaseScraper
+from .base import BaseScraper, note_api
 
 log = logging.getLogger(__name__)
 
@@ -47,12 +45,16 @@ class FanaticsCollectScraper(BaseScraper):
 
     def _algolia(self, query: str, marketplace: str, max_results: int):
         if not self.search_key:
+            if "credentials" not in self._announced:
+                note_api("fanatics_collect/api", "failed")
+                self._announced.add("credentials")
             log.info("fanatics_collect: no search_key in config - skipping "
                      "(see scrapers/fanatics_collect.py for how to get one)")
             return None
         # circuit breaker: failures were counted below but never checked,
         # so a dead/rotated key kept getting POSTed once per query all run
         if self.lane_tripped("api"):
+            note_api("fanatics_collect/api", "skipped")
             if "api" not in self._announced:
                 log.warning("fanatics_collect/api: %d consecutive failures "
                             "- skipping this channel for the rest of the "
@@ -80,17 +82,28 @@ class FanaticsCollectScraper(BaseScraper):
             r = self.session.post(url, json=payload, headers=headers, timeout=30)
             r.raise_for_status()
             self._streaks["api"] = 0
+            note_api("fanatics_collect/api", "ok")
             return r.json()
         except Exception as e:
             self._streaks["api"] += 1
+            note_api("fanatics_collect/api", "failed")
             log.warning("fanatics_collect: search failed (%d/%d) (%s)",
                         self._streaks["api"], self.trip_after,
                         redact_text(e))
+            if self._streaks["api"] == self.trip_after:
+                self._persist_trip(
+                    "api", "%d consecutive failures" % self._streaks["api"])
             return None
 
     def _parse(self, data, query: str) -> list[Listing]:
+        if (not isinstance(data, dict)
+                or not isinstance(data.get("results"), list)):
+            note_api("fanatics_collect/parse", "failed")
+            log.warning("fanatics_collect: search response schema changed")
+            return []
+        note_api("fanatics_collect/parse", "ok")
         out = []
-        for res in (data or {}).get("results", []):
+        for res in data["results"]:
             for h in res.get("hits", []):
                 title = h.get("title") or ""
                 price = h.get("currentPrice")

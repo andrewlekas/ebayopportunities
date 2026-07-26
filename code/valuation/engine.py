@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 
-from economics import resale_fee_rate, sales_tax_rate, total_acquisition_cost
+from economics import best_exit_route, sales_tax_rate, total_acquisition_cost
 from models import Listing, Valuation, Opportunity, SoldComp
 from . import comps as comps_mod
 from .comps import (GRADE_RE, GRADER_PREMIUM, _subject_tokens, card_number,
@@ -201,10 +201,6 @@ class ValuationEngine:
             self.config, listing,
             vault_route=self._vault_route(listing, price))
 
-    def _sell_fee(self, listing: Listing, vault_route: bool = False) -> float:
-        return (self.vault_sell_fee if vault_route
-                else resale_fee_rate(self.config, listing))
-
     # ---------------- EV per listing ----------------
     def score(self, listing: Listing, v: Valuation) -> Valuation:
         if v.fair_value <= 0:
@@ -244,8 +240,10 @@ class ValuationEngine:
         # checkout) is decided at today's price. Vault route: no tax in,
         # and consignment replaces the marketplace fee on the way out
         # (one all-in rate - nets 93% by default).
-        route_now = self._vault_route(listing, cost_now)
-        proceeds_now = resale * (1 - self._sell_fee(listing, route_now))
+        vault_now = self._vault_route(listing, cost_now)
+        exit_now = best_exit_route(
+            self.config, listing, resale, allow_vault=vault_now)
+        proceeds_now = exit_now.net_proceeds
         tax_now = self._buy_tax(listing, cost_now)
         acquisition_now = total_acquisition_cost(listing, item_now, tax_now)
         v.edge_now = round(proceeds_now - acquisition_now, 2)
@@ -329,15 +327,29 @@ class ValuationEngine:
         # up - a $100 bid closing near $2k is a vault purchase, not a taxed
         # one). For BINs expected == asking, so this matches edge_now.
         expected_landed = listing.landed_cost(expected_item)
-        route_ev = self._vault_route(listing, expected_landed)
-        proceeds = resale * (1 - self._sell_fee(listing, route_ev))
+        vault_ev = self._vault_route(listing, expected_landed)
+        exit_ev = best_exit_route(
+            self.config, listing, resale, allow_vault=vault_ev)
+        proceeds = exit_ev.net_proceeds
         tax_ev = self._buy_tax(listing, expected_landed)
         expected = total_acquisition_cost(listing, expected_item, tax_ev)
         if tax_ev > 0:
             v.notes.append(f"+{tax_ev:.0%} tax in")
-        elif route_ev:
+        elif vault_ev:
             v.notes.append("vault route (0% tax in / "
                            f"{self.vault_sell_fee:.0%} out)")
+        v.resale_channel = exit_ev.channel
+        v.resale_fee_rate = exit_ev.fee_rate
+        v.net_proceeds = round(exit_ev.net_proceeds, 2)
+        v.exit_advantage = round(exit_ev.advantage_vs_ebay, 2)
+        if exit_ev.channel != "ebay":
+            advantage = (f"; +${exit_ev.advantage_vs_ebay:,.0f} vs eBay"
+                         if exit_ev.advantage_vs_ebay > 0 else "")
+            exit_label = ("PSA Vault" if exit_ev.channel == "psa_vault"
+                          else exit_ev.channel.replace("_", " ").title())
+            v.notes.append(
+                f"best exit: {exit_label} "
+                f"({exit_ev.fee_rate:.1%} fee{advantage})")
         landed_note = listing.landed_cost_note(expected_item)
         if landed_note:
             v.notes.append(landed_note)

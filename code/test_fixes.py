@@ -731,6 +731,149 @@ class TestLandedEconomics(unittest.TestCase):
         self.assertEqual(max_bid, 152)
         self.assertEqual(breakeven, 182)
 
+    def test_percentage_buyer_premium_and_minimum_are_invertible(self):
+        listing = Listing(
+            site="goldin", title="Card", url="", current_price=10,
+            buyer_fee_rate=0.22, minimum_buyer_fee=19)
+        self.assertEqual(listing.landed_cost(10), 29)
+        self.assertAlmostEqual(listing.item_price_for_landed_cost(29), 10)
+        self.assertEqual(listing.landed_cost(100), 122)
+        self.assertAlmostEqual(listing.item_price_for_landed_cost(122), 100)
+
+
+class TestExitOptimizer(unittest.TestCase):
+    def _config(self):
+        return {
+            "_config_dir": tempfile.mkdtemp(),
+            "algorithm": {
+                "default_resale_channel": "auto",
+                "resale_channels": {
+                    "ebay": {"fee_rate": 0.1325},
+                    "goldin": {
+                        "fee_rate": 0.083, "min_value": 100,
+                        "categories": ["Sports Cards"],
+                        "requires_graded": True,
+                    },
+                    "heritage": {
+                        "fee_rate": 0.01, "auto_enabled": False},
+                },
+                "psa_vault": {"enabled": False},
+                "sales_tax_rate": 0,
+            },
+        }
+
+    def _listing(self, channel="auto", title="1986 Fleer Jordan PSA 9"):
+        return Listing(
+            site="goldin", title=title, url="", current_price=500,
+            query="Michael Jordan", category="Sports Cards",
+            listing_type="fixed", resale_channel=channel)
+
+    def test_auto_selects_highest_net_eligible_exit(self):
+        from economics import best_exit_route
+        route = best_exit_route(
+            self._config(), self._listing(), 1000)
+        self.assertEqual(route.channel, "goldin")
+        self.assertAlmostEqual(route.net_proceeds, 917)
+        self.assertAlmostEqual(route.advantage_vs_ebay, 49.5)
+
+    def test_manual_override_is_honored(self):
+        from economics import best_exit_route
+        route = best_exit_route(
+            self._config(), self._listing("ebay"), 1000)
+        self.assertEqual(route.channel, "ebay")
+        self.assertAlmostEqual(route.net_proceeds, 867.5)
+
+    def test_ineligible_ungraded_item_stays_on_ebay(self):
+        from economics import best_exit_route
+        route = best_exit_route(
+            self._config(), self._listing(title="1986 Fleer Jordan"), 1000)
+        self.assertEqual(route.channel, "ebay")
+
+    def test_engine_records_exit_and_report_exposes_it(self):
+        from openpyxl import Workbook
+        from valuation.engine import ValuationEngine
+        listing = self._listing()
+        valuation = ValuationEngine(self._config()).score(
+            listing, Valuation(fair_value=1000, confidence=0.8))
+        self.assertEqual(valuation.resale_channel, "goldin")
+        self.assertEqual(valuation.net_proceeds, 917)
+        self.assertEqual(valuation.exit_advantage, 49.5)
+        wb = Workbook()
+        report_mod._fill_sheet(
+            wb.active, [Opportunity(listing, valuation)])
+        self.assertEqual(wb.active["Y2"].value, "Goldin")
+        self.assertEqual(wb.active["Z2"].value, 0.083)
+        self.assertEqual(wb.active["AA2"].value, 917)
+        self.assertEqual(wb.active["AB2"].value, 49.5)
+
+    def test_open_portfolio_mark_uses_the_same_optimizer(self):
+        import csv
+        import portfolio
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "portfolio.csv"), "w",
+                      newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(portfolio.CSV_HEADER)
+                writer.writerow([
+                    "2026-07-01", "1986 Fleer Jordan PSA 9",
+                    "Michael Jordan 1986 Fleer", "500", "", "",
+                    "auto", "",
+                ])
+            rows = portfolio.build_rows(
+                self._config(),
+                {"michael jordan 1986 fleer": 1000}, tmp)
+        self.assertEqual(rows[0]["exit_channel"], "goldin")
+        self.assertEqual(rows[0]["value"], 917)
+        self.assertEqual(rows[0]["pnl"], 417)
+
+
+class TestMarketplaceParserCanaries(unittest.TestCase):
+    def test_goldin_current_schema_and_buyer_premium(self):
+        from scrapers.goldin import GoldinScraper
+
+        class Response:
+            @staticmethod
+            def json():
+                return {"searchalgolia": {"lots": [{
+                    "status": "Live", "title": "Jordan PSA 9",
+                    "current_price": 100, "number_of_bids": 3,
+                    "end_timestamp": "2026-08-01T02:00:00Z",
+                    "lot_id": "lot-1", "meta_slug": "jordan-psa-9",
+                    "buyer_premium": 22,
+                }]}}
+
+        scraper = GoldinScraper(
+            {"_config_dir": tempfile.mkdtemp(), "scraping": {}})
+        with mock.patch.object(scraper, "_post", return_value=Response()):
+            rows = scraper.search_auctions("Jordan")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].buyer_fee_rate, 0.22)
+        self.assertEqual(rows[0].minimum_buyer_fee, 19)
+        self.assertEqual(rows[0].landed_cost(), 122)
+
+    def test_heritage_current_bid_markup(self):
+        from scrapers.heritage import HeritageScraper
+        html = """
+        <section class="result">
+          <a href="/itm/basketball-cards/jordan/a/50086-80953">
+            1986 Fleer Michael Jordan #57 PSA Mint 9
+          </a>
+          <div>Current Bid: $23,000</div>
+        </section>
+        """
+        rows = HeritageScraper.parse_html(html, "Michael Jordan")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].current_price, 23000)
+        self.assertEqual(rows[0].buyer_fee_rate, 0.22)
+        self.assertEqual(rows[0].minimum_buyer_fee, 29)
+
+    def test_fanatics_rejects_an_unknown_schema(self):
+        from scrapers.fanatics_collect import FanaticsCollectScraper
+        scraper = FanaticsCollectScraper(
+            {"_config_dir": tempfile.mkdtemp(), "scraping": {},
+             "api_keys": {"fanatics": {}}})
+        self.assertEqual(scraper._parse({"unexpected": []}, "Jordan"), [])
+
 
 class TestCrossoverPolicy(unittest.TestCase):
     """The regrade sheet is a card strategy, not a generic non-PSA grader

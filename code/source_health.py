@@ -60,11 +60,12 @@ def _endpoint_matches(source: str, endpoint: str) -> bool:
         "ebay/listings": ("ebay/api", "ebay/oauth"),
         "ebay/comps": ("ebay/html",),
         "130point/comps": ("130point/html",),
-        "yahoo_jp/listings": ("yahoo_jp/html",),
-        "goldin/listings": ("goldin/html",),
-        "heritage/listings": ("heritage/html",),
+        "yahoo_jp/listings": ("yahoo_jp/html", "yahoo_jp/parse"),
+        "goldin/listings": ("goldin/api", "goldin/parse"),
+        "heritage/listings": ("heritage/html", "heritage/parse"),
         "fanatics_collect/listings": (
-            "fanatics_collect/api", "fanatics_collect/html"),
+            "fanatics_collect/api", "fanatics_collect/html",
+            "fanatics_collect/parse"),
         "pricecharting/guide": ("pricecharting",),
         "pokemontcg/guide": ("pokemontcg.io",),
     }

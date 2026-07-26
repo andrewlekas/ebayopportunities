@@ -882,3 +882,76 @@ FIXED (main.py).**
   info, _category import fix, output_ok try/except, __main__ crash
   logging), `code/valuation/price_guide.py` (429 breaker + no caching of
   errored misses).
+
+---
+
+## 17. Session 2026-07-25 evening — live acceptance, Goldin/Heritage, exit optimizer
+
+This section supersedes older notes that describe Goldin/Heritage as
+inactive, Fanatics as only a rotated-key problem, Buyee as healthy, the
+default exit as eBay, or `Model Detail` as column Z.
+
+### Live acceptance result
+
+The production acceptance run passed all 105 pre-change tests, then exited
+1 because it could not obtain live inventory. That outcome was correct:
+
+- eBay Browse: three HTTP 429s, persistent API breaker opened.
+- eBay sold HTML: repeated bot challenges, persistent HTML breaker opened.
+- Buyee/Yahoo JP: HTTP succeeded across priority queries but the expected
+  `li.itemCard` markup was absent.
+- Stale comp caches were available, but no live listings existed to score.
+
+Do not interpret that run as "there were no bargains." It means production
+ingestion was unavailable, exactly as the Source Health controls reported.
+
+### Marketplace recovery
+
+- `scrapers/goldin.py` uses the current public `lots_v2` POST service and
+  validates `searchalgolia.lots`. Live smoke test returned three real
+  Michael Jordan PSA 9 lots. Goldin's 22% buyer premium and $19 minimum
+  now flow through landed cost and bid inversion.
+- `scrapers/heritage.py` uses `sports.ha.com` and parses live `/itm/`
+  anchors by their `Current Bid` block rather than brittle CSS class names.
+  curl_cffi live smoke returned three real listings. Heritage's 22% buyer
+  premium and $29 minimum are modeled.
+- `goldin` and `heritage` were added to local `config.yaml` sites.
+- Parser canaries write `site/parse` outcomes for Goldin, Heritage,
+  Fanatics and Yahoo/Buyee; Source Health now distinguishes transport
+  success from a broken response schema.
+- Fanatics remains disabled. Its old Algolia adapter is retained with a
+  canary, but the current app's production public-search hostname had no
+  DNS and anonymous GraphQL was rejected. Recheck upstream before more
+  reverse engineering.
+
+### Automatic exit optimizer
+
+- `economics.best_exit_route` compares eligible configured venues by net
+  proceeds. It supports percentage/tiered fees, fixed costs, value bounds,
+  category allowlists and a `requires_graded` rule.
+- `Listing.resale_channel` defaults to `auto`; explicit watchlist and
+  portfolio overrides are honored.
+- Local auto candidates: eBay (13.25%) and Goldin Marketplace (8.3%,
+  eligible graded cards/games, $100 minimum). Heritage and Fanatics are
+  manual-only until dependable seller terms/access are known.
+- PSA Vault is exclusive whenever its 0%-tax acquisition route applies.
+  This prevents mixing vault tax treatment with an ordinary marketplace
+  exit.
+- Engine EV/Edge, Today Max Bid/Breakeven and Portfolio marks all use the
+  same route.
+- Excel main sheets: Best Exit, Exit Fee, Net Proceeds and vs eBay were
+  inserted after Score. Notes is AC and hidden Model Detail is AD.
+- Today: Best Exit, Net Proceeds and vs eBay sit before Max Bid.
+- Portfolio: Best Exit is visible beside the mark.
+
+Validation: 114 unit/regression tests pass; demo report writes successfully;
+live Goldin and Heritage smoke tests returned real inventory.
+
+### Next three
+
+1. Repair/replace Yahoo-Buyee listing ingestion, whose markup or delivery
+   behavior changed.
+2. After eBay breaker cooldown, rerun full acceptance and visually review
+   the first real Today sheet with automatic exits.
+3. Add verified seller fee/eligibility models for Probstein and COMC; add
+   Fanatics only after its public inventory service is reachable again.

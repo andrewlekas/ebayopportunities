@@ -374,6 +374,33 @@ class BaseScraper:
                 self._save_cookies()
             return r
 
+    def _post(self, url: str, api: bool = False,
+              **kwargs) -> requests.Response | None:
+        """POST counterpart to ``_get`` with the same breaker/telemetry."""
+        lane = "api" if api else "html"
+        if self.lane_tripped(lane):
+            note_api(f"{self.site}/{lane}", "skipped")
+            return None
+        time.sleep(random.uniform(0.05, 0.2) if api
+                   else self.delay * (0.5 + random.random()))
+        try:
+            r = self.session.post(
+                url, timeout=(30 if api else self.html_timeout), **kwargs)
+            r.raise_for_status()
+            self._streaks[lane] = 0
+            note_api(f"{self.site}/{lane}", "ok")
+            return r
+        except _HTTP_ERRORS as e:
+            note_api(f"{self.site}/{lane}", "failed")
+            self._streaks[lane] += 1
+            log.warning("%s/%s: POST failed (%d/%d) for %s (%s)",
+                        self.site, lane, self._streaks[lane],
+                        self.trip_after, redact_url(url), redact_text(e))
+            if self._streaks[lane] == self.trip_after:
+                self._persist_trip(
+                    lane, "%d consecutive failures" % self._streaks[lane])
+            return None
+
     def search_auctions(self, query: str, max_results: int = 50):
         """Return list[Listing] of live auctions matching query."""
         raise NotImplementedError
