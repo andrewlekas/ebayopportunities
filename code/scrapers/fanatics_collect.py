@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 
 from models import Listing
+from security import redact_text
 from .base import BaseScraper
 
 log = logging.getLogger(__name__)
@@ -83,7 +84,8 @@ class FanaticsCollectScraper(BaseScraper):
         except Exception as e:
             self._streaks["api"] += 1
             log.warning("fanatics_collect: search failed (%d/%d) (%s)",
-                        self._streaks["api"], self.trip_after, e)
+                        self._streaks["api"], self.trip_after,
+                        redact_text(e))
             return None
 
     def _parse(self, data, query: str) -> list[Listing]:

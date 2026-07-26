@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from scrapers.base import note_api
+from security import redact_text
 
 from . import comps as comps_mod
 from .comps import title_match_score, grade_info, GRADE_RE
@@ -268,7 +269,7 @@ class PriceGuide:
                 log.warning("pricecharting: rate limited (429) - pausing "
                             "guide lookups for %ds", secs)
             elif self._pc_fails < 3:
-                log.warning("pricecharting failed: %s", e)
+                log.warning("pricecharting failed: %s", redact_text(e))
             if self._pc_fails == 3:
                 log.warning("pricecharting: 3 consecutive failures - "
                             "backing off for the rest of this run")
@@ -306,7 +307,7 @@ class PriceGuide:
         except requests.RequestException as e:
             note_api("pokemontcg.io", "failed")
             self._ptcg_fails += 1
-            log.warning("pokemontcg.io failed: %s", e)
+            log.warning("pokemontcg.io failed: %s", redact_text(e))
             if self._ptcg_fails == 3:
                 log.warning("pokemontcg.io: 3 consecutive failures - "
                             "skipping it for the rest of this run")

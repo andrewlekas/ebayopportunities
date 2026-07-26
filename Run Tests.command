@@ -22,8 +22,9 @@ PY=.venv/bin/python
     "$PY" - <<'EOF'
 import sys
 try:
-    import yaml
-    c = yaml.safe_load(open("config.yaml"))
+    sys.path.insert(0, "code")
+    from main import load_config
+    c = load_config("config.yaml")
     assert c["api_keys"]["ebay"]["client_id"], "eBay client_id missing"
     assert c["api_keys"]["ebay"]["client_secret"], "eBay client_secret missing"
     assert c["api_keys"]["pricecharting"]["token"], "PriceCharting token missing"

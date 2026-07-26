@@ -14,6 +14,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from security import redact_text, redact_url
+
 import paths
 
 # curl_cffi impersonates a real Chrome browser at the TLS/HTTP2 level.
@@ -338,7 +340,7 @@ class BaseScraper:
                 self._streaks[lane] += 1
                 log.warning("%s/%s: request failed (%d/%d) for %s (%s)",
                             self.site, lane, self._streaks[lane],
-                            self.trip_after, url, e)
+                            self.trip_after, redact_url(url), redact_text(e))
                 if self._streaks[lane] == self.trip_after:
                     # persist so the every-30-min cron doesn't re-assault a
                     # site that's rejecting us (cross-run backoff)

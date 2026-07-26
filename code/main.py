@@ -36,13 +36,62 @@ from valuation.comps import (GRADE_RE, grade_conflict, grade_info,
 log = logging.getLogger("scanner")
 
 
+SECRET_ENV_PATHS = {
+    "CARD_SCANNER_EBAY_CLIENT_ID": ("api_keys", "ebay", "client_id"),
+    "CARD_SCANNER_EBAY_CLIENT_SECRET": ("api_keys", "ebay", "client_secret"),
+    "CARD_SCANNER_PRICECHARTING_TOKEN": ("api_keys", "pricecharting", "token"),
+    "CARD_SCANNER_POKEMONTCG_API_KEY": ("api_keys", "pokemontcg", "api_key"),
+    "CARD_SCANNER_FANATICS_APP_ID": ("api_keys", "fanatics", "app_id"),
+    "CARD_SCANNER_FANATICS_SEARCH_KEY": ("api_keys", "fanatics", "search_key"),
+    "CARD_SCANNER_TELEGRAM_BOT_TOKEN":
+        ("alerts", "telegram", "bot_token"),
+    "CARD_SCANNER_TELEGRAM_CHAT_ID": ("alerts", "telegram", "chat_id"),
+}
+
+
+def _merge_secret_config(config: dict, overlay: dict) -> None:
+    """Merge only credential-bearing sections from secrets.yaml."""
+    for root in ("api_keys", "alerts"):
+        incoming = overlay.get(root)
+        if not isinstance(incoming, dict):
+            continue
+        if root == "alerts":
+            incoming = {"telegram": incoming.get("telegram", {})}
+        target = config.setdefault(root, {})
+        for name, values in incoming.items():
+            if not isinstance(values, dict):
+                continue
+            target.setdefault(name, {}).update(
+                {k: v for k, v in values.items() if v not in (None, "")})
+
+
+def _set_nested(config: dict, path: tuple[str, ...], value: str) -> None:
+    node = config
+    for part in path[:-1]:
+        node = node.setdefault(part, {})
+    node[path[-1]] = value
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
     # scrapers use this to keep state files (cookie jars) next to config
     # regardless of the cwd cron happens to use
     base = os.path.dirname(os.path.abspath(path))
     config["_config_dir"] = base
+    # Keep credentials outside the tracked/main configuration.  An optional
+    # secrets.yaml beside config.yaml is loaded first, then environment
+    # variables win.  Existing inline keys remain compatible during the
+    # transition, so this is safe to roll out before manually moving them.
+    secrets_path = os.environ.get(
+        "CARD_SCANNER_SECRETS_FILE", os.path.join(base, "secrets.yaml"))
+    if os.path.isfile(secrets_path):
+        with open(secrets_path) as f:
+            _merge_secret_config(config, yaml.safe_load(f) or {})
+    for env_name, key_path in SECRET_ENV_PATHS.items():
+        value = os.environ.get(env_name)
+        if value:
+            _set_nested(config, key_path, value)
     # Resolve the database path against config.yaml's folder, not the
     # current directory. A scan launched from anywhere now finds the real
     # history.db instead of silently creating an empty one beside itself.

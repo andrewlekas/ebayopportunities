@@ -6,6 +6,8 @@ __pycache__/
 
 # Live configuration contains API and Telegram credentials.
 /config.yaml
+/secrets.yaml
+/.env
 
 # Runtime databases, state, logs, reports, and learned artifacts.
 /database/
@@ -27,4 +29,3 @@ __pycache__/
 *.xlsx
 *.xls
 *.log
-

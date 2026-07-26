@@ -17,7 +17,8 @@ clickable listing links, filterable header.
 
 ## Configure
 
-Edit `config.yaml`:
+Edit `config.yaml` for ordinary settings. Keep credentials in an ignored
+`secrets.yaml` copied from `secrets.example.yaml`:
 
 - **watchlist** — search queries (include grade for graded cards, e.g.
   `"Charizard Base Set Holo PSA 8"`) with optional `max_buy_price`.
@@ -27,6 +28,14 @@ Edit `config.yaml`:
   - `pricecharting` token: graded-card guide prices.
   - `pokemontcg` key: TCGPlayer market prices for raw cards.
 - **algorithm** — tuning knobs (settle ratio, fees, outlier threshold, etc.).
+
+Environment variables can override the secrets file:
+`CARD_SCANNER_EBAY_CLIENT_ID`, `CARD_SCANNER_EBAY_CLIENT_SECRET`,
+`CARD_SCANNER_PRICECHARTING_TOKEN`, `CARD_SCANNER_POKEMONTCG_API_KEY`,
+`CARD_SCANNER_FANATICS_APP_ID`, `CARD_SCANNER_FANATICS_SEARCH_KEY`,
+`CARD_SCANNER_TELEGRAM_BOT_TOKEN`, and
+`CARD_SCANNER_TELEGRAM_CHAT_ID`. Set `CARD_SCANNER_SECRETS_FILE` to use a
+secrets file in a different location.
 
 ## How the valuation works
 

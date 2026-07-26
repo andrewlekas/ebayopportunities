@@ -25,6 +25,7 @@ import logging
 import requests
 
 from models import Opportunity
+from security import redact_text
 
 log = logging.getLogger(__name__)
 
@@ -58,10 +59,11 @@ def _send(text: str, tg: dict) -> bool:
                   "disable_web_page_preview": True},
             timeout=15)
         if not r.ok:
-            log.warning("digest: telegram send failed (%s)", r.text[:200])
+            log.warning("digest: telegram send failed (%s)",
+                        redact_text(r.text[:200]))
         return telegram_result(r.ok)
     except requests.RequestException as e:
-        log.warning("digest: telegram unreachable (%s)", e)
+        log.warning("digest: telegram unreachable (%s)", redact_text(e))
         return telegram_result(False)
 
 

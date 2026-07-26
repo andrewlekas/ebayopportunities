@@ -22,6 +22,7 @@ from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 
 from models import Listing, SoldComp
+from security import redact_text
 from .base import BaseScraper, note_api
 
 log = logging.getLogger(__name__)
@@ -93,7 +94,7 @@ class EbayScraper(BaseScraper):
             note_api("ebay/oauth", "failed")
             self._oauth_fails += 1
             log.warning("ebay: OAuth failed (%d/3) (%s); falling back to "
-                        "HTML", self._oauth_fails, e)
+                        "HTML", self._oauth_fails, redact_text(e))
             if self._oauth_fails == 3:
                 log.warning("ebay: OAuth failed 3 straight times - not "
                             "retrying for the rest of this run")

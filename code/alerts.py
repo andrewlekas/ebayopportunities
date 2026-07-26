@@ -30,6 +30,7 @@ import requests
 import db as histdb
 from models import Opportunity
 from scrapers.base import note_api
+from security import redact_text
 
 log = logging.getLogger(__name__)
 
@@ -112,10 +113,11 @@ def _send_telegram(fresh: list[Opportunity], tg: dict) -> bool:
                   "disable_web_page_preview": len(fresh) > 1},
             timeout=15)
         if not r.ok:
-            log.warning("alerts: telegram send failed (%s)", r.text[:200])
+            log.warning("alerts: telegram send failed (%s)",
+                        redact_text(r.text[:200]))
         return telegram_result(r.ok)
     except requests.RequestException as e:
-        log.warning("alerts: telegram unreachable (%s)", e)
+        log.warning("alerts: telegram unreachable (%s)", redact_text(e))
         return telegram_result(False)
 
 

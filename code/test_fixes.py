@@ -19,6 +19,9 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
+
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -927,6 +930,64 @@ class TestRunFooter(unittest.TestCase):
         self.assertIn("run finished in", joined)
         self.assertIn("mode=bin", joined)
         self.assertIn("api calls:", joined)
+
+
+class TestCredentialHygiene(unittest.TestCase):
+    def test_network_text_redacts_query_path_and_header_secrets(self):
+        from security import redact_text
+        secrets = {
+            "pc-token-123456789": (
+                "https://www.pricecharting.com/api/product?"
+                "t=pc-token-123456789&q=charizard"),
+            "123456789:telegram-token-value": (
+                "https://api.telegram.org/"
+                "bot123456789:telegram-token-value/sendMessage"),
+            "bearer-token-123456789": (
+                "Authorization: Bearer bearer-token-123456789"),
+            "client-secret-123456789": (
+                '"client_secret": "client-secret-123456789"'),
+        }
+        for secret, text in secrets.items():
+            safe = redact_text(text)
+            self.assertNotIn(secret, safe)
+            self.assertIn("<redacted>", safe)
+
+    def test_secrets_file_and_environment_override_inline_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.yaml")
+            secrets_path = os.path.join(tmp, "secrets.yaml")
+            with open(config_path, "w") as f:
+                yaml.safe_dump({
+                    "api_keys": {
+                        "ebay": {"client_id": "inline-id",
+                                 "client_secret": "inline-secret"},
+                        "pricecharting": {"token": "inline-token"},
+                    },
+                    "alerts": {"telegram": {"bot_token": "inline-bot"}},
+                    "database": {"file": "database/test.db"},
+                }, f)
+            with open(secrets_path, "w") as f:
+                yaml.safe_dump({
+                    "api_keys": {
+                        "ebay": {"client_secret": "file-secret"},
+                        "pricecharting": {"token": "file-token"},
+                    },
+                    "alerts": {"telegram": {"bot_token": "file-bot"}},
+                }, f)
+            with mock.patch.dict(
+                    os.environ,
+                    {"CARD_SCANNER_PRICECHARTING_TOKEN": "env-token"},
+                    clear=False):
+                config = scanner.load_config(config_path)
+            self.assertEqual(
+                config["api_keys"]["ebay"]["client_secret"], "file-secret")
+            self.assertEqual(
+                config["api_keys"]["pricecharting"]["token"], "env-token")
+            self.assertEqual(
+                config["alerts"]["telegram"]["bot_token"], "file-bot")
+            self.assertEqual(
+                config["database"]["file"],
+                os.path.join(tmp, "database", "test.db"))
 
 
 class TestMLDeploymentGate(unittest.TestCase):
