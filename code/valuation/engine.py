@@ -442,8 +442,27 @@ class ValuationEngine:
                          f"{q_gi[0].upper()} {q_gi[1]}")
         return " ".join(parts), "; ".join(notes)
 
+    def targeted_comp_query(self, listing: Listing) -> str | None:
+        """Exact sold-search query for a numbered card surfaced broadly.
+
+        Broad searches remain useful for discovery, but they must not supply
+        the final price.  Once a live listing exposes the card number and
+        grade, this query fetches a separate sold pool for that identity.
+        Discovery-only rows deliberately stay broad.
+        """
+        if listing.discovery or card_number(listing.title) is None:
+            return None
+        specific = self._valuation_query(listing)
+        if specific is None:
+            # The watchlist query already names this card/grade, so its base
+            # comp fetch is already the targeted pool.
+            return None
+        query, _ = specific
+        return query if card_number(query) is not None else None
+
     def evaluate(self, listing: Listing, comps: list[SoldComp],
-                 asks: list[float] | None = None) -> Opportunity:
+                 asks: list[float] | None = None,
+                 specific_comps: list[SoldComp] | None = None) -> Opportunity:
         regrade = self._valuation_query(listing)
         if regrade is None:
             v = self.fair_value(listing.query, comps, asks)
@@ -453,27 +472,28 @@ class ValuationEngine:
         vquery, note = regrade
         # no ask-based fallback here: the ask pool belongs to the QUERY's
         # grade population, not this listing's
-        v = self.fair_value(vquery, comps, None)
+        specific_pool = specific_comps if specific_comps is not None else comps
+        v = self.fair_value(vquery, specific_pool, None)
         v.regraded = True
         v.notes.append(note)
+        if specific_comps is not None:
+            v.audit_notes.append(
+                f"targeted comp pool: {vquery!r} ({len(specific_comps)} rows)")
 
         if v.n_comps >= self.min_specific_comps and v.fair_value > 0:
             return Opportunity(listing=listing,
                                valuation=self.score(listing, v))
 
-        # Nothing in the pool sold as THIS card at THIS grade. A watchlist
-        # query returns one page of sold results covering every card and
-        # grade in the set, so slicing it down to one card usually leaves
-        # nothing - the durable fix is a query per card. Until then, fall
-        # back to the query's own (mixed) median rather than showing no
-        # value at all, but say so loudly and cap confidence so it cannot
-        # drive an alert. Kept out of fair_history either way (regraded).
+        # Fewer than the required exact sales. Fall back to the broad query's
+        # median for browsing rather than showing no value at all, but mark
+        # it as non-tradeable. A later run can fill the targeted cache.
         fallback = self.fair_value(listing.query, comps, asks)
         if fallback.fair_value > 0:
             fallback.regraded = True
             fallback.notes.append(
-                f"MIXED POOL: no sales of {vquery!r} in the comps - this is "
-                "a set-wide median across different cards, NOT a bid target")
+                f"MIXED POOL: only {v.n_comps} exact sale(s) of {vquery!r}; "
+                f"need {self.min_specific_comps} - showing a broad median "
+                "for browsing, NOT a bid target")
             fallback.confidence = round(
                 min(fallback.confidence, self.mixed_pool_conf), 3)
             fallback.audit_notes.append(

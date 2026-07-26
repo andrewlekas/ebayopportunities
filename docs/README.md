@@ -42,7 +42,9 @@ secrets file in a different location.
 1. **Sold comps** (eBay completed sales): fuzzy title matching filters wrong
    cards, a grade guard drops mismatched grades, MAD outlier rejection kills
    shill/damaged sales, then a recency-weighted median (30-day half-life)
-   gives the comps value.
+   gives the comps value. Broad searches discover inventory, but numbered
+   cards receive a separate, cache-first sold search for their exact card
+   number and listing grade before they can become tradeable.
 2. **Price guide**: PriceCharting (graded) or pokemontcg.io (raw) reference.
 3. **Blend**: comps weight scales with sample size and tightness; thin/noisy
    comps lean on the guide.

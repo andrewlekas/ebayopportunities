@@ -292,6 +292,32 @@ def persist_trusted_evidence(conn, o: Opportunity, config: dict,
     return fair_recorded, None
 
 
+def plan_targeted_comp_queries(listings: list, engine: ValuationEngine,
+                               limit: int) -> list[str]:
+    """Prioritized, deduplicated exact comp searches for numbered cards."""
+    if limit <= 0:
+        return []
+    candidates: dict[str, tuple] = {}
+    for listing in listings:
+        if (_category(listing.query)
+                not in {"Pokemon Cards", "Sports Cards"}):
+            continue
+        query = engine.targeted_comp_query(listing)
+        if not query:
+            continue
+        timing = (listing.age_hours if listing.listing_type == "fixed"
+                  else listing.hours_remaining)
+        rank = (0 if listing.priority else 1,
+                timing if timing is not None else 1e9,
+                listing.total_cost_now)
+        if query not in candidates or rank < candidates[query]:
+            candidates[query] = rank
+    return [
+        query for query, _ in
+        sorted(candidates.items(), key=lambda item: item[1])[:limit]
+    ]
+
+
 def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportunity]:
     sites = config.get("sites", ["ebay"])
     max_results = config.get("scraping", {}).get("max_results_per_query", 40)
@@ -430,14 +456,14 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
         results = [fetch(p) for p in plans]
     t_fetch = time.monotonic() - t_fetch
 
-    # ---- phase C (main thread): DB writes, filtering, valuation
+    # ---- phase C (main thread): DB writes + listing relevance
     # Rejections from the centralized evidence gate.  The report's browsing
     # tabs may still show these rows, but trends and learning never see them.
     import collections
     evidence_skips: collections.Counter = collections.Counter()
     n_comp_junk = [0]        # list so the loop below can accumulate into it
     t_val = time.monotonic()
-    opps: list[Opportunity] = []
+    prepared = []
     for entry, cached, fetched, listings in results:
         query = entry["query"]
         cap = entry.get("max_buy_price")
@@ -523,11 +549,93 @@ def run_live(config: dict, engine: ValuationEngine, mode: str) -> list[Opportuni
         # source when sold comps and guide prices are both unavailable
         ask_pool = [(k, l.total_cost_now) for k, l in relevant
                     if l.listing_type == "fixed" and l.total_cost_now > 0]
+        prepared.append((query, comps, relevant, ask_pool))
 
+    # ---- phase D: exact comp pools for numbered cards -------------------
+    # Broad live searches are good at FINDING cards. They are not allowed to
+    # PRICE #101, #288 and #195 from one shared median. Once listing titles
+    # reveal card number + grade, fetch/cache a separate sold pool for each
+    # identity. Limits prevent a broad scan from multiplying into hundreds
+    # of requests; priority and ending/fresh-soon listings go first.
+    target_default = 6 if mode == "bin" else 20
+    target_limit = int(scfg.get(
+        "targeted_comp_queries_per_bin_run" if mode == "bin"
+        else "targeted_comp_queries_per_run", target_default))
+    target_max = int(scfg.get("targeted_comp_max_results", 60))
+    all_relevant = [listing for _, _, rows, _ in prepared
+                    for _, listing in rows]
+    target_queries = plan_targeted_comp_queries(
+        all_relevant, engine, target_limit)
+    targeted_pools: dict[str, list] = {}
+    target_missing = []
+    for target_query in target_queries:
+        pool = histdb.cached_comps(
+            conn, target_query, cache_hours, min_count=1) or []
+        if pool:
+            targeted_pools[target_query] = pool
+        else:
+            target_missing.append(target_query)
+
+    def fetch_targeted(target_query: str):
+        try:
+            pool = []
+            if p130 and not p130.tripped:
+                pool = p130.search_sold(target_query, target_max)
+            if not pool and ebay and use_html and not ebay.tripped:
+                pool = ebay.search_sold(target_query, target_max)
+            return target_query, pool
+        except Exception:
+            # One malformed title/query or scraper parser change must not
+            # abort every valuation after the main discovery work succeeded.
+            log.exception("targeted comp query %r failed - using broad "
+                          "quarantined fallback", target_query)
+            return target_query, []
+
+    target_started = time.monotonic()
+    target_results = []
+    if target_missing:
+        if workers > 1 and len(target_missing) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(workers, 4)) as ex:
+                target_results = list(ex.map(fetch_targeted, target_missing))
+        else:
+            target_results = [fetch_targeted(q) for q in target_missing]
+    for target_query, pool in target_results:
+        if pool:
+            histdb.save_comps(conn, target_query, pool)
+            histdb.match_closed(conn, pool)
+        else:
+            pool = histdb.cached_comps(
+                conn, target_query, cache_hours, min_count=1,
+                allow_stale=True) or []
+        targeted_pools[target_query] = pool
+    t_fetch += time.monotonic() - target_started
+
+    if exclude:
+        for target_query, pool in list(targeted_pools.items()):
+            clean = [c for c in pool if not _excluded(c.title, exclude)]
+            n_comp_junk[0] += len(pool) - len(clean)
+            targeted_pools[target_query] = clean
+    if target_queries:
+        usable = sum(
+            len(pool) >= engine.min_specific_comps
+            for pool in targeted_pools.values())
+        log.info("targeted comps: %d exact card queries planned (%d cache "
+                 "hits, %d cache misses, %d with >=%d rows)",
+                 len(target_queries), len(target_queries) - len(target_missing),
+                 len(target_missing), usable, engine.min_specific_comps)
+
+    # ---- phase E: valuation + trusted persistence -----------------------
+    opps: list[Opportunity] = []
+    for query, comps, relevant, ask_pool in prepared:
         fair_recorded = False
         for key, listing in relevant:
             asks = [c for k, c in ask_pool if k != key]
-            opp = engine.evaluate(listing, comps, asks)
+            target_query = engine.targeted_comp_query(listing)
+            specific = (targeted_pools.get(target_query)
+                        if target_query in targeted_pools else None)
+            opp = engine.evaluate(
+                listing, comps, asks, specific_comps=specific)
             v = opp.valuation
             fair_recorded, rejected = persist_trusted_evidence(
                 conn, opp, config, fair_recorded)

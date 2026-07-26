@@ -659,6 +659,29 @@ class TestBidLevels(unittest.TestCase):
         self.assertIsNotNone(be)
         self.assertLess(mb, be)
 
+    def test_max_bid_validates_its_own_vault_route(self):
+        # $600 fair -> vault breakeven is $558, but the 15%-ROI vault max
+        # is only $485. The old code saw breakeven above $500 and returned
+        # the $485 number using tax-free vault math even though a $485 win
+        # cannot enter the vault.
+        mb, be = report_mod._bid_levels(self._opp_for(600.0), self._cfg())
+        self.assertEqual(mb, 419)
+        self.assertEqual(be, 558)
+        taxed_cost = mb * 1.08
+        taxed_proceeds = 600.0 * (1 - 0.1325)
+        self.assertGreaterEqual(
+            (taxed_proceeds - taxed_cost) / taxed_cost, 0.15)
+
+    def test_whole_dollar_bid_never_rounds_up_across_vault_boundary(self):
+        cfg = self._cfg(target=0.0)
+        # Make the vault route deliberately unattractive so the best valid
+        # route is normal checkout immediately below the $500 boundary.
+        cfg["algorithm"]["psa_vault"]["sell_fee_rate"] = 0.40
+        mb, _ = report_mod._bid_levels(
+            self._opp_for(650.0), cfg)
+        self.assertEqual(mb, 499,
+                         "a normal-route result must stay below $500")
+
 
 class TestCompHygiene(unittest.TestCase):
     """'Babe Ruth 1933' had 116 comps from $1 to $21,000 with a median of
@@ -722,6 +745,96 @@ class TestCompHygiene(unittest.TestCase):
         value, n, _disp, _m = robust_comp_value("George Mikan 1948 #69", pool)
         self.assertEqual(n, 3, "only the three #69 sales should count")
         self.assertGreater(value, 4000)
+
+
+class TestTargetedCompRouting(unittest.TestCase):
+    def _engine(self):
+        from valuation import ValuationEngine
+        tmp = tempfile.mkdtemp()
+        engine = ValuationEngine({
+            "_config_dir": tmp,
+            "database": {"file": os.path.join(tmp, "history.db")},
+            "algorithm": {"min_specific_comps": 3,
+                          "guide_skip_min_comps": 8},
+        })
+        engine.guide.guide_value = lambda _query: None
+        return engine
+
+    def _listing(self, number="288", *, priority=False, discovery=False,
+                 hours=12):
+        return Listing(
+            site="ebay",
+            title=f"1984-85 Star #{number} Michael Jordan PSA 8",
+            url=f"https://www.ebay.com/itm/123456789{number.zfill(3)}",
+            current_price=500.0, bid_count=4,
+            listing_id=f"123456789{number.zfill(3)}",
+            query="Michael Jordan 1984 Star PSA 8",
+            end_time=datetime.now(timezone.utc) + timedelta(hours=hours),
+            priority=priority, discovery=discovery)
+
+    def test_listing_number_and_grade_become_the_sold_search(self):
+        engine = self._engine()
+        query = engine.targeted_comp_query(self._listing())
+        self.assertIsNotNone(query)
+        self.assertIn("#288", query)
+        self.assertIn("PSA 8", query)
+
+    def test_discovery_and_already_exact_queries_do_not_multiply(self):
+        engine = self._engine()
+        self.assertIsNone(
+            engine.targeted_comp_query(self._listing(discovery=True)))
+        exact = self._listing()
+        exact.query = "Michael Jordan 1984 Star #288 PSA 8"
+        self.assertIsNone(engine.targeted_comp_query(exact))
+
+    def test_planner_deduplicates_caps_and_prioritizes(self):
+        engine = self._engine()
+        ordinary = self._listing("101", priority=False, hours=1)
+        priority = self._listing("288", priority=True, hours=48)
+        duplicate = self._listing("288", priority=True, hours=2)
+        planned = scanner.plan_targeted_comp_queries(
+            [ordinary, priority, duplicate], engine, limit=1)
+        self.assertEqual(len(planned), 1)
+        self.assertIn("#288", planned[0],
+                      "priority beats an earlier non-priority listing")
+
+    def test_exact_pool_prices_288_without_101_contamination(self):
+        engine = self._engine()
+        listing = self._listing()
+        broad = [
+            SoldComp(f"1984 Star #101 Michael Jordan PSA 8 sale {i}",
+                     9000.0 + i * 500)
+            for i in range(3)
+        ]
+        exact = [
+            SoldComp(f"1984-85 Star #288 Michael Jordan PSA 8 sale {i}",
+                     price)
+            for i, price in enumerate((900.0, 1000.0, 1100.0))
+        ]
+        opp = engine.evaluate(listing, broad, specific_comps=exact)
+        self.assertEqual(opp.valuation.n_comps, 3)
+        self.assertAlmostEqual(opp.valuation.fair_value, 1000.0, delta=75)
+        self.assertFalse(any("MIXED POOL" in note
+                             for note in opp.valuation.notes))
+        self.assertTrue(any("targeted comp pool" in note
+                            for note in opp.valuation.audit_notes))
+
+    def test_thin_exact_pool_stays_non_tradeable(self):
+        from quality import is_tradeable
+        engine = self._engine()
+        listing = self._listing()
+        broad = [
+            SoldComp(f"1984 Star #101 Michael Jordan PSA 8 sale {i}",
+                     9000.0 + i * 500)
+            for i in range(3)
+        ]
+        exact = [
+            SoldComp("1984-85 Star #288 Michael Jordan PSA 8", 1000.0)
+        ]
+        opp = engine.evaluate(listing, broad, specific_comps=exact)
+        self.assertTrue(any("MIXED POOL" in note
+                            for note in opp.valuation.notes))
+        self.assertFalse(is_tradeable(opp))
 
 
 class TestCollectingStandards(unittest.TestCase):

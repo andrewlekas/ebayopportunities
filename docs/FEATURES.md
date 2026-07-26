@@ -52,6 +52,9 @@
   discovery, regraded, thin-comp and collection-rejected valuations cannot
   contaminate learning/history; decision outputs share the same tradeability
   policy while category tabs retain questionable rows for research.
+- **Exact-card comp routing**: broad searches discover inventory, then
+  cache-first, rate-capped sold searches price numbered cards using their
+  card number and listing grade instead of a set-wide median.
 
 ## Backlog
 Fanatics Collect + Alt scrapers, Mercari JP, velocity/annualized return,

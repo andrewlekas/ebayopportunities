@@ -15,6 +15,7 @@ audit columns (comps/guide/#comps/expected cost) grouped & hidden.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from openpyxl import Workbook
@@ -347,16 +348,29 @@ def _bid_levels(o, config: dict) -> tuple[float | None, float | None]:
         mb = (net_proceeds / (1 + max(target, 0.0))) / divisor - ship
         return mb, be
 
-    # vault route: no tax in, consignment fee out - only if the bid lands
-    # at or above the vault threshold
-    if vault_on:
-        mb, be = _levels(resale * (1 - vault_fee), taxed=False)
-        if be + ship >= vault_min:
-            return (round(mb, 0) if mb > 0 else None,
-                    round(be, 0) if be > 0 else None)
-    mb, be = _levels(resale * (1 - sell_fee), taxed=True)
-    return (round(mb, 0) if mb > 0 else None,
-            round(be, 0) if be > 0 else None)
+    normal = _levels(resale * (1 - sell_fee), taxed=True)
+    if not vault_on:
+        return tuple(math.floor(x) if x > 0 else None for x in normal)
+
+    vault_levels = _levels(resale * (1 - vault_fee), taxed=False)
+
+    def _best_valid(normal_value: float, vault_value: float):
+        candidates = []
+        # Normal checkout is valid strictly below the all-in vault boundary.
+        # If its mathematical ceiling crosses the boundary, the highest
+        # whole-dollar normal-route bid is the dollar immediately below it.
+        normal_cap = vault_min - ship
+        if normal_cap > 0:
+            candidates.append(min(normal_value, normal_cap - 1e-9))
+        # Vault economics are valid only when THIS candidate—not the
+        # breakeven from the same route—actually reaches the threshold.
+        if vault_value + ship >= vault_min:
+            candidates.append(vault_value)
+        valid = [value for value in candidates if value > 0]
+        return math.floor(max(valid)) if valid else None
+
+    return (_best_valid(normal[0], vault_levels[0]),
+            _best_valid(normal[1], vault_levels[1]))
 
 
 def _today_tab(wb, opps: list[Opportunity], config: dict) -> None:
@@ -680,6 +694,7 @@ def write_report(opps: list[Opportunity], path: str,
         ("Edge Now", "fair value net of fees minus CURRENT price+shipping"),
         ("Capture", "how capturable the edge is (auction: time left; BIN: freshness)"),
         ("Score", "ROI x Confidence x Capture - the sort key"),
+        ("Targeted comps", "numbered cards discovered by broad searches are repriced from a separate sold pool for that exact card number and listing grade; thin exact pools remain browse-only"),
         ("Sales/mo", "how many of this card sell per month (comp velocity) - the liquidity dimension"),
         ("Ann ROI", "ROI annualized by turnover: same edge on a faster-trading card = higher capital velocity"),
         ("Pri (star)", "query names a specific grade; alerts enabled"),
