@@ -125,6 +125,45 @@ def _evaluate_route(config: dict, channel: str,
     return ExitRoute(channel, rate, fixed, net)
 
 
+def psa_vault_eligible(config: dict, listing: Listing) -> bool:
+    """Whether this listing is an asset PSA Vault can actually receive.
+
+    Vault economics are intentionally narrower than ordinary resale routes:
+    an eBay watch, watch part, comic, game, raw card, or memorabilia listing
+    must never receive a tax-free card-vault bid ceiling merely because it
+    costs more than the configured dollar threshold.
+    """
+    vault = (config.get("algorithm", {}) or {}).get("psa_vault") or {}
+    if vault.get("enabled", False) is False:
+        return False
+    if (listing.site or "").lower() != "ebay":
+        return False
+    categories = {
+        str(category).strip().lower()
+        for category in (vault.get("eligible_categories")
+                         or ["Pokemon Cards", "Sports Cards"])
+    }
+    if categories and (listing.category or "").strip().lower() not in categories:
+        return False
+    try:
+        from valuation.identity import object_class
+        if object_class(listing.title or "") != "card":
+            return False
+    except (ImportError, AttributeError):
+        return False
+    if vault.get("requires_graded", True):
+        graders = {
+            str(grader).strip().upper()
+            for grader in (vault.get("eligible_graders")
+                           or ["PSA", "BGS", "CGC", "SGC", "BVG"])
+        }
+        match = re.search(r"\b(PSA|BGS|CGC|SGC|BVG)\b",
+                          listing.title or "", re.I)
+        if not match or match.group(1).upper() not in graders:
+            return False
+    return True
+
+
 def best_exit_route(config: dict, listing: Listing, resale_value: float,
                     allow_vault: bool = False) -> ExitRoute:
     """Choose the eligible exit with the highest expected net proceeds.
@@ -138,6 +177,9 @@ def best_exit_route(config: dict, listing: Listing, resale_value: float,
     selected = str(getattr(listing, "resale_channel", "") or
                    algo.get("default_resale_channel", "auto")).lower()
     if selected != "auto":
+        if selected == "psa_vault" and not psa_vault_eligible(
+                config, listing):
+            selected = "ebay"
         chosen = _evaluate_route(config, selected, value)
         ebay = _evaluate_route(config, "ebay", value)
         return ExitRoute(chosen.channel, chosen.fee_rate, chosen.fixed_cost,
@@ -159,7 +201,7 @@ def best_exit_route(config: dict, listing: Listing, resale_value: float,
             continue
         candidates.append(_evaluate_route(config, channel, value))
 
-    if allow_vault:
+    if allow_vault and psa_vault_eligible(config, listing):
         vault = algo.get("psa_vault") or {}
         if vault.get("enabled", False):
             vault_cfg = {

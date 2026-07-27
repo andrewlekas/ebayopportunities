@@ -14,6 +14,7 @@ import base64
 import logging
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -51,6 +52,7 @@ def _iso(dt_str: str | None):
 
 class EbayScraper(BaseScraper):
     site = "ebay"
+    capabilities = frozenset({"auctions", "fixed", "sold"})
     warmup_url = "https://www.ebay.com/"
 
     def __init__(self, config: dict):
@@ -65,6 +67,21 @@ class EbayScraper(BaseScraper):
         # re-POSTed on every single query (~200 calls/run). Rule: any
         # endpoint that fails 3 straight gets left alone for the run.
         self._oauth_fails = 0
+        # Sold-comps pages are the one eBay lane for which there is no
+        # generally available official API.  Query workers run in parallel,
+        # so a request-level lock alone is not enough: after one worker sees
+        # a challenge it releases BaseScraper's HTML lock while cooling down,
+        # and the other workers can otherwise keep hitting eBay.  Keep the
+        # ENTIRE sold-search lifecycle (request, challenge cooldown, retry)
+        # in one lane and leave a quiet gap after each completed search.
+        scraping = config.get("scraping", {})
+        self._sold_lock = threading.Lock()
+        self._sold_delay = max(
+            0.0, float(scraping.get(
+                "ebay_sold_request_delay_seconds", 10.0)))
+        self._last_sold_search: float | None = None
+        log.info("ebay/sold: one-at-a-time pacing enabled "
+                 "(%.1fs quiet gap between searches)", self._sold_delay)
 
     # ---------------- Browse API ----------------
     def _get_token(self) -> str | None:
@@ -156,22 +173,49 @@ class EbayScraper(BaseScraper):
         mps = self.marketplaces if intl else self.marketplaces[:1]
 
         def fetch(mp: str) -> list[Listing]:
-            params = {"q": query, "filter": f"buyingOptions:{{{buying}}}",
-                      "limit": min(max_results, 200)}
-            if sort:
-                params["sort"] = sort
-            r = self._get(BROWSE_URL, api=True,
-                          headers={"Authorization": f"Bearer {token}",
-                                   "X-EBAY-C-MARKETPLACE-ID": mp},
-                          params=params)
-            if not r:
-                return []
             found = []
-            for it in r.json().get("itemSummaries", []) or []:
-                l = self._parse_summary(it, query, mp)
-                if l:
-                    found.append(l)
-            return found
+            offset = 0
+            # eBay requires every non-zero offset to be an exact multiple
+            # of the requested page limit. Keep one page size throughout
+            # pagination and slice the last response locally.
+            page_limit = min(max_results, 200)
+            while len(found) < max_results:
+                params = {
+                    "q": query,
+                    "filter": f"buyingOptions:{{{buying}}}",
+                    "limit": page_limit,
+                }
+                if offset:
+                    params["offset"] = offset
+                if sort:
+                    params["sort"] = sort
+                r = self._get(
+                    BROWSE_URL, api=True,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-EBAY-C-MARKETPLACE-ID": mp,
+                    },
+                    params=params)
+                if not r:
+                    break
+                payload = r.json()
+                items = payload.get("itemSummaries", []) or []
+                for it in items:
+                    l = self._parse_summary(it, query, mp)
+                    if l:
+                        found.append(l)
+                        if len(found) >= max_results:
+                            break
+                if not payload.get("next") or not items:
+                    break
+                response_offset = int(payload.get("offset", offset) or 0)
+                response_limit = int(
+                    payload.get("limit", page_limit) or page_limit)
+                next_offset = response_offset + response_limit
+                if next_offset <= offset:
+                    break
+                offset = next_offset
+            return found[:max_results]
 
         if len(mps) == 1:
             return fetch(mps[0])
@@ -287,7 +331,24 @@ class EbayScraper(BaseScraper):
         return self._search_html(query, max_results, fixed=True)
 
     def search_sold(self, query: str, max_results: int = 60) -> list[SoldComp]:
-        comps = self._search_html(query, max_results, sold=True)
+        with self._sold_lock:
+            # A tripped lane should skip immediately rather than making
+            # every queued query wait through the quiet gap.  Let _get()
+            # record the skip in the endpoint telemetry.
+            if not self.lane_tripped("html"):
+                if self._last_sold_search is not None:
+                    wait = self._sold_delay - (
+                        time.monotonic() - self._last_sold_search)
+                    if wait > 0:
+                        time.sleep(wait)
+            try:
+                comps = self._search_html(query, max_results, sold=True)
+            finally:
+                # Completion-to-next-search spacing is deliberately more
+                # conservative than start-to-start spacing.  _search_html's
+                # normal randomized HTML delay is additive, so the default
+                # wire cadence is roughly 12-15 seconds between clean pages.
+                self._last_sold_search = time.monotonic()
         now = datetime.now(timezone.utc)
         for c in comps:
             c.sold_date = c.sold_date or now

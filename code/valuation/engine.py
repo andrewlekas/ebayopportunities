@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import math
 
-from economics import best_exit_route, sales_tax_rate, total_acquisition_cost
+from economics import (best_exit_route, psa_vault_eligible, sales_tax_rate,
+                       total_acquisition_cost)
 from models import Listing, Valuation, Opportunity, SoldComp
 from . import comps as comps_mod
 from .comps import (GRADE_RE, GRADER_PREMIUM, _subject_tokens, card_number,
                     comp_velocity, grade_info, grader_of, robust_comp_value,
                     subject_candidates, title_match_score)
+from .identity import (CardIdentity, MATCH_EXACT, MATCH_STRONG, identity_of)
 from .price_guide import PriceGuide
 
 
@@ -92,6 +94,48 @@ class ValuationEngine:
         # this we fall back to the query's mixed median and flag the row
         self.min_specific_comps = algo.get("min_specific_comps", 3)
         self.mixed_pool_conf = algo.get("mixed_pool_confidence_cap", 0.25)
+        # --- identity-led valuation (2026-07-26) -----------------------
+        # How precisely a listing must name ONE physical asset before its
+        # value may become a bid target. Below this the row is browse-only,
+        # however confident the underlying sources look.
+        self.identity_floor = algo.get("identity_specificity_floor", 0.70)
+        # Comps older than this stop counting as current market and start
+        # discounting confidence. The 2026-07-26 run priced live auctions
+        # off 144-hour-old pools while printing 56.7% confidence.
+        self.comp_fresh_hours = float(
+            config.get("database", {}).get("comp_cache_hours", 48) or 48)
+        # A resolved PriceCharting product is a paid, card-specific market
+        # observation. When we have landed the exact card, it LEADS - comps
+        # may pull the value down but never inflate it.
+        self.guide_leads = algo.get("guide_leads_on_match", True)
+        # --- guide call economics (2026-07-26) -------------------------
+        # PriceCharting's paid API is one call per second and we observe
+        # ~2s round trip, so 400 lookups cost ~20 minutes of wall clock -
+        # the dominant cost of a full scan. In the 11:54 run, 3,813 of
+        # 4,193 valued rows (91%) died at the fair-value floor, so most of
+        # that spend bought nothing. These two gates skip the call when the
+        # answer cannot change the outcome.
+        flt = config.get("filters", {})
+        self.value_floor = flt.get("min_value", 0) or 0
+        self.value_floor_by_cat = flt.get("min_value_by_category") or {}
+        self.poke_grade_floor = flt.get("pokemon_grade_floor", 3.0)
+        # Skip the guide when identity-matched comps already put the row
+        # this far below its category floor. Deliberately generous: at 50%
+        # the guide would have to disagree with a solid comp pool by 2x to
+        # rescue the row, and that disagreement would be quarantined anyway.
+        self.guide_skip_ratio = algo.get("guide_skip_below_floor_ratio", 0.5)
+        # "live"      - price the auction at its current bid (>=1 bid).
+        #               Finds dislocations you can act on now.
+        # "projected" - model where the auction will close. Requires a
+        #               calibrated settle ratio to be meaningful, and ours
+        #               has never been validated against a real close.
+        self.auction_pricing = str(
+            algo.get("auction_pricing", "live")).strip().lower()
+        # How close to the end a ZERO-bid auction becomes takeable at its
+        # opening price. Beyond this it is browse-only: a low opening bid is
+        # bait, and bait needs time to work.
+        self.zero_bid_hours = float(algo.get("zero_bid_actionable_hours", 24))
+
 
         # Self-improving layer: prefer learned parameters / model when the
         # accumulated close data supports them (see learner.py).
@@ -107,7 +151,65 @@ class ValuationEngine:
             self.predictor = None
         self.guide = PriceGuide(config)
 
+    def _floor_for(self, listing: Listing) -> float:
+        cat = getattr(listing, "category", None)
+        return float(self.value_floor_by_cat.get(cat, self.value_floor) or 0)
+
+    def _guide_worth_calling(self, ident: CardIdentity, listing: Listing,
+                             cv: float | None, n: int) -> tuple[bool, str]:
+        """Would a guide lookup change what happens to this row?"""
+        if listing is not None and getattr(listing, "grail", False):
+            return True, ""          # grails are priced regardless of cost
+        if not ident.is_specific(self.identity_floor):
+            return False, (f"identity only {ident.specificity():.0%} specific "
+                           "- browse-only whatever the guide says")
+        # Graded Pokemon at or below the grade floor are dropped by
+        # output_ok after valuation. Pricing them first is pure waste.
+        if (ident.object_class == "card" and ident.grade is not None
+                and ident.grade <= self.poke_grade_floor
+                and getattr(listing, "category", None) == "Pokemon Cards"):
+            return False, (f"graded Pokemon at PSA {ident.grade:g} - below "
+                           "the configured grade floor")
+        floor = self._floor_for(listing)
+        if (cv is not None and n >= self.min_specific_comps and floor
+                and cv < floor * self.guide_skip_ratio):
+            return False, (f"comps ${cv:,.0f} are far below the "
+                           f"${floor:,.0f} floor - the guide cannot rescue it")
+        return True, ""
+
     # ---------------- fair value ----------------
+    def _ask_prices_for(self, ident: CardIdentity | None,
+                        asks) -> tuple[list[float], int]:
+        """Live asks that are the SAME asset, plus how many were rejected.
+
+        An ask pool is gathered per QUERY, so without this every listing
+        under a broad query shares one estimate: on 2026-07-26 a pool of 149
+        "Tiger Woods UDA" asks - framed photos, tournament-worn shirts,
+        jersey cards, signed flags - produced a single $1,799.10 that was
+        handed to all 20 rows on the Sports Cards tab.
+
+        Accepts either Listings (identity-filterable) or bare floats, since
+        the legacy query-keyed path and older tests still pass prices.
+        """
+        prices, dropped = [], 0
+        for a in asks or []:
+            price = getattr(a, "total_cost_now", None)
+            if price is None:
+                try:
+                    prices.append(float(a))       # legacy: a bare price
+                except (TypeError, ValueError):
+                    pass
+                continue
+            if price <= 0:
+                continue
+            if ident is not None:
+                other = identity_of(getattr(a, "title", "") or "")
+                if ident.conflicts_with(other) is not None:
+                    dropped += 1
+                    continue
+            prices.append(float(price))
+        return prices, dropped
+
     @staticmethod
     def _ask_based(asks: list[float]) -> float | None:
         """Value floor from live fixed-price asks: MAD-trim the outliers,
@@ -120,6 +222,248 @@ class ValuationEngine:
         if len(kept) < 3:
             kept = sorted(asks)
         return kept[max(0, int(len(kept) * 0.25) - 0)] * 0.90
+
+    # ---------------- identity-led fair value ----------------
+    def _identity_comps(self, ident: CardIdentity,
+                        comps: list[SoldComp]) -> tuple[list[SoldComp], int]:
+        """Keep only comps that are the SAME physical asset."""
+        kept, dropped = [], 0
+        for c in comps or []:
+            if ident.conflicts_with(identity_of(c.title or "")) is None:
+                kept.append(c)
+            else:
+                dropped += 1
+        return kept, dropped
+
+    @staticmethod
+    def _newest_comp_age_hours(comps: list[SoldComp]) -> float | None:
+        """Age of the freshest sale actually used.
+
+        Staleness was previously reported once, globally, in Source Health
+        and never touched a number: the 2026-07-26 run priced live auctions
+        off 144-hour-old pools while printing 56.7% confidence.
+        """
+        from datetime import datetime, timezone
+        newest = None
+        for c in comps or []:
+            raw = getattr(c, "sold_date", None)
+            if not raw:
+                continue
+            if isinstance(raw, datetime):
+                ts = raw
+            else:
+                try:
+                    ts = datetime.fromisoformat(
+                        str(raw).replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if newest is None or ts > newest:
+                newest = ts
+        if newest is None:
+            return None
+        return max(0.0, (datetime.now(timezone.utc)
+                         - newest).total_seconds() / 3600.0)
+
+    def fair_value_for(self, ident: CardIdentity, query: str,
+                       comps: list[SoldComp],
+                       asks: list[float] | None = None,
+                       targeted: bool = False,
+                       broad_comps: list[SoldComp] | None = None,
+                       listing: Listing | None = None) -> Valuation:
+        """PriceCharting-led fair value for ONE identified asset.
+
+        Order of authority (Andrew's rule, 2026-07-26):
+
+        1. If PriceCharting resolved to THIS card (exact/strong match), that
+           paid, card-specific observation SETS the value. Identity-matched
+           comps may pull it DOWN but never inflate it - a comp pool can warn
+           you, it cannot talk you into paying more.
+        2. Otherwise fall back to identity-filtered comps.
+        3. If neither is card-specific, the row is browse-only and says so.
+
+        This inverts the old design, where the guide was consulted only when
+        comps were thin and then silently carried 65% of the number via a
+        set-level product lookup.
+        """
+        v = Valuation()
+        v.identity_key = ident.fingerprint()
+        v.identity_specificity = ident.specificity()
+
+        pool, dropped = self._identity_comps(ident, comps)
+        # Match comps against the CARD, not the watchlist phrase. Using the
+        # query here meant a "Disney Chrome 2023" search (no grade, so
+        # PSA-5-equivalent) rejected every PSA 10 sale of the very card being
+        # valued - the query-keyed filter fighting the identity filter.
+        ref = ident.source_text or query
+        cv, n, disp, match_q = robust_comp_value(
+            ref, pool, min_match=self.min_match, mad_k=self.mad_k,
+            half_life_days=self.half_life, premiums=self.premiums)
+        v.comps_value, v.n_comps, v.dispersion = cv, n, disp
+        v.comp_age_hours = self._newest_comp_age_hours(pool)
+        if targeted:
+            v.audit_notes.append(
+                f"targeted comp pool: {query!r} ({len(pool)} rows)")
+        if pool:
+            v.sales_per_month = comp_velocity(ref, pool,
+                                              min_match=self.min_match)
+        if dropped:
+            v.audit_notes.append(
+                f"identity filter dropped {dropped} comp(s) of a different "
+                "card/parallel/object")
+
+        # Only spend a paid lookup on a listing that could actually become a
+        # bid target. A vague listing is browse-only whatever the guide says,
+        # so resolving it buys nothing: a live run on 2026-07-26 paid for
+        # searches like '1933 tues july' and '1933 aceo sketch' that could
+        # never have landed a product.
+        worth, why_not = self._guide_worth_calling(ident, listing, cv, n)
+        if worth:
+            quote = self.guide.quote(ident)
+        else:
+            from .price_guide import GuideQuote
+            quote = GuideQuote(note=f"guide not consulted - {why_not}")
+            v.audit_notes.append(f"guide skipped: {why_not}")
+        broad_fallback = False
+        fallback_pool = broad_comps if broad_comps is not None else comps
+        if cv is None and not quote.landed and fallback_pool:
+            # Nothing card-specific survived the identity filter and the
+            # guide did not land the card either. Show the unfiltered median
+            # so the row still carries a rough sense of scale for browsing -
+            # a labelled broad number beats a blank cell - but it is
+            # emphatically not a bid target and is marked as such below.
+            bcv, bn, bdisp, bmatch = robust_comp_value(
+                query, fallback_pool, min_match=self.min_match,
+                mad_k=self.mad_k, half_life_days=self.half_life,
+                premiums=self.premiums)
+            if bcv is not None:
+                cv, n, disp, match_q = bcv, bn, bdisp, bmatch
+                v.comps_value, v.n_comps, v.dispersion = cv, n, disp
+                v.comp_age_hours = self._newest_comp_age_hours(fallback_pool)
+                broad_fallback = True
+        v.guide_value = quote.value
+        v.identity_match = quote.match
+        v.guide_product = quote.product_name
+        v.guide_product_id = quote.product_id
+        if quote.note:
+            v.audit_notes.append(quote.note)
+        if quote.how:
+            v.audit_notes.append(f"guide grade routing: {quote.how}")
+        # PriceCharting publishes yearly units sold - a real liquidity
+        # measure, unlike comp dates which are only fetch dates.
+        if quote.sales_volume:
+            v.sales_per_month = round(quote.sales_volume / 12.0, 2)
+        else:
+            v.sales_per_month = comp_velocity(query, pool,
+                                              min_match=self.min_match)
+
+        if self.guide_leads and quote.landed:
+            v.fair_value = quote.value
+            v.audit_notes.append(
+                f"guide-led ({quote.match} match, {quote.score:.0%})")
+            if cv is not None and n >= self.min_specific_comps and cv < quote.value:
+                v.fair_value = cv
+                v.notes.append(
+                    f"comps below guide - using the lower ${cv:,.0f} "
+                    f"(guide ${quote.value:,.0f} from {n} matched sale(s))")
+                v.audit_notes.append("comps pulled the guide value down")
+        elif cv is not None:
+            v.fair_value = cv
+            v.audit_notes.append(f"comps only ({n} identity-matched sales)")
+        elif quote.value:
+            v.fair_value = quote.value
+            v.audit_notes.append(
+                f"guide only, {quote.match} match ({quote.score:.0%})")
+        elif asks:
+            # Identity-filtered: only asks for THIS card may price it.
+            prices, dropped = self._ask_prices_for(ident, asks)
+            est = self._ask_based(prices) if prices else None
+            if est and len(prices) >= self.min_specific_comps:
+                v.fair_value = est
+                v.confidence = round(min(0.35, 0.15 + 0.02 * len(prices)), 3)
+                v.notes.append(
+                    f"ASK-BASED estimate from {len(prices)} live asks of "
+                    "this card (no sold comps) - verify before bidding")
+                if dropped:
+                    v.audit_notes.append(
+                        f"ask pool: kept {len(prices)}, dropped {dropped} "
+                        "ask(s) for a different card/object")
+                return v
+            if prices:
+                v.notes.append(
+                    f"only {len(prices)} live ask(s) match this card "
+                    f"(need {self.min_specific_comps}) - no ask-based value")
+            v.notes.append("no valuation source")
+            return v
+        else:
+            v.notes.append("no valuation source")
+            return v
+
+        # --- honesty gates -------------------------------------------------
+        # Value carried by comps alone, on fewer exact sales than we require:
+        # same concept the old code called a MIXED POOL, so it keeps that
+        # name and stays behind the same tradeability blocker.
+        exact_n = 0 if broad_fallback else n
+        if (not quote.landed and cv is not None
+                and (broad_fallback or n < self.min_specific_comps)):
+            v.notes.append(
+                f"MIXED POOL: only {exact_n} exact sale(s) of "
+                f"{ident.guide_query()!r}; need {self.min_specific_comps} "
+                "- showing a broad median for browsing, NOT a bid target")
+            v.confidence = round(min(v.confidence or 1.0,
+                                     self.mixed_pool_conf), 3)
+        if not ident.is_specific(self.identity_floor):
+            v.notes.append(
+                "IDENTITY UNRESOLVED: this listing does not name one specific "
+                f"card ({v.identity_specificity:.0%} specific) - browsing "
+                "value only, NOT a bid target")
+        elif not quote.landed:
+            v.notes.append(
+                "IDENTITY UNRESOLVED: no PriceCharting product matched this "
+                f"exact card (best {quote.score:.0%}) - browsing value only, "
+                "NOT a bid target")
+
+        v.confidence = self._identity_confidence(v, quote, match_q)
+        # Keep the >4x sanity check: when we DID land the card and comps
+        # still disagree wildly, something is wrong with one of them.
+        if cv is not None and quote.value:
+            agreement = 1 - min(1.0, abs(cv - quote.value)
+                                / max(cv, quote.value))
+            v.audit_notes.append(f"comps/guide agreement={agreement:.0%}")
+            if agreement < 0.25:
+                v.disputed = True
+                v.notes.append("VALUE DISPUTED: comps and guide disagree >4x "
+                               "- verify before acting")
+                v.confidence = min(v.confidence, 0.30)
+        return v
+
+    def _identity_confidence(self, v: Valuation, quote, match_q: float
+                             ) -> float:
+        """Confidence rooted in IDENTITY, not merely in sample size.
+
+        The old formula could return 56.7% for a value built on a set-level
+        guide product and six comps of the wrong parallel. Knowing WHICH card
+        you are pricing has to matter more than how many loosely-related
+        sales you gathered.
+        """
+        base = {MATCH_EXACT: 0.72, MATCH_STRONG: 0.58}.get(quote.match, 0.30)
+        conf = base * max(0.35, v.identity_specificity)
+        if v.n_comps:
+            sample = min(1.0, v.n_comps / 8.0)
+            tightness = math.exp(-3.0 * v.dispersion)
+            conf += 0.25 * (0.5 * sample + 0.3 * tightness + 0.2 * match_q)
+        # Stale evidence is not current market. A 144-hour-old pool against a
+        # 48-hour freshness limit should not read like fresh conviction.
+        if v.comp_age_hours and v.comp_age_hours > self.comp_fresh_hours:
+            stale = min(1.0, (v.comp_age_hours / self.comp_fresh_hours) - 1.0)
+            conf *= (1.0 - 0.35 * stale)
+            v.audit_notes.append(
+                f"comps {v.comp_age_hours:.0f}h old vs "
+                f"{self.comp_fresh_hours:.0f}h limit - confidence discounted")
+        if not quote.landed:
+            conf = min(conf, self.mixed_pool_conf)
+        return round(max(0.0, min(1.0, conf)), 3)
 
     def fair_value(self, query: str, comps: list[SoldComp],
                    asks: list[float] | None = None) -> Valuation:
@@ -193,7 +537,8 @@ class ValuationEngine:
         the way in; consignment fee on the way out. (Auctions are judged
         on the expected close, not the current bid.)"""
         return (self.vault_enabled and listing.site == "ebay"
-                and price >= self.vault_min)
+                and price >= self.vault_min
+                and psa_vault_eligible(self.config, listing))
 
     def _buy_tax(self, listing: Listing, price: float) -> float:
         """Effective buy-side sales-tax rate at this purchase price."""
@@ -285,31 +630,90 @@ class ValuationEngine:
             settle = resale * sr
             hrs = listing.hours_remaining
             bids = listing.bid_count or 0
-            ml_pred = None
-            if self.predictor and resale > 0:
-                ml_pred = self.predictor.predict_ratio(
-                    hrs, cost_now / resale, bids, resale)
-            if ml_pred is not None:
-                expected_item = max(item_now, resale * ml_pred)
-                v.audit_notes.append("ML close model")
-            else:
-                adj_bid = item_now
-                if bids > 0:
-                    adj_bid = item_now * (1 + min(self.proxy_cap,
-                                                  self.proxy_per_bid * bids))
-                if hrs is None:
-                    expected_item = max(item_now, settle)
+
+            if self.auction_pricing == "live":
+                # LIVE PRICING (Andrew's rule, 2026-07-26).
+                #
+                # The projection was somewhat circular: it modelled the close
+                # as fair x settle_ratio and then asked whether that was
+                # cheap relative to fair. With settle_ratio 0.92, a 13.25%
+                # sell fee and 8% buy tax you must acquire at <= 80.3% of
+                # fair to break even - so ANY auction whose live bid had not
+                # yet started to dominate the model was negative-EV by
+                # arithmetic, and every auction beyond ~48h was invisible.
+                # Worse, 0.92 has never been validated: the learner sits at
+                # n=0 with 0 of 20 trustworthy closes.
+                #
+                # So price the auction at what it actually costs RIGHT NOW.
+                # This answers "is there a dislocation I can act on?" rather
+                # than "where do I guess this ends?".
+                #
+                # WHAT THIS CHANGES: expected_value is no longer a forecast
+                # of profit at the close. It is the edge available at this
+                # instant. You will usually not win at the current bid -
+                # Max Bid is the number that matters when you actually bid.
+                #
+                # The >= 1 bid requirement is essential. At zero bids the
+                # "current price" is the seller's opening ask, not a market,
+                # and treating it as takeable is the 2026-07-25 fake-bargain
+                # bug. output_ok already drops pure zero-bid auctions; this
+                # is the second lock on the same door.
+                if bids < 1 and not (bin_item > 0):
+                    # A zero-bid auction is takeable in a way a contested one
+                    # is not: bid the opening price and, if nobody else
+                    # shows up, you win at that price. But a LOW opening bid
+                    # is a marketing tactic - a $0.99 start on a $5,000 card
+                    # shows $5,000 of "edge" and is unwinnable at $0.99.
+                    #
+                    # Time decides which it is. With days to run, bait has
+                    # time to attract bidders. Near the close, a card nobody
+                    # has bid on is the best thing this scanner can find: it
+                    # means nobody noticed.
+                    if hrs is not None and hrs <= self.zero_bid_hours:
+                        expected_item = item_now
+                        v.audit_notes.append(
+                            f"no bids with {hrs:.0f}h left - priced at the "
+                            "opening bid, which is takeable if nobody else "
+                            "shows up")
+                        v.notes.append(
+                            "NO BIDS YET - you could open at this price, but "
+                            "one rival bid changes everything. Use Max Bid.")
+                    else:
+                        expected_item = max(item_now, settle)
+                        v.audit_notes.append(
+                            "no bids and still far from close - an opening "
+                            "ask is not a market yet")
                 else:
-                    w = 1 - math.exp(-hrs / self.tau_hours)
-                    expected_item = adj_bid + (settle - adj_bid) * w
-                    if hrs <= self.late_hours:
-                        floor = settle * self.sniper_floor
-                        if expected_item < floor:
-                            expected_item = floor
-                            v.audit_notes.append(
-                                f"sniper floor: close modeled >= "
-                                f"{self.sniper_floor:.0%} of settle")
-                    expected_item = max(item_now, expected_item)
+                    expected_item = item_now
+                    v.audit_notes.append(
+                        f"live pricing: edge measured at the current bid "
+                        f"({bids} bid(s)), not a forecast close")
+            else:
+                ml_pred = None
+                if self.predictor and resale > 0:
+                    ml_pred = self.predictor.predict_ratio(
+                        hrs, cost_now / resale, bids, resale)
+                if ml_pred is not None:
+                    expected_item = max(item_now, resale * ml_pred)
+                    v.audit_notes.append("ML close model")
+                else:
+                    adj_bid = item_now
+                    if bids > 0:
+                        adj_bid = item_now * (1 + min(
+                            self.proxy_cap, self.proxy_per_bid * bids))
+                    if hrs is None:
+                        expected_item = max(item_now, settle)
+                    else:
+                        w = 1 - math.exp(-hrs / self.tau_hours)
+                        expected_item = adj_bid + (settle - adj_bid) * w
+                        if hrs <= self.late_hours:
+                            floor = settle * self.sniper_floor
+                            if expected_item < floor:
+                                expected_item = floor
+                                v.audit_notes.append(
+                                    f"sniper floor: close modeled >= "
+                                    f"{self.sniper_floor:.0%} of settle")
+                        expected_item = max(item_now, expected_item)
             # nobody bids an auction above a Buy It Now they could just take
             if bin_item > 0 and expected_item > bin_item:
                 expected_item = bin_item
@@ -484,6 +888,23 @@ class ValuationEngine:
     def evaluate(self, listing: Listing, comps: list[SoldComp],
                  asks: list[float] | None = None,
                  specific_comps: list[SoldComp] | None = None) -> Opportunity:
+        # Identity-led path: describe the OBJECT, resolve PriceCharting to
+        # that object, then price it. Falls back to the legacy query-keyed
+        # path only when there is no usable identity (so a title we cannot
+        # parse at all still produces a browsing value rather than nothing).
+        ident = identity_of(listing.title or "")
+        if ident.subject or ident.number:
+            targeted = specific_comps is not None
+            pool = specific_comps if targeted else comps
+            v = self.fair_value_for(ident, listing.query, pool, asks,
+                                    targeted=targeted, broad_comps=comps,
+                                    listing=listing)
+            if v.fair_value > 0 or v.notes:
+                if listing.discovery:
+                    v.notes.append("discovery query - browsing only")
+                return Opportunity(listing=listing,
+                                   valuation=self.score(listing, v))
+
         regrade = self._valuation_query(listing)
         if regrade is None:
             v = self.fair_value(listing.query, comps, asks)

@@ -26,7 +26,15 @@ def _configured_sources(config: dict) -> dict[str, tuple[bool, str]]:
     sites = {str(s) for s in (config.get("sites") or ["ebay"])}
     scraping = config.get("scraping", {}) or {}
     keys = config.get("api_keys", {}) or {}
-    return {
+    fanatics = keys.get("fanatics") or {}
+    alt = keys.get("alt") or {}
+    fanatics_ready = bool(
+        fanatics.get("feed_file")
+        or (fanatics.get("authorized") and fanatics.get("endpoint")))
+    alt_ready = bool(
+        alt.get("feed_file")
+        or (alt.get("authorized") and alt.get("endpoint")))
+    sources = {
         "ebay/listings": (
             "ebay" in sites,
             "Browse API with HTML fallback"),
@@ -43,9 +51,16 @@ def _configured_sources(config: dict) -> dict[str, tuple[bool, str]]:
             "goldin" in sites, "Goldin listings"),
         "heritage/listings": (
             "heritage" in sites, "Heritage listings"),
+        "pristine/listings": (
+            "pristine" in sites, "Pristine Auction public search"),
         "fanatics_collect/listings": (
-            "fanatics_collect" in sites,
-            "Fanatics Collect listings"),
+            "fanatics_collect" in sites and fanatics_ready,
+            "Fanatics Collect authorized API/export"
+            + ("" if fanatics_ready else "; access not configured")),
+        "alt/listings": (
+            "alt" in sites and alt_ready,
+            "ALT authorized API/export"
+            + ("" if alt_ready else "; access not configured")),
         "pricecharting/guide": (
             bool((keys.get("pricecharting") or {}).get("token")),
             "PriceCharting guide"),
@@ -53,6 +68,12 @@ def _configured_sources(config: dict) -> dict[str, tuple[bool, str]]:
             bool((keys.get("pokemontcg") or {}).get("api_key")),
             "PokemonTCG.io guide"),
     }
+    try:
+        from source_registry import source_health_sources
+        sources.update(source_health_sources(config))
+    except Exception:
+        pass
+    return sources
 
 
 def _endpoint_matches(source: str, endpoint: str) -> bool:
@@ -63,13 +84,22 @@ def _endpoint_matches(source: str, endpoint: str) -> bool:
         "yahoo_jp/listings": ("yahoo_jp/html", "yahoo_jp/parse"),
         "goldin/listings": ("goldin/api", "goldin/parse"),
         "heritage/listings": ("heritage/html", "heritage/parse"),
+        "pristine/listings": ("pristine/html", "pristine/parse"),
         "fanatics_collect/listings": (
             "fanatics_collect/api", "fanatics_collect/html",
+            "fanatics_collect/feed", "fanatics_collect/access",
             "fanatics_collect/parse"),
+        "alt/listings": (
+            "alt/api", "alt/feed", "alt/access", "alt/parse"),
         "pricecharting/guide": ("pricecharting",),
         "pokemontcg/guide": ("pokemontcg.io",),
     }
-    return endpoint in rules.get(source, ())
+    if endpoint in rules.get(source, ()):
+        return True
+    if source.endswith("/listings"):
+        source_id = source.split("/", 1)[0]
+        return endpoint.startswith(f"{source_id}/")
+    return False
 
 
 def capture(config: dict, mode: str) -> list[dict]:

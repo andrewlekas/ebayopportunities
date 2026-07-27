@@ -1,0 +1,39 @@
+# Copy this file, remove the leading underscore, and give the source a unique
+# lowercase id. Never put tokens or API keys here.
+id: example_house
+display_name: Example Auction House
+enabled: false
+capabilities: [auctions, fixed]
+
+access:
+  # A local JSON or CSV export is the safest first integration.
+  feed_file: imports/example_house.csv
+  # For a documented endpoint, obtain authorization and use secrets.yaml or
+  # environment variables for credentials.
+  authorized: false
+  endpoint: ""
+  access_token_env: EXAMPLE_HOUSE_ACCESS_TOKEN
+  api_key_env: EXAMPLE_HOUSE_API_KEY
+  api_key_header: X-API-Key
+
+field_map:
+  listing_id: lot_id
+  title: description
+  url: link
+  current_price: current_bid
+  listing_type: sale_type
+  bid_count: bids
+  end_time: closes_at
+  image_url: image
+  status: status
+  grader: grading_company
+  certificate_number: cert_number
+
+economics:
+  auction_buyer_fee_rate: 0.20
+  fixed_buyer_fee_rate: 0
+  minimum_buyer_fee: 0
+  shipping: 0
+  insurance_rate: 0
+  insurance_on_buyer_fee: false
+  marketplace: EXAMPLE_HOUSE

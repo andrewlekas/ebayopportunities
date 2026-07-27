@@ -20,6 +20,18 @@ __pycache__/
 # Andrew's private portfolio ledger.
 /portfolio/portfolio.csv
 
+# Persistent opportunity decisions and actual trade cash flows.
+/trade_blotter/*.csv
+/trade_blotter/*.bak.csv
+
+# User/platform inventory exports and installed source-specific backups.
+/imports/*
+!/imports/README.md
+/source_manifests/*.bak
+
+# Downloaded PriceCharting/SportsCardsPro catalogs are large runtime data.
+/guide_csv/*.csv
+
 # Generated output or scratch artifacts if they appear elsewhere.
 *.db
 *.db-*

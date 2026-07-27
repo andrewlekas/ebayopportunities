@@ -1,8 +1,9 @@
 # Pokemon Card Auction EV Scanner
 
-Scans live auctions (eBay, Goldin, Fanatics Collect, Heritage) for cards on
-your watchlist, computes a blended fair value, and writes an Excel report of
-opportunities sorted by expected value.
+Scans live auctions and fixed-price marketplaces (eBay, Goldin, Heritage,
+Pristine Auction, plus authorized Fanatics Collect and ALT feeds) for
+collectibles on your watchlist, computes a blended fair value, and writes an
+Excel report of opportunities sorted by expected value.
 
 ## Quick start
 
@@ -13,7 +14,14 @@ python main.py                 # live scan using config.yaml
 ```
 
 Output: `opportunities.xlsx` — sorted by Opportunity Score, color-scaled EV,
-clickable listing links, filterable header.
+clickable listing links, filterable headers, and a persistent Trade Blotter
+snapshot.
+
+On macOS, `Open Trade Blotter.command` opens the private CSV where workflow
+status and actual trade cash flows survive future scans. `Onboard
+Source.command` installs a validated authorized-source manifest, and `Check
+Source Feeds.command` validates all installed manifests without contacting
+marketplaces.
 
 ## Configure
 
@@ -27,12 +35,19 @@ Edit `config.yaml` for ordinary settings. Keep credentials in an ignored
     API instead of HTML scraping. Strongly recommended.
   - `pricecharting` token: graded-card guide prices.
   - `pokemontcg` key: TCGPlayer market prices for raw cards.
+  - `fanatics` / `alt`: an explicitly authorized inventory endpoint or a
+    normalized local JSON/CSV export. See `PLATFORM_ACCESS.md`.
 - **algorithm** — tuning knobs (settle ratio, fees, outlier threshold, etc.).
+- **trade_blotter** — private CSV path and per-run auto-capture count.
+- **source_manifests** — additional authorized JSON/CSV feeds with declared
+  capabilities, field maps, and buyer economics; enabled manifests join scans
+  automatically.
 
 Environment variables can override the secrets file:
 `CARD_SCANNER_EBAY_CLIENT_ID`, `CARD_SCANNER_EBAY_CLIENT_SECRET`,
 `CARD_SCANNER_PRICECHARTING_TOKEN`, `CARD_SCANNER_POKEMONTCG_API_KEY`,
-`CARD_SCANNER_FANATICS_APP_ID`, `CARD_SCANNER_FANATICS_SEARCH_KEY`,
+`CARD_SCANNER_FANATICS_ENDPOINT`, `CARD_SCANNER_FANATICS_ACCESS_TOKEN`,
+`CARD_SCANNER_ALT_ENDPOINT`, `CARD_SCANNER_ALT_ACCESS_TOKEN`,
 `CARD_SCANNER_TELEGRAM_BOT_TOKEN`, and
 `CARD_SCANNER_TELEGRAM_CHAT_ID`. Set `CARD_SCANNER_SECRETS_FILE` to use a
 secrets file in a different location.
@@ -59,9 +74,14 @@ secrets file in a different location.
 
 - eBay HTML fallback works without keys but is fragile and rate-limited; use
   API keys for anything serious.
-- Goldin/Fanatics/Heritage are JS-heavy sites — those scrapers are best-effort
-  and fail gracefully. If they return 0 results, inspect the site's network
-  requests and update the endpoint/field names in `scrapers/<site>.py`.
+- Goldin uses its live lots service. Pristine uses its public server-rendered
+  search. Heritage remains best-effort HTML. Fanatics and ALT deliberately
+  make no marketplace request without approved access or a local export.
+- Goldin landed cost includes its 22%/$19 premium, published $6/$19 card
+  shipping tiers, and 0.9% insurance on hammer plus premium. Non-card Goldin
+  lots use $19 as a configurable shipping floor. Pristine includes its 17% premium;
+  its variable shipping is configurable and defaults to zero, so verify it
+  before bidding.
 - Respect each site's terms of service and robots.txt; the built-in request
   delay is deliberate. This tool is for research, not high-frequency scraping.
 - Valuations are estimates, not financial advice — always verify a comp

@@ -72,6 +72,10 @@ def translate_query(query: str) -> str:
 
 class YahooJpScraper(BaseScraper):
     site = "yahoo_jp"
+    # The Buyee result page is a mixed Yahoo Auctions/PayPay feed exposed
+    # through search_auctions; keep it on one lane to avoid fetching the
+    # identical page twice during a full scan.
+    capabilities = frozenset({"auctions"})
 
     def __init__(self, config: dict):
         super().__init__(config)

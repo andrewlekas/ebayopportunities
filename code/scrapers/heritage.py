@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 class HeritageScraper(BaseScraper):
     site = "heritage"
+    capabilities = frozenset({"auctions"})
     warmup_url = "https://sports.ha.com/"
 
     def __init__(self, config: dict):

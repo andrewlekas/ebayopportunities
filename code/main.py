@@ -23,11 +23,11 @@ import yaml
 
 import db as histdb
 import paths
-from models import Opportunity
+from models import Listing, Opportunity
 from quality import (evidence_rejection, is_tradeable,
                      tradeability_rejection)
 from report import write_report
-from scrapers import ALL_SCRAPERS
+from source_registry import enabled_source_ids, scraper_registry
 from valuation import ValuationEngine
 from report import _category
 import valuation.comps as comps_mod
@@ -43,12 +43,248 @@ SECRET_ENV_PATHS = {
     "CARD_SCANNER_EBAY_CLIENT_SECRET": ("api_keys", "ebay", "client_secret"),
     "CARD_SCANNER_PRICECHARTING_TOKEN": ("api_keys", "pricecharting", "token"),
     "CARD_SCANNER_POKEMONTCG_API_KEY": ("api_keys", "pokemontcg", "api_key"),
-    "CARD_SCANNER_FANATICS_APP_ID": ("api_keys", "fanatics", "app_id"),
-    "CARD_SCANNER_FANATICS_SEARCH_KEY": ("api_keys", "fanatics", "search_key"),
+    "CARD_SCANNER_FANATICS_ACCESS_TOKEN":
+        ("api_keys", "fanatics", "access_token"),
+    "CARD_SCANNER_FANATICS_ENDPOINT":
+        ("api_keys", "fanatics", "endpoint"),
+    "CARD_SCANNER_ALT_ACCESS_TOKEN":
+        ("api_keys", "alt", "access_token"),
+    "CARD_SCANNER_ALT_ENDPOINT": ("api_keys", "alt", "endpoint"),
     "CARD_SCANNER_TELEGRAM_BOT_TOKEN":
         ("alerts", "telegram", "bot_token"),
     "CARD_SCANNER_TELEGRAM_CHAT_ID": ("alerts", "telegram", "chat_id"),
 }
+
+
+def _listing_identity(listing: Listing) -> str:
+    """High-confidence identity for per-query duplicate suppression.
+
+    A trusted physical-asset ID may cross marketplace boundaries.  Without
+    one, identity stays namespaced to the source and its native listing ID;
+    titles are deliberately never used because two copies of the same card
+    are two real opportunities.
+    """
+    asset_id = re.sub(
+        r"\s+", "", str(listing.canonical_asset_id or "")).lower()
+    if asset_id:
+        return f"asset:{asset_id}"
+    site = (listing.site or "unknown").lower()
+    native_id = str(listing.listing_id or "").strip().lower()
+    if not native_id and listing.url:
+        match = histdb.ITEM_ID_RE.search(listing.url)
+        native_id = match.group(1).lower() if match else ""
+    if native_id:
+        return f"listing:{site}:{native_id}"
+    clean_url = (listing.url or "").split("#", 1)[0].split("?", 1)[0]
+    if clean_url:
+        return f"url:{site}:{clean_url.rstrip('/').lower()}"
+    # Missing identity is not evidence of sameness. Keep anonymous rows
+    # distinct and let ordinary relevance/evidence gates decide their fate.
+    return f"anonymous:{site}:{id(listing)}"
+
+
+def _dedupe_listings(listings: list[Listing]) -> tuple[list[Listing], int]:
+    """Collapse native duplicates and explicitly identified cross-listings.
+
+    The lowest known landed-cost route wins when the same physical asset is
+    offered by multiple sources.  This is intentionally conservative:
+    identical normalized titles alone never count as a duplicate.
+    """
+    kept: list[Listing] = []
+    positions: dict[str, int] = {}
+    duplicates = 0
+    for listing in listings:
+        key = _listing_identity(listing)
+        position = positions.get(key)
+        if position is None:
+            positions[key] = len(kept)
+            kept.append(listing)
+            continue
+        duplicates += 1
+        if listing.total_cost_now < kept[position].total_cost_now:
+            kept[position] = listing
+    return kept, duplicates
+
+
+def _query_context_rank(listing: Listing) -> tuple:
+    """Prefer the most specific trustworthy query for one physical row."""
+    query = listing.query or ""
+    tokens = re.findall(r"[a-z0-9]+", query.lower())
+    try:
+        match = title_match_score(query, listing.title)
+    except Exception:
+        match = 0.0
+    return (
+        1 if listing.discovery else 0,
+        0 if listing.priority else 1,
+        -match,
+        -len(tokens),
+        listing.total_cost_now,
+    )
+
+
+def _dedupe_prepared(prepared: list[tuple]) -> tuple[list[tuple], int]:
+    """Collapse physical listings repeated under different scan queries.
+
+    The winning row keeps the best query's comps/ask context while recording
+    every query that found it. This runs before targeted comp planning and
+    valuation, so duplicates cannot consume paid lookups or produce two
+    contradictory opinions about the same eBay item.
+    """
+    groups: dict[str, list[tuple[int, Listing]]] = {}
+    for context_i, (_query, _comps, relevant, _asks) in enumerate(prepared):
+        for key, listing in relevant:
+            groups.setdefault(key, []).append((context_i, listing))
+
+    winners: dict[str, Listing] = {}
+    winner_context: dict[str, int] = {}
+    duplicates = 0
+    for key, candidates in groups.items():
+        context_i, winner = min(
+            candidates, key=lambda item: _query_context_rank(item[1]))
+        winners[key] = winner
+        winner_context[key] = context_i
+        duplicates += len(candidates) - 1
+
+        queries: list[str] = [winner.query] if winner.query else []
+        for _candidate_context, candidate in candidates:
+            for query in list(candidate.matched_queries or []) + [
+                    candidate.query]:
+                if query and query not in queries:
+                    queries.append(query)
+        winner.matched_queries = queries
+        winner.priority = any(candidate.priority
+                              for _i, candidate in candidates)
+        winner.discovery = all(candidate.discovery
+                               for _i, candidate in candidates)
+        grails = [
+            candidate for _i, candidate in candidates if candidate.grail]
+        if grails:
+            best_grail = max(grails, key=lambda row: row.grail_score)
+            winner.grail = best_grail.grail
+            winner.grail_score = best_grail.grail_score
+
+    deduped = []
+    for context_i, (query, comps, relevant, _asks) in enumerate(prepared):
+        kept = []
+        for key, _listing in relevant:
+            if winner_context.get(key) == context_i:
+                kept.append((key, winners[key]))
+        asks = [(key, listing) for key, listing in kept
+                if listing.listing_type == "fixed"
+                and listing.total_cost_now > 0]
+        deduped.append((query, comps, kept, asks))
+    return deduped, duplicates
+
+
+def find_value_collisions(opps, *, min_group: int = 3) -> list[tuple]:
+    """Distinct fair values shared, TO THE CENT, by several different assets.
+
+    Two listings of the same card should share a value. Two listings of
+    DIFFERENT cards sharing one to the cent is an arithmetic impossibility in
+    a real market, and is the fingerprint of a valuation keyed on something
+    broader than the object - which is exactly how eight Disney parallels came
+    to be worth $1,069.60 each and an $18 plastic figure came to be worth
+    $2,821.29.
+
+    Returns (value, distinct_asset_count, row_count, sample_titles).
+    """
+    groups: dict[float, dict] = {}
+    for o in opps or []:
+        v = getattr(o, "valuation", None)
+        fair = round(float(getattr(v, "fair_value", 0) or 0), 2)
+        if fair <= 0:
+            continue
+        g = groups.setdefault(fair, {"keys": set(), "rows": 0, "titles": []})
+        key = getattr(v, "identity_key", "") or getattr(
+            o.listing, "title", "")
+        g["keys"].add(key)
+        g["rows"] += 1
+        if len(g["titles"]) < 3:
+            g["titles"].append(getattr(o.listing, "title", "")[:60])
+    out = []
+    for fair, g in groups.items():
+        if len(g["keys"]) >= min_group:
+            out.append((fair, len(g["keys"]), g["rows"], g["titles"]))
+    return sorted(out, key=lambda r: -r[1])
+
+
+def log_value_collisions(opps, *, min_group: int = 3) -> list[tuple]:
+    """Canary: shout when distinct assets are sharing one number.
+
+    Modelled on the parser canaries - a silent wrong answer is worse than a
+    loud missing one. Had this existed on 2026-07-26 it would have flagged
+    the Disney and Superman pools the moment they appeared.
+    """
+    collisions = find_value_collisions(opps, min_group=min_group)
+    for fair, assets, rows, titles in collisions[:5]:
+        log.warning(
+            "IDENTITY CANARY: $%s is the fair value of %d DIFFERENT assets "
+            "across %d row(s) - the valuation is keyed on something broader "
+            "than the card. e.g. %s",
+            f"{fair:,.2f}", assets, rows, "; ".join(titles))
+    return collisions
+
+
+def site_result_caps(scfg: dict, mode: str) -> dict:
+    """Per-connector result ceilings for this run mode.
+
+    eBay's deep 500-result ceiling is right for a once-a-day full scan, where
+    recall on the user's primary transaction venue matters more than runtime.
+    It is wrong for a sweep that has to finish inside its own schedule.  On
+    2026-07-26 the 500 cap went live between the 12:30 and 13:00 BIN sweeps:
+    sweep runtime went from 3m37s to over an hour, one query alone returned
+    1,277 eBay rows, and the 13:30 sweep was skipped because the 13:00 sweep
+    still held the lock.  Left alone, roughly every second sweep would be
+    dropped.
+
+    ``max_results_per_query_by_site_bin`` overlays the base per-site map for
+    BIN sweeps only, so full scans keep their depth.
+    """
+    caps = dict(scfg.get("max_results_per_query_by_site") or {})
+    if mode == "bin":
+        caps.update(scfg.get("max_results_per_query_by_site_bin") or {})
+    return caps
+
+
+def _search_marketplaces(scrapers: dict, mode: str, query: str,
+                         max_results: int, intl: bool = True,
+                         query_ja: str | None = None,
+                         max_results_by_site: dict | None = None
+                         ) -> list[Listing]:
+    """Call every configured connector advertising the requested lane."""
+    listings: list[Listing] = []
+    site_limits = max_results_by_site or {}
+    if mode in ("all", "auctions"):
+        for name, scraper in scrapers.items():
+            if not scraper.supports("auctions"):
+                continue
+            site_max = max(1, int(site_limits.get(name, max_results)))
+            if name == "yahoo_jp":
+                if not intl:
+                    continue
+                found = scraper.search_auctions(
+                    query, site_max, query_ja=query_ja)
+            elif name == "ebay":
+                found = scraper.search_auctions(
+                    query, site_max, intl=intl)
+            else:
+                found = scraper.search_auctions(query, site_max)
+            log.info("  %s: %d auctions (%s)", name, len(found), query)
+            listings += found
+    if mode in ("all", "bin"):
+        for name, scraper in scrapers.items():
+            if not scraper.supports("fixed"):
+                continue
+            site_max = max(1, int(site_limits.get(name, max_results)))
+            if name == "ebay":
+                found = scraper.search_fixed(
+                    query, site_max, intl=intl)
+            else:
+                found = scraper.search_fixed(query, site_max)
+            log.info("  %s: %d fixed-price (%s)", name, len(found), query)
+            listings += found
+    return listings
 
 
 def _merge_secret_config(config: dict, overlay: dict) -> None:
@@ -114,6 +350,53 @@ def load_config(path: str) -> dict:
 def _excluded(title: str, keywords: list[str]) -> bool:
     t = title.lower()
     return any(k.lower() in t for k in keywords)
+
+
+def within_auction_horizon(listing, max_hours: float | None) -> bool:
+    """Is this auction close enough to act on?
+
+    Under live pricing an auction's edge is measured at its CURRENT bid, so
+    a listing six days out is quoting a number that has barely been tested
+    by the market - it will drift for days before it means anything. Cutting
+    them keeps the workbook to auctions you could actually bid on this week,
+    and saves the valuation and paid-guide lookups they would have cost.
+
+    Fixed-price listings and auctions with no end time are unaffected.
+    """
+    if not max_hours or max_hours <= 0:
+        return True
+    if getattr(listing, "listing_type", "") == "BIN":
+        return True
+    hrs = getattr(listing, "hours_remaining", None)
+    if hrs is None:
+        return True
+    return hrs <= max_hours
+
+
+def within_bin_age_window(listing, dead_from: float, dead_to: float) -> bool:
+    """Is this fixed-price listing at an age where mispricing is likely?
+
+    Andrew's rule (2026-07-26). A Buy It Now is worth attention at two
+    moments and not in between:
+
+      * FRESH - you are seeing it before the market has. Genuine mispricing
+        gets bought within days, so if it is still there after a week the
+        market has already looked and passed.
+      * STALE - it has sat long enough that the market moved underneath a
+        price the seller set months ago and never revisited.
+
+    The middle is picked-over inventory: seen by everyone, priced at or
+    above market, and the single biggest source of low-quality BIN rows.
+    """
+    if not dead_from or dead_to <= dead_from:
+        return True
+    if getattr(listing, "listing_type", "") == "auction":
+        return True
+    age = getattr(listing, "age_hours", None)
+    if age is None:
+        return True                      # unknown age - do not guess
+    days = age / 24.0
+    return not (dead_from <= days < dead_to)
 
 
 def collection_ok(o, config: dict, drops=None) -> bool:
@@ -203,7 +486,7 @@ def run_self_test(config: dict) -> tuple[bool, str]:
 
 
 def output_ok(o, *, min_ev: float = 0.0, poke_floor: float = 3.0,
-              drops=None) -> bool:
+              zero_bid_hours: float = 24.0, drops=None) -> bool:
     """Andrew's output rules - the report only shows actionable rows:
 
       - grails are always kept (they have their own tab; profit is not the
@@ -246,13 +529,22 @@ def output_ok(o, *, min_ev: float = 0.0, poke_floor: float = 3.0,
             return _drop("expected value < $%g" % min_ev)
         if v.roi < 0:
             return _drop("negative ROI")
-        # A zero-bid auction has no market yet. The hybrid exemption only
-        # holds when we actually KNOW the buy-it-now price - otherwise the
-        # row would be priced off the seller's opening ask.
+        # A zero-bid auction far from close has no market yet. Two
+        # exemptions:
+        #   - a hybrid whose buy-it-now we actually KNOW (that price is
+        #     takeable; the opening ask is not)
+        #   - a zero-bid auction near its close, which the engine prices at
+        #     the opening bid on purpose: nobody has bid, so opening at that
+        #     price can genuinely win it. Bait needs time to attract
+        #     bidders, so this only holds close to the end.
         takeable_bin = l.has_buy_now and getattr(l, "buy_now_price", 0) > 0
+        hrs_left = getattr(l, "hours_remaining", None)
+        near_close = (hrs_left is not None
+                      and hrs_left <= zero_bid_hours)
         if (l.listing_type == "auction" and l.bid_count < 1
-                and not takeable_bin and l.site != "yahoo_jp"):
-            return _drop("zero-bid auction with no takeable buy-it-now")
+                and not takeable_bin and not near_close
+                and l.site != "yahoo_jp"):
+            return _drop("zero-bid auction still far from close")
         return True
     except Exception:
         # a bad row must never kill the whole report - log it loudly (with
@@ -321,19 +613,34 @@ def plan_targeted_comp_queries(listings: list, engine: ValuationEngine,
 
 def run_live(config: dict, engine: ValuationEngine, mode: str,
              diagnostics: dict | None = None) -> list[Opportunity]:
-    sites = config.get("sites", ["ebay"])
-    max_results = config.get("scraping", {}).get("max_results_per_query", 40)
+    sites = list(config.get("sites", ["ebay"]))
+    for source_id in enabled_source_ids(config):
+        if source_id not in sites:
+            sites.append(source_id)
+    scfg = config.get("scraping", {})
+    max_results = scfg.get("max_results_per_query", 40)
+    max_results_by_site = site_result_caps(scfg, mode)
     flt = config.get("filters", {})
     price_max = flt.get("max_price") or float("inf")
+    # Live-priced auctions far from close are quoting a bid the market has
+    # barely tested. Cut them here, before valuation, so they cost neither
+    # scoring time nor a paid guide lookup.
+    auction_horizon = flt.get("max_auction_hours") or 0
+    # Fixed-price listings are interesting when fresh (before the market
+    # sees them) or old (price set months ago, market has since moved).
+    # The window between is picked-over inventory.
+    bin_dead_from = float(flt.get("bin_dead_zone_from_days", 0) or 0)
+    bin_dead_to = float(flt.get("bin_dead_zone_to_days", 0) or 0)
     exclude = flt.get("exclude_keywords") or []
     dbc = config.get("database", {})
     conn = histdb.connect(dbc.get("file", "history.db"))
     cache_hours = dbc.get("comp_cache_hours", 24)
 
-    scrapers = {s: ALL_SCRAPERS[s](config) for s in sites if s in ALL_SCRAPERS}
+    registry = scraper_registry(config)
+    scrapers = {site: registry[site](config)
+                for site in sites if site in registry}
     ebay = scrapers.get("ebay")
 
-    scfg = config.get("scraping", {})
     p130 = None
     if scfg.get("use_130point", True):
         from scrapers.point130 import Point130Scraper
@@ -408,24 +715,10 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
             # queries (that's where the cross-market edge is), unless disabled
             intl = priority or not intl_pri_only
 
-            listings = []
-            if mode in ("all", "auctions"):
-                for name, s in scrapers.items():
-                    if name == "yahoo_jp":
-                        if not intl:
-                            continue
-                        found = s.search_auctions(query, max_results,
-                                                  query_ja=entry.get("query_ja"))
-                    elif name == "ebay":
-                        found = s.search_auctions(query, max_results, intl=intl)
-                    else:
-                        found = s.search_auctions(query, max_results)
-                    log.info("  %s: %d auctions (%s)", name, len(found), query)
-                    listings += found
-            if mode in ("all", "bin") and ebay:
-                found = ebay.search_fixed(query, max_results, intl=intl)
-                log.info("  ebay: %d fixed-price (%s)", len(found), query)
-                listings += found
+            listings = _search_marketplaces(
+                scrapers, mode, query, max_results, intl,
+                entry.get("query_ja"),
+                max_results_by_site=max_results_by_site)
 
             # misspelling hunter: priority queries only, full scans only (to
             # stay inside API quota) - typo'd listings get few bidders
@@ -506,16 +799,10 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
         log.info("  %d sold comps (%s)", len(comps), query)
 
         min_match = flt.get("min_listing_match", 0.6)
-        seen_ids: set[str] = set()
+        listings, n_duplicates = _dedupe_listings(listings)
+        relevance_skips["duplicate within query"] += n_duplicates
         relevant: list[tuple[str, object]] = []
         for listing in listings:
-            # dedupe: the same item shows up once per marketplace searched
-            m = histdb.ITEM_ID_RE.search(listing.url or "")
-            key = m.group(1) if m else (listing.listing_id or listing.url)
-            if key in seen_ids:
-                relevance_skips["duplicate within query"] += 1
-                continue
-            seen_ids.add(key)
             if _excluded(listing.title, exclude):
                 relevance_skips["excluded keyword"] += 1
                 continue
@@ -549,6 +836,15 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
             if listing.total_cost_now > price_max:
                 relevance_skips["over global price cap"] += 1
                 continue
+            if not within_auction_horizon(listing, auction_horizon):
+                relevance_skips[
+                    "auction more than %gh away" % auction_horizon] += 1
+                continue
+            if not within_bin_age_window(listing, bin_dead_from, bin_dead_to):
+                relevance_skips[
+                    "BIN aged %g-%g days (picked over)"
+                    % (bin_dead_from, bin_dead_to)] += 1
+                continue
             listing.priority = priority
             listing.discovery = discovery
             listing.category = _category(query)
@@ -565,13 +861,25 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
                              and listing.total_cost_now > gm.max_price)):
                 listing.grail = gm.name
                 listing.grail_score = gm.score
+            # Phase D and persistence use the retained listing identity.
+            # Dedupe now happens in one pre-pass, so recompute the winning
+            # row's key instead of relying on the removed inline seen loop.
+            key = _listing_identity(listing)
             relevant.append((key, listing))
 
         # live fixed-price asks for this query: last-resort valuation
         # source when sold comps and guide prices are both unavailable
-        ask_pool = [(k, l.total_cost_now) for k, l in relevant
+        # Carry the LISTING, not just its price. An ask pool that is only
+        # numbers cannot be filtered to the card being valued, which is how
+        # 149 "Tiger Woods UDA" asks - photos, shirts, jersey cards - became
+        # one $1,799.10 estimate handed to all 20 rows under that query.
+        ask_pool = [(k, l) for k, l in relevant
                     if l.listing_type == "fixed" and l.total_cost_now > 0]
         prepared.append((query, comps, relevant, ask_pool))
+
+    prepared, n_cross_query_duplicates = _dedupe_prepared(prepared)
+    relevance_skips[
+        "duplicate across queries"] += n_cross_query_duplicates
 
     # ---- phase D: exact comp pools for numbered cards -------------------
     # Broad live searches are good at FINDING cards. They are not allowed to
@@ -652,13 +960,20 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
     for query, comps, relevant, ask_pool in prepared:
         fair_recorded = False
         for key, listing in relevant:
-            asks = [c for k, c in ask_pool if k != key]
+            asks = [l for k, l in ask_pool if k != key]
             target_query = engine.targeted_comp_query(listing)
             specific = (targeted_pools.get(target_query)
                         if target_query in targeted_pools else None)
             opp = engine.evaluate(
                 listing, comps, asks, specific_comps=specific)
             v = opp.valuation
+            if len(listing.matched_queries) > 1:
+                alternatives = [
+                    query for query in listing.matched_queries
+                    if query != listing.query]
+                v.audit_notes.append(
+                    "also found by %d other query(s): %s"
+                    % (len(alternatives), " | ".join(alternatives)))
             fair_recorded, rejected = persist_trusted_evidence(
                 conn, opp, config, fair_recorded)
             if rejected:
@@ -742,7 +1057,25 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
 
 def run_demo(config: dict, engine: ValuationEngine) -> list[Opportunity]:
     import demo_data
+    from valuation.identity import MATCH_EXACT
+    from valuation.price_guide import GuideQuote
     engine.guide.guide_value = demo_data.demo_guide_value  # stub guide API
+
+    # The identity path asks the guide to resolve a PRODUCT, not a phrase, so
+    # `quote` must be stubbed too or --demo would hit the live paid API. The
+    # demo is the offline self-check; it must never touch the network.
+    def demo_quote(ident):
+        for query in demo_data.MARKET:
+            if set(ident.subject) & {w.casefold()
+                                     for w in query.split()}:
+                return GuideQuote(
+                    value=demo_data.demo_guide_value(query),
+                    match=MATCH_EXACT, score=0.9,
+                    product_id="demo", product_name=query,
+                    console_name="demo", how="demo stub")
+        return GuideQuote(note="demo: no product")
+    engine.guide.quote = demo_quote
+
     opps = []
     for query in demo_data.MARKET:
         comps = demo_data.demo_comps(query)
@@ -763,9 +1096,21 @@ def classify_report_rows(opps: list[Opportunity], config: dict
 
     min_value = config.get("filters", {}).get("min_value", 0)
     by_cat = config.get("filters", {}).get("min_value_by_category") or {}
-    max_roi = config.get("filters", {}).get("max_roi", 2.0)
+    # The ROI ceiling catches nonsense (a $2 comp pool against a $2,000
+    # listing). Its right value depends on what ROI MEANS, which changed on
+    # 2026-07-26: under projected pricing a live $200 bid on a $1,000 card
+    # scored 30% ROI, because expected cost was dragged to ~92% of fair.
+    # Under live pricing the same row is 302% - so a 200% ceiling would
+    # discard precisely the dislocations live pricing exists to find.
+    flt_cfg = config.get("filters", {})
+    live_pricing = str(config.get("algorithm", {}).get(
+        "auction_pricing", "live")).strip().lower() == "live"
+    max_roi = (flt_cfg.get("max_roi_live", 10.0) if live_pricing
+               else flt_cfg.get("max_roi", 2.0))
     min_ev = config.get("output", {}).get("min_expected_value", 0)
     poke_floor = config.get("filters", {}).get("pokemon_grade_floor", 3.0)
+    zero_bid_hours = float(config.get("algorithm", {}).get(
+        "zero_bid_actionable_hours", 24))
     max_rows = config.get("output", {}).get("max_rows", 1000)
 
     counts: collections.Counter = collections.Counter()
@@ -809,7 +1154,7 @@ def classify_report_rows(opps: list[Opportunity], config: dict
         output_drops: collections.Counter = collections.Counter()
         if not output_ok(
                 o, min_ev=min_ev, poke_floor=poke_floor,
-                drops=output_drops):
+                zero_bid_hours=zero_bid_hours, drops=output_drops):
             reason = next(iter(output_drops), "output rule")
             reject(o, "Output economics", reason)
             continue
@@ -1093,6 +1438,28 @@ def main() -> int:
         "detail": "still browsable; blocked from Action/Today/alerts",
     }])
 
+    # Provenance. A lot of economics changed on 2026-07-26 - live auction
+    # pricing, a 72h horizon, a zero-bid window, a raised ROI ceiling - and
+    # they interact. When a workbook looks wrong, the first question is
+    # always "what settings produced this?", so the run answers it itself
+    # rather than leaving it to be reconstructed from config archaeology.
+    _algo = config.get("algorithm", {}) or {}
+    _flt = config.get("filters", {}) or {}
+    _live = str(_algo.get("auction_pricing", "live")).strip().lower() == "live"
+    _ceiling = (_flt.get("max_roi_live", 10.0) if _live
+                else _flt.get("max_roi", 2.0))
+    log.info(
+        "economics: auction_pricing=%s | zero-bid actionable <=%gh | "
+        "auction horizon <=%gh | ROI ceiling %.0f%% | settle ratio %.2f%s",
+        _algo.get("auction_pricing", "live"),
+        float(_algo.get("zero_bid_actionable_hours", 24)),
+        float(_flt.get("max_auction_hours", 0) or 0),
+        float(_ceiling) * 100, float(_algo.get("auction_settle_ratio", 0.92)),
+        " (LEARNED)" if getattr(engine, "predictor", None)
+        and getattr(engine.predictor, "settle_ratio", None) else " (unvalidated)")
+
+    log_value_collisions(kept)
+
     log.info(
         "filter waterfall: raw %d -> relevant %d -> valued %d -> "
         "fair floor %d -> ROI %d -> collection %d -> output %d -> "
@@ -1146,10 +1513,17 @@ def main() -> int:
             portfolio_rows = pf.build_rows(config, fairs, pf_dir)
         except Exception:
             log.exception("portfolio marking failed - continuing")
+    trade_rows: list[dict] = []
+    if not args.demo:
+        try:
+            from trade_blotter import sync as sync_trade_blotter
+            trade_rows = sync_trade_blotter(kept, config)
+        except Exception:
+            log.exception("trade blotter sync failed - continuing")
     write_report(
         kept, out, portfolio=portfolio_rows, config=config,
         source_health=health_rows, research=research_rows,
-        filter_waterfall=waterfall_rows)
+        filter_waterfall=waterfall_rows, trade_blotter=trade_rows)
     opps = kept
 
     if not args.demo and opps:

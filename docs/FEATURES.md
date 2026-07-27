@@ -7,6 +7,18 @@
   watchlist entry), Buyee purchase links, full configurable landed-cost
   estimate (domestic + international shipping, proxy fee, insurance,
   import duty and FX spread)
+- **Goldin**: live lots service with current bid/end time, 22%/$19 buyer
+  premium, $6/$19 card shipping tiers, and 0.9% insurance on price realized
+- **Pristine Auction**: public live search with current bid/end timestamp,
+  canonical lot links, images, and 17% buyer premium
+- **Fanatics Collect + ALT**: permission-gated API/local-export connectors
+  for both auction and fixed-price inventory; no browser-key extraction
+- **Connector capabilities**: full/BIN modes discover every source that
+  advertises the requested lane instead of hard-wiring fixed price to eBay
+- **Global cross-query dedupe**: native listing identity plus trusted physical
+  asset/certificate IDs; one physical listing is valued once under its most
+  specific query while retaining every query that found it. Titles alone
+  never collapse distinct copies
 - **Sold comps chain**: 130point (includes hidden Best Offer amounts) →
   eBay sold pages (auto-resume after bot-block cooldown) → cached history
 - **PriceCharting API**: graded-card guide values (Pokemon, sports, games)
@@ -28,6 +40,9 @@
   too-good-to-be-true can't top the board)
 - One landed-cost equation drives live EV and Excel bid ceilings; watchlist
   entries can select an exit marketplace with `resale_channel`
+- PSA Vault economics are restricted to eligible graded Pokemon/sports cards;
+  watches, parts, raw cards, games, comics, and memorabilia retain ordinary
+  checkout tax and resale fees
 - Scam defense: exclude keywords (reprint/proxy/pick-a-card/...), price
   <35% of market flag, low seller feedback penalty
 - Self-improving loop: predictions vs actual closes logged every scan;
@@ -39,12 +54,19 @@
 - Telegram alerts: edge ≥ $150, ROI ≥ 15%, capture ≥ 50%, confidence floor;
   per-listing dedupe; failed sends retry
 - Excel: Action tab (decide-now items), category tabs (Pokemon/Sports/
-  Watches/Games/Pop Culture), card-only Crossover, Source Health,
+  Watches/Games/Pop Culture), persistent Trade Blotter snapshot, card-only
+  Crossover, Source Health,
   Discovery quarantine, Movers (trusted 30d trends),
   human timing ("ends 2h 59m", amber <6h), hyperlinked titles, hidden
   audit column group (M–P)
 - SQLite history.db: comp cache (48h), trusted fair-value trend lines,
   calibration data, persistent source readiness, 7-day guide-price cache
+- **Persistent trade blotter**: the strongest tradeable rows are upserted to
+  a private CSV without overwriting human status/notes/cash flows; landed
+  cost, realized P&L/ROI, and holding time are derived on every run
+- **Manifest-driven sources**: authorized JSON/CSV marketplace feeds declare
+  field maps, auction/fixed capabilities, and buyer economics in YAML; an
+  enabled manifest automatically joins scans and Source Health
 
 ## Config quick reference (config.yaml)
 - `watchlist:` queries; `priority` auto-set by grade; `discovery: true` for
@@ -68,7 +90,11 @@
 - **Source readiness**: each run persists success/failure/breaker counts,
   deliberately disabled sources and comp-cache freshness, then displays
   them in the workbook.
+- `trade_blotter:` controls the persistent CSV and per-run auto-capture count.
+- `source_manifests/*.yaml` onboards additional authorized sources without a
+  Python edit; raw secrets are rejected from manifests.
 
 ## Backlog
-Revive Fanatics Collect, add Mercari JP, and expand exit-channel support
-to consignors such as Probstein/DC Sports/COMC.
+Obtain approved Fanatics/ALT data access, then onboard them through manifests
+or their built-in authorized connectors. Add Mercari JP and expand
+exit-channel support to consignors such as Probstein/DC Sports/COMC.

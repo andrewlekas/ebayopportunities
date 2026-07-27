@@ -42,15 +42,28 @@ CHALLENGE_MARKERS = ("pardon our interruption", "splashui/challenge",
 def _final_price(ebay: EbayScraper, item_id: str) -> float | None:
     """Winning bid for an ended item, 0.0 if it went unsold,
     None if undetermined (retry next run)."""
-    r = ebay._get(f"https://www.ebay.com/itm/{item_id}")
+    # OWN BREAKER LANE (2026-07-26). This used to share the "html" lane with
+    # sold-comp search scraping, so every comp-scrape challenge starved close
+    # tracking too - and close tracking is the ONLY source of ground truth
+    # for the settle ratio. The symptom: "settled 0 real closes, 20 pending
+    # retry" on every run for days, taking 0s because the breaker
+    # short-circuited it before a single request went out. The learner sat at
+    # n=0 as a direct result.
+    #
+    # The two activities also have different risk profiles: a single item
+    # page is a normal browse, while repeated sold-listing SEARCH pages are
+    # what actually attract challenges. They should not share a fuse. This
+    # lane still trips on its own three failures and is capped at 20 lookups
+    # per run, so it cannot become a hammer.
+    r = ebay._get(f"https://www.ebay.com/itm/{item_id}", lane="close")
     if not r:
         return None
     head = r.text[:4000].lower()
     if any(m in head for m in CHALLENGE_MARKERS):
-        ebay._streaks["html"] += 1
+        ebay._streaks["close"] += 1
         log.warning("closer: bot-challenge page for item %s (%d/%d)",
-                    item_id, ebay._streaks["html"], ebay.trip_after)
-        ebay.note_challenge("html")   # counts toward the run-wide backoff
+                    item_id, ebay._streaks["close"], ebay.trip_after)
+        ebay.note_challenge("close")
         return None
     text = r.text
     for rx in PRICE_RES:
@@ -91,7 +104,13 @@ def settle_closes(config: dict) -> str:
     ebay = EbayScraper(config)
     n_ok = n_unsold = 0
     for item_id, shipping in rows:
-        if ebay.tripped:
+        # `ebay.tripped` is the HTML-lane shorthand. Consulting it here undid
+        # the whole point of giving close tracking its own fuse: with
+        # sold-comp scraping cooling, this broke out of the loop before
+        # _final_price was ever called - which is why the 18:00 run still
+        # reported "settled 0 real closes" and made no ebay/close requests
+        # at all. Ask the lane we actually use.
+        if ebay.lane_tripped("close"):
             break
         price = _final_price(ebay, item_id)
         if price is None:

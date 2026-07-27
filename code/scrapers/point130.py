@@ -46,6 +46,7 @@ def _parse_iso(text: str):
 
 class Point130Scraper(BaseScraper):
     site = "130point"
+    capabilities = frozenset({"sold"})
     warmup_url = "https://130point.com/sales/"
 
     def search_sold(self, query: str, max_results: int = 60) -> list[SoldComp]:

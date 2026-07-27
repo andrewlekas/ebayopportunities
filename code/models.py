@@ -18,7 +18,15 @@ class Listing:
     end_time: Optional[datetime] = None
     image_url: str = ""
     listing_id: str = ""
+    # Optional source-independent identity for the physical collectible.
+    # Populate only from a trusted asset/certificate identifier so distinct
+    # copies of the same card are never collapsed merely by title.
+    canonical_asset_id: str = ""
     query: str = ""               # watchlist query that found it
+    # Every watchlist/discovery query that surfaced this same physical
+    # listing. ``query`` remains the best valuation context; this list keeps
+    # the full discovery provenance after cross-query deduplication.
+    matched_queries: list[str] = field(default_factory=list)
     priority: bool = False        # from watchlist entry's priority flag
     discovery: bool = False       # broad theme query: browse, don't trust EV
     misspell_from: str = ""       # typo'd search that surfaced this listing
@@ -48,6 +56,9 @@ class Listing:
     minimum_buyer_fee: float = 0.0
     international_shipping: float = 0.0
     insurance_rate: float = 0.0
+    # Some auction houses insure the full "price realized" (hammer plus
+    # buyer premium), not only the hammer. Keep that venue rule explicit.
+    insurance_on_buyer_fee: bool = False
     import_duty_rate: float = 0.0
     fx_spread_rate: float = 0.0
 
@@ -86,9 +97,14 @@ class Listing:
     def landed_cost(self, item_price: float | None = None) -> float:
         """Price plus every known fee required to get the item in hand."""
         price = self.current_price if item_price is None else item_price
+        buyer_fee = self.buyer_fee(price)
+        premium_insurance = (
+            buyer_fee * max(0.0, self.insurance_rate or 0.0)
+            if self.insurance_on_buyer_fee else 0.0)
         return (max(0.0, price or 0.0)
                 * (1 + self.variable_acquisition_rate)
-                + self.fixed_acquisition_cost + self.buyer_fee(price))
+                + self.fixed_acquisition_cost + buyer_fee
+                + premium_insurance)
 
     def item_price_for_landed_cost(self, landed_cost: float) -> float:
         """Inverse of ``landed_cost`` for bid/offer ceilings."""
@@ -96,13 +112,19 @@ class Listing:
         other_rate = self.variable_acquisition_rate
         buyer_rate = max(0.0, self.buyer_fee_rate or 0.0)
         minimum = max(0.0, self.minimum_buyer_fee or 0.0)
+        premium_multiplier = (
+            1 + max(0.0, self.insurance_rate or 0.0)
+            if self.insurance_on_buyer_fee else 1.0)
         # Try the percentage-premium branch first. If its calculated fee
         # clears the minimum, it is the exact inverse.
-        price = available / (1 + other_rate + buyer_rate)
+        price = available / (
+            1 + other_rate + buyer_rate * premium_multiplier)
         if price * buyer_rate >= minimum:
             return max(0.0, price)
         # Below the crossover the buyer premium is a fixed minimum.
-        return max(0.0, (available - minimum) / (1 + other_rate))
+        return max(
+            0.0,
+            (available - minimum * premium_multiplier) / (1 + other_rate))
 
     def landed_cost_note(self, item_price: float | None = None) -> str:
         """Compact audit text for reports/logs when extras are non-zero."""
@@ -178,6 +200,20 @@ class Valuation:
     # (mongrel comp pool or wrong guide product). Confidence capped at 0.30;
     # kept out of fair_history so bad blends don't poison trends.
     disputed: bool = False
+    # --- identity resolution (2026-07-26) -------------------------------
+    # How well this listing was pinned to ONE physical asset, and whether
+    # PriceCharting was resolved to THAT asset rather than to its set.
+    # Before these existed, 489 workbook rows shared just 5 fair values:
+    # eight Disney parallels at $1,069.60 and an $18 plastic figure carrying
+    # $2,821 inherited from a "Superman 1940" pool. `identity_match` is what
+    # licences the guide to lead; `identity_specificity` is what licences the
+    # row to become a bid target at all.
+    identity_match: str = "none"          # exact | strong | weak | none
+    identity_specificity: float = 0.0     # 0..1
+    identity_key: str = ""                # fingerprint, for collision checks
+    guide_product: Optional[str] = None   # resolved PriceCharting product
+    guide_product_id: Optional[str] = None
+    comp_age_hours: Optional[float] = None  # age of the newest comp used
     notes: list[str] = field(default_factory=list)        # human/decision
     audit_notes: list[str] = field(default_factory=list)  # model diagnostics
 

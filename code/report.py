@@ -24,7 +24,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from economics import (best_exit_route, item_price_for_total_cost,
-                       sales_tax_rate)
+                       psa_vault_eligible, sales_tax_rate)
 from models import Opportunity
 from quality import is_tradeable
 from textutil import fold
@@ -230,10 +230,68 @@ def _fill_sheet(ws, opps: list[Opportunity]) -> None:
                        font=Font(color="9C0006")))
 
 
+#
+
+# Every way a value can come from the QUERY rather than from the card. All
+# three collapse every listing under a query onto one number:
+#   MIXED POOL          - broad comp median, the guide could not land
+#   IDENTITY UNRESOLVED - no product matched this exact card
+#   ASK-BASED           - lower quartile of live asks under the query. The
+#                         2026-07-26 Sports Cards tab was 20 Tiger Woods
+#                         rows at $1,799.10 from a single pool of 149 asks.
+UNRESOLVED_MARKERS = ("IDENTITY UNRESOLVED", "MIXED POOL", "ASK-BASED")
+
+
+def _is_unresolved(o) -> bool:
+    """True when this row's value came from a broad fallback, not the card."""
+    notes = " | ".join(str(n).upper() for n in (o.valuation.notes or ()))
+    return any(m in notes for m in UNRESOLVED_MARKERS)
+
+
 def _sorted(opps):
-    return sorted(opps, key=lambda o: (o.listing.priority,
+    """Identified rows first, then by priority and score.
+
+    A row valued from its own card outranks one valued from a query-wide
+    median, however large the median made its apparent edge look.
+    """
+    return sorted(opps, key=lambda o: (not _is_unresolved(o),
+                                       o.listing.priority,
                                        o.valuation.opportunity_score),
                   reverse=True)
+
+
+def _cap_unresolved(opps: list[Opportunity], per_query: int = 3
+                    ) -> list[Opportunity]:
+    """Stop one unresolved value from swallowing a whole sheet.
+
+    When the guide cannot land a card, every listing under that query falls
+    back to the SAME broad comp median - and because that median is inflated
+    relative to the individual cards, those rows are also the ones that
+    clear the category fair-value floor. The result on 2026-07-26 18:00 was
+    a Sports Cards tab where all 20 rows were "Tiger Woods UDA" at
+    $1,799.10, and a Discovery tab where all 47 were "Upper Deck
+    Authenticated Signed Jersey" at $1,085 - the cheap, correctly-valued
+    cards having been cut at the floor beneath them.
+
+    They stay visible, because a broad median is still a useful smell test.
+    They just no longer crowd out the rows we actually identified.
+    """
+    kept: list[Opportunity] = []
+    seen: dict[tuple, int] = {}
+    for o in opps:
+        if not _is_unresolved(o):
+            kept.append(o)
+            continue
+        key = (o.listing.query, round(float(o.valuation.fair_value or 0), 2))
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] <= per_query:
+            if seen[key] == per_query:
+                o.valuation.notes.append(
+                    "more listings under this query share this same "
+                    "unresolved value - they are hidden here; see "
+                    "Research-Filtered for the full list")
+            kept.append(o)
+    return kept
 
 
 def _collapse(opps: list[Opportunity]) -> list[Opportunity]:
@@ -342,7 +400,8 @@ def _bid_levels(o, config: dict) -> tuple[float | None, float | None]:
         return None, None
     algo = config.get("algorithm", {})
     vault = algo.get("psa_vault", {}) or {}
-    vault_on = vault.get("enabled", True) and l.site == "ebay"
+    vault_on = (vault.get("enabled", True)
+                and psa_vault_eligible(config, l))
     vault_min = vault.get("min_price", 500)
     target = (config.get("output", {}).get("today") or {}).get(
         "max_bid_target_roi", 0.15)
@@ -609,6 +668,82 @@ def _portfolio_tab(wb, rows: list[dict]) -> None:
         r_i += 1
 
 
+def _trade_blotter_tab(wb, rows: list[dict]) -> None:
+    """Read-only workbook snapshot of the persistent trade workflow."""
+    ws = wb.create_sheet("Trade Blotter")
+    columns = [
+        ("Status", "status", 19), ("Verified", "verified", 10),
+        ("Site", "site", 12), ("Type", "listing_type", 11),
+        ("Title", "title", 54), ("Query", "query", 34),
+        ("Current", "current_price", 12), ("Fair Value", "fair_value", 13),
+        ("Edge Now", "edge_now", 12), ("ROI", "roi", 10),
+        ("Max Bid/Offer", "suggested_max_bid", 15),
+        ("Breakeven", "breakeven", 13), ("Auction End", "auction_end", 22),
+        ("Best Exit", "best_exit", 14),
+        ("Planned Bid/Offer", "planned_bid_or_offer", 17),
+        ("Purchase", "actual_purchase_price", 12),
+        ("Actual Landed", "actual_landed_cost", 14),
+        ("Won", "date_won", 12), ("Received", "date_received", 12),
+        ("Listed", "date_listed", 12), ("Asking", "asking_price", 12),
+        ("Sold", "date_sold", 12), ("Sale Proceeds", "sale_proceeds", 14),
+        ("Realized P&L", "realized_profit", 14),
+        ("Realized ROI", "realized_roi", 12),
+        ("Hold Days", "holding_days", 10), ("Last Seen", "last_seen", 22),
+        ("Notes", "notes", 42),
+    ]
+    fill = PatternFill("solid", fgColor="203864")
+    for column, (name, _key, width) in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=column, value=name)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(column)].width = width
+    ws.freeze_panes = "E2"
+    ws.auto_filter.ref = f"A1:AB{max(1, len(rows) + 1)}"
+    status_fill = {
+        "Discovered": "D9EAF7", "Verified": "DDEBF7",
+        "Watching": "FFF2CC", "Bid/Offer Placed": "FCE4D6",
+        "Won": "E2F0D9", "Received": "C6E0B4", "Listed": "E4DFEC",
+        "Sold": "C6EFCE", "Lost": "E7E6E6", "Passed": "E7E6E6",
+    }
+    money_keys = {
+        "current_price", "fair_value", "edge_now", "suggested_max_bid",
+        "breakeven", "planned_bid_or_offer", "actual_purchase_price",
+        "actual_landed_cost", "asking_price", "sale_proceeds",
+        "realized_profit",
+    }
+    ratio_keys = {"roi", "realized_roi"}
+    band = PatternFill("solid", fgColor="F5F7FA")
+    for row_i, row in enumerate(rows, 2):
+        for column, (_name, key, _width) in enumerate(columns, 1):
+            value = row.get(key, "")
+            if key in money_keys or key in ratio_keys:
+                try:
+                    value = float(value) if value not in (None, "") else None
+                except (TypeError, ValueError):
+                    pass
+            cell = ws.cell(row=row_i, column=column, value=value)
+            if row_i % 2 == 0:
+                cell.fill = band
+            if key in money_keys and isinstance(value, (int, float)):
+                cell.number_format = _money_fmt(value)
+            elif key in ratio_keys and isinstance(value, (int, float)):
+                cell.number_format = "0.0%"
+        ws.cell(row=row_i, column=1).fill = PatternFill(
+            "solid", fgColor=status_fill.get(
+                str(row.get("status") or ""), "E7E6E6"))
+        title = ws.cell(row=row_i, column=5)
+        if row.get("url"):
+            title.hyperlink = row["url"]
+            title.font = Font(color="0563C1", underline="single")
+        ws.cell(row=row_i, column=28).alignment = Alignment(
+            wrap_text=True, vertical="top")
+        pnl = ws.cell(row=row_i, column=24)
+        if isinstance(pnl.value, (int, float)):
+            pnl.font = Font(
+                bold=True, color="006100" if pnl.value >= 0 else "9C0006")
+
+
 def _source_health_tab(wb, rows: list[dict]) -> None:
     """Per-run source readiness, including deliberately disabled sources."""
     if not rows:
@@ -752,7 +887,8 @@ def write_report(opps: list[Opportunity], path: str,
                  config: dict | None = None,
                  source_health: list[dict] | None = None,
                  research: list[dict] | None = None,
-                 filter_waterfall: list[dict] | None = None) -> str:
+                 filter_waterfall: list[dict] | None = None,
+                 trade_blotter: list[dict] | None = None) -> str:
     grail_rows = [o for o in opps if o.listing.grail]
     main = [o for o in opps if not o.listing.discovery and not o.listing.grail]
     disc = [o for o in opps
@@ -797,6 +933,12 @@ def write_report(opps: list[Opportunity], path: str,
         wb.move_sheet("Today", offset=-len(wb.sheetnames) + 1)
         wb.active = wb["Today"]
 
+    if trade_blotter is not None:
+        _trade_blotter_tab(wb, trade_blotter)
+
+    # Diagnostics are built here but moved to the back of the book at the
+    # end - they are for answering "why is this row missing?", not for
+    # daily reading, and they were sitting third and fourth.
     _filter_waterfall_tab(wb, filter_waterfall or [])
     _research_tab(wb, research or [])
 
@@ -806,7 +948,8 @@ def write_report(opps: list[Opportunity], path: str,
         by_cat.setdefault(_category(o.listing.query), []).append(o)
     for cat in CATEGORIES:
         if by_cat.get(cat):
-            _fill_sheet(wb.create_sheet(cat), _sorted(by_cat[cat]))
+            _fill_sheet(wb.create_sheet(cat),
+                        _cap_unresolved(_sorted(by_cat[cat])))
 
     if grail_rows:
         _grails_tab(wb, grail_rows)
@@ -820,7 +963,8 @@ def write_report(opps: list[Opportunity], path: str,
         _source_health_tab(wb, source_health)
 
     if disc:
-        _fill_sheet(wb.create_sheet("Discovery"), _sorted(disc))
+        _fill_sheet(wb.create_sheet("Discovery"),
+                    _cap_unresolved(_sorted(disc)))
 
     # Movers: unique queries by |trend|
     movers = {}
@@ -857,6 +1001,7 @@ def write_report(opps: list[Opportunity], path: str,
         ("Max Bid", "the highest ITEM bid/offer that still leaves your target return (output.today.max_bid_target_roi, default 15%) after adding shipping, buyer/proxy fees, international shipping, duty, FX, insurance, tax and the vault route"),
         ("Breakeven", "the price where profit is exactly zero. A wall, not a target - winning there earns nothing, and fair value is an estimate (see Conf)"),
         ("Action tab", "tradeable top-scored rows + anything ending/fresh within 6h with positive EV (watches excluded - see Watches tab); duplicate cards collapsed to the best listing"),
+        ("Trade Blotter", "persistent opportunity workflow and realized P&L snapshot. Edit trade_blotter/trade_blotter.csv (not this workbook) so statuses and actual cash flows survive future runs"),
         ("Expected Value", "fair value net of resale fees, minus expected all-in cost"),
         ("Edge Now", "fair value net of exit-channel fees minus CURRENT landed cost (price, shipping, buyer/proxy fee, international shipping, insurance, duty, FX and tax where applicable)"),
         ("Best Exit", "eligible configured venue with the highest expected net proceeds; a watchlist or portfolio resale_channel can pin a manual override"),
@@ -882,5 +1027,27 @@ def write_report(opps: list[Opportunity], path: str,
     meta.column_dimensions["A"].width = 18
     meta.column_dimensions["B"].width = 84
 
+    _order_sheets(wb)
     wb.save(path)
     return path
+
+
+# Reading order, front to back. Decision tabs first, then the research book,
+# then the diagnostics you only open to ask "why is this row missing?".
+# Anything not named here keeps its position between the two groups.
+SHEET_ORDER_FRONT = ("Today", "Action", "Trade Blotter",
+                     "Pokemon Cards", "Sports Cards",
+                     "Video Games", "Discovery", "Watches", "Other",
+                     "Grails", "Crossover", "Portfolio", "Movers")
+SHEET_ORDER_BACK = ("Source Health", "Filter Waterfall", "Research-Filtered",
+                    "About")
+
+
+def _order_sheets(wb) -> None:
+    """Put the book in reading order without disturbing missing sheets."""
+    front = [n for n in SHEET_ORDER_FRONT if n in wb.sheetnames]
+    back = [n for n in SHEET_ORDER_BACK if n in wb.sheetnames]
+    middle = [n for n in wb.sheetnames if n not in front and n not in back]
+    wb._sheets = [wb[n] for n in front + middle + back]
+    if "Today" in wb.sheetnames:
+        wb.active = wb["Today"]

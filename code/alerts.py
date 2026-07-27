@@ -133,7 +133,13 @@ def send_alerts(opps: list[Opportunity], config: dict, db_path: str) -> int:
     min_edge = acfg.get("min_edge_now", 150)
     min_roi = acfg.get("min_roi", 0.15)
     # too-good-to-be-true ceiling: absurd ROI = bad data, not a real deal
-    max_roi = acfg.get("max_roi", 2.0)
+    # See main.py: ROI means "edge at the current bid" under live pricing,
+    # so the ceiling that made sense for a modelled close would now mute
+    # every genuinely cheap auction.
+    live_pricing = str((config.get("algorithm") or {}).get(
+        "auction_pricing", "live")).strip().lower() == "live"
+    max_roi = (acfg.get("max_roi_live", 10.0) if live_pricing
+               else acfg.get("max_roi", 2.0))
     min_capture = acfg.get("min_capture", 0.5)
     min_conf = acfg.get("min_confidence", 0.15)
     priority_only = acfg.get("priority_only", True)

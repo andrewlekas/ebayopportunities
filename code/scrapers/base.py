@@ -100,6 +100,8 @@ USER_AGENTS = [
 
 class BaseScraper:
     site = "base"
+    # Advertise only the inventory lanes this connector actually supplies.
+    capabilities = frozenset()
     # fetched once per session before the first real HTML request: real
     # browsers arrive with cookies from browsing the site - clients that
     # hit search APIs cold, without ever loading a page, look like bots
@@ -160,7 +162,9 @@ class BaseScraper:
         # calls fail independently (eBay can block scraping while the API
         # is fine), so each lane trips on its own
         self.trip_after = scraping.get("circuit_breaker_failures", 3)
-        self._streaks = {"api": 0, "html": 0}
+        # Any lane name is valid, not just api/html: activities with
+        # different risk profiles get their own fuse (see _get's `lane=`).
+        self._streaks = collections.defaultdict(int, {"api": 0, "html": 0})
         self._announced: set[str] = set()
         # bot-challenge tally for the WHOLE run: individual challenges often
         # clear after a cooldown retry (which resets the failure streak), but
@@ -247,6 +251,10 @@ class BaseScraper:
             self.session.cookies.clear()
         except Exception:
             pass
+        # The same process may make a controlled retry after the jar is
+        # cleared.  Make that retry visit the homepage first instead of
+        # sending another cold search request with no cookies.
+        self._warmed = False
 
     _state_lock = threading.Lock()   # class-level: one state file, many scrapers
 
@@ -321,8 +329,14 @@ class BaseScraper:
 
         api=True marks authenticated API calls: they use their own short,
         serialized pacing lane instead of the slower HTML politeness delay.
+
+        `lane=` overrides the channel entirely. Activities with different
+        risk profiles should not share a fuse: close tracking fetches single
+        item pages, while sold-comp scraping hammers search pages, and it was
+        the searches that kept tripping the shared breaker - silently
+        starving the only source of ground truth we have.
         """
-        lane = "api" if api else "html"
+        lane = kwargs.pop("lane", None) or ("api" if api else "html")
         if self.lane_tripped(lane):
             note_api(f"{self.site}/{lane}", "skipped")
             if lane not in self._announced:
@@ -443,8 +457,16 @@ class BaseScraper:
 
     def search_auctions(self, query: str, max_results: int = 50):
         """Return list[Listing] of live auctions matching query."""
-        raise NotImplementedError
+        return []
+
+    def search_fixed(self, query: str, max_results: int = 50):
+        """Return list[Listing] of live fixed-price items. Optional."""
+        return []
 
     def search_sold(self, query: str, max_results: int = 60):
         """Return list[SoldComp] of recent sold items. Optional."""
         return []
+
+    def supports(self, capability: str) -> bool:
+        """Whether orchestration should call this connector lane."""
+        return capability in self.capabilities

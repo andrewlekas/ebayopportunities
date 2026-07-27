@@ -176,6 +176,173 @@ class TestGuideCacheInvalidation(unittest.TestCase):
         conn.close()
 
 
+class TestPriceChartingRequestControl(unittest.TestCase):
+    """Paid API calls obey PriceCharting's one-call-per-second contract."""
+
+    class Response:
+        def __init__(self, product):
+            self._product = product
+            self.status_code = 200
+            self.headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._product
+
+    @staticmethod
+    def _product(name="Charizard #4"):
+        return {
+            "status": "success",
+            "product-name": name,
+            "console-name": "Pokemon",
+            "loose-price": 10000,
+            "new-price": 30000,
+            "graded-price": 50000,
+        }
+
+    def _guide(self, directory):
+        from valuation.price_guide import PriceGuide
+        return PriceGuide({
+            "database": {"file": os.path.join(directory, "h.db")},
+            "api_keys": {"pricecharting": {"token": "paid-token"}},
+            "pricecharting": {"request_delay_seconds": 1.05},
+        })
+
+    def test_keys_share_product_payload_but_keep_grade_value_separate(self):
+        from valuation.price_guide import (
+            _guide_cache_key, _pricecharting_product_key)
+
+        self.assertEqual(
+            _pricecharting_product_key("Charizard #015 PSA 9"),
+            "charizard #15")
+        self.assertEqual(
+            _guide_cache_key("Charizard #015 CGC 10"),
+            "charizard #15|psa:9")
+
+    def test_different_grades_reuse_one_product_response_across_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._guide(tmp)
+            first._pc_delay = 0
+            calls = []
+            first.session.get = lambda *a, **k: (
+                calls.append(k["params"]["q"])
+                or self.Response(self._product()))
+
+            self.assertEqual(first.guide_value("Charizard #4 PSA 8"), 300)
+            self.assertEqual(first.guide_value("Charizard #4 PSA 9"), 500)
+            self.assertEqual(calls, ["charizard #4"])
+
+            # The raw product payload is persistent, not only in-memory.
+            second = self._guide(tmp)
+            second.session.get = lambda *a, **k: self.fail(
+                "persistent product cache should avoid a wire call")
+            self.assertEqual(
+                second.guide_value("Charizard #004 PSA 8.5"), 400)
+
+    def test_requests_are_spaced_start_to_start(self):
+        import valuation.price_guide as guide_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            guide = self._guide(tmp)
+            clock = [100.0]
+            starts = []
+
+            def monotonic():
+                return clock[0]
+
+            def sleep(seconds):
+                clock[0] += seconds
+
+            def get(*args, **kwargs):
+                starts.append(clock[0])
+                name = kwargs["params"]["q"]
+                return self.Response(self._product(name))
+
+            guide.session.get = get
+            with mock.patch.object(guide_mod.time, "monotonic", monotonic), \
+                    mock.patch.object(guide_mod.time, "sleep", sleep):
+                guide._pricecharting("Charizard #4 PSA 9")
+                guide._pricecharting("Blastoise #2 PSA 9")
+
+            self.assertEqual(len(starts), 2)
+            self.assertAlmostEqual(starts[1] - starts[0], 1.05, places=6)
+
+    def test_429_waits_and_retries_once_instead_of_skipping_the_run(self):
+        import requests as requests_mod
+        import valuation.price_guide as guide_mod
+        from scrapers.base import API_STATS, reset_api_stats
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reset_api_stats()
+            guide = self._guide(tmp)
+            clock = [100.0]
+            calls = 0
+
+            class RateLimited:
+                status_code = 429
+                headers = {"Retry-After": "2"}
+
+                def raise_for_status(self):
+                    raise requests_mod.HTTPError(
+                        "429", response=self)
+
+            def get(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return RateLimited()
+                return self.Response(self._product())
+
+            guide.session.get = get
+            with mock.patch.object(
+                    guide_mod.time, "monotonic", lambda: clock[0]), \
+                    mock.patch.object(
+                        guide_mod.time, "sleep",
+                        lambda seconds: clock.__setitem__(
+                            0, clock[0] + seconds)):
+                value = guide._pricecharting("Charizard #4 PSA 9")
+
+            self.assertEqual(value, 500)
+            self.assertEqual(calls, 2)
+            self.assertGreaterEqual(clock[0], 102.0)
+            self.assertEqual(API_STATS[("pricecharting", "failed")], 1)
+            self.assertEqual(API_STATS[("pricecharting", "ok")], 1)
+            self.assertEqual(API_STATS[("pricecharting", "skipped")], 0)
+
+    def test_parallel_requests_share_one_wire_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            guide = self._guide(tmp)
+            guide._pc_delay = 0
+            in_flight = 0
+            peak = 0
+            calls_lock = threading.Lock()
+
+            def get(*args, **kwargs):
+                nonlocal in_flight, peak
+                with calls_lock:
+                    in_flight += 1
+                    peak = max(peak, in_flight)
+                time.sleep(0.003)
+                with calls_lock:
+                    in_flight -= 1
+                return self.Response(
+                    self._product(kwargs["params"]["q"]))
+
+            guide.session.get = get
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                rows = list(pool.map(
+                    lambda i: guide._pricecharting(
+                        f"Card {i} PSA 9"),
+                    range(24)))
+
+            self.assertTrue(all(value == 500 for value in rows))
+            self.assertEqual(peak, 1)
+
+
 def _opp(title="Card", query="Pokemon Card", ev=500.0, roi=0.4, bids=3,
          ltype="auction", grail="", site="ebay", has_buy_now=False):
     return Opportunity(
@@ -624,10 +791,15 @@ class TestCategoryRouting(unittest.TestCase):
 class TestBidLevels(unittest.TestCase):
     """Max Bid used to be exact breakeven - winning there earns nothing."""
 
-    def _opp_for(self, fair, ship=0.0):
+    def _opp_for(self, fair, ship=0.0, *,
+                 title="1999 Pokemon Base Set Charizard PSA 9",
+                 query="1999 Pokemon Base Set Charizard PSA 9",
+                 category="Pokemon Cards"):
         return Opportunity(
-            listing=Listing(site="ebay", title="t", url="", current_price=1.0,
-                            shipping=ship, query="q", marketplace="EBAY_US"),
+            listing=Listing(
+                site="ebay", title=title, url="", current_price=1.0,
+                shipping=ship, query=query, category=category,
+                marketplace="EBAY_US"),
             valuation=Valuation(fair_value=fair))
 
     def _cfg(self, target=0.15, vault=True):
@@ -683,6 +855,21 @@ class TestBidLevels(unittest.TestCase):
             self._opp_for(650.0), cfg)
         self.assertEqual(mb, 499,
                          "a normal-route result must stay below $500")
+
+    def test_watch_never_receives_vault_or_tax_free_bid_math(self):
+        watch = self._opp_for(
+            2450.0, title="Rolex Submariner 116610LN Full Set",
+            query="Rolex Submariner 116610LN", category="Watches")
+        mb, be = report_mod._bid_levels(watch, self._cfg())
+        taxed_proceeds = 2450.0 * (1 - 0.1325)
+        self.assertEqual(be, int(taxed_proceeds / 1.08))
+        self.assertLess(mb, be)
+
+    def test_ungraded_card_does_not_receive_vault_math(self):
+        raw = self._opp_for(
+            2450.0, title="1999 Pokemon Base Set Charizard Holo #4")
+        _mb, be = report_mod._bid_levels(raw, self._cfg())
+        self.assertEqual(be, int((2450.0 * (1 - 0.1325)) / 1.08))
 
 
 class TestLandedEconomics(unittest.TestCase):
@@ -851,7 +1038,59 @@ class TestMarketplaceParserCanaries(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].buyer_fee_rate, 0.22)
         self.assertEqual(rows[0].minimum_buyer_fee, 19)
-        self.assertEqual(rows[0].landed_cost(), 122)
+        self.assertEqual(rows[0].shipping, 6)
+        self.assertEqual(rows[0].insurance_rate, 0.009)
+        self.assertTrue(rows[0].insurance_on_buyer_fee)
+        self.assertAlmostEqual(rows[0].landed_cost(), 129.098)
+
+    def test_goldin_uses_high_value_shipping_tier(self):
+        from scrapers.goldin import GoldinScraper
+
+        class Response:
+            @staticmethod
+            def json():
+                return {"searchalgolia": {"lots": [{
+                    "status": "Live", "title": "Jordan PSA 10",
+                    "current_price": 1000, "number_of_bids": 9,
+                    "lot_id": "lot-2", "buyer_premium": 22,
+                }]}}
+
+        scraper = GoldinScraper(
+            {"_config_dir": tempfile.mkdtemp(), "scraping": {}})
+        with mock.patch.object(scraper, "_post", return_value=Response()):
+            rows = scraper.search_auctions("Jordan")
+        self.assertEqual(rows[0].shipping, 19)
+        self.assertAlmostEqual(rows[0].landed_cost(), 1249.98)
+
+    def test_goldin_non_card_uses_non_card_shipping_floor(self):
+        from scrapers.goldin import GoldinScraper
+
+        class Response:
+            @staticmethod
+            def json():
+                return {"searchalgolia": {"lots": [{
+                    "status": "Live",
+                    "title": "Pokemon Factory-Sealed Booster Box",
+                    "current_price": 100, "lot_id": "lot-3",
+                    "buyer_premium": 22,
+                }]}}
+
+        scraper = GoldinScraper(
+            {"_config_dir": tempfile.mkdtemp(), "scraping": {}})
+        with mock.patch.object(scraper, "_post", return_value=Response()):
+            rows = scraper.search_auctions("Pokemon Box")
+        self.assertEqual(rows[0].shipping, 19)
+        self.assertAlmostEqual(rows[0].landed_cost(), 142.098)
+
+    def test_goldin_insurance_on_price_realized_is_invertible(self):
+        listing = Listing(
+            site="goldin", title="Card", url="", current_price=100,
+            shipping=6, buyer_fee_rate=0.22, minimum_buyer_fee=19,
+            insurance_rate=0.009, insurance_on_buyer_fee=True)
+        landed = listing.landed_cost()
+        self.assertAlmostEqual(landed, 129.098)
+        self.assertAlmostEqual(
+            listing.item_price_for_landed_cost(landed), 100)
 
     def test_heritage_current_bid_markup(self):
         from scrapers.heritage import HeritageScraper
@@ -869,12 +1108,253 @@ class TestMarketplaceParserCanaries(unittest.TestCase):
         self.assertEqual(rows[0].buyer_fee_rate, 0.22)
         self.assertEqual(rows[0].minimum_buyer_fee, 29)
 
+    def test_pristine_current_schema_and_buyer_premium(self):
+        from scrapers.pristine import PristineScraper
+        future = int((datetime.now(timezone.utc)
+                      + timedelta(hours=6)).timestamp())
+        html = f"""
+        <div aria-label="Auction item" class="row product"
+             data-pristine-product-venue-id="12868123"
+             data-pristine-title="Charizard Vstar CGC 9">
+          <a class="title hidden-xs"
+             href="/a12868123-Charizard-Vstar-CGC-9">
+            Charizard Vstar CGC 9
+          </a>
+          <p class="high-bid" data-high-bid="100.00">$100.00</p>
+          <span class="end-time" data-pristine-end-time="{future}"></span>
+          <img src="https://images.example/card.jpg">
+        </div>
+        """
+        rows = PristineScraper.parse_html(html, "Charizard")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].listing_id, "12868123")
+        self.assertEqual(rows[0].buyer_fee_rate, 0.17)
+        self.assertEqual(rows[0].total_cost_now, 117)
+
     def test_fanatics_rejects_an_unknown_schema(self):
         from scrapers.fanatics_collect import FanaticsCollectScraper
         scraper = FanaticsCollectScraper(
             {"_config_dir": tempfile.mkdtemp(), "scraping": {},
              "api_keys": {"fanatics": {}}})
         self.assertEqual(scraper._parse({"unexpected": []}, "Jordan"), [])
+
+    def test_fanatics_normalized_auction_has_20_percent_premium(self):
+        from scrapers.fanatics_collect import FanaticsCollectScraper
+        scraper = FanaticsCollectScraper(
+            {"_config_dir": tempfile.mkdtemp(), "scraping": {},
+             "api_keys": {"fanatics": {}}})
+        payload = {"items": [{
+            "id": "f-1", "status": "live", "listing_type": "auction",
+            "title": "1986 Fleer Michael Jordan PSA 9",
+            "url": "https://www.fanaticscollect.com/item/f-1",
+            "current_bid": 1000, "bid_count": 7,
+            "grader": "PSA", "certificate_number": "12345678",
+        }]}
+        rows = scraper._parse(payload, "Jordan", "auction")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].buyer_fee_rate, 0.20)
+        self.assertEqual(rows[0].canonical_asset_id, "psa:12345678")
+        self.assertEqual(rows[0].total_cost_now, 1200)
+
+    def test_alt_fixed_has_no_auction_premium(self):
+        from scrapers.alt import AltScraper
+        scraper = AltScraper(
+            {"_config_dir": tempfile.mkdtemp(), "scraping": {},
+             "api_keys": {"alt": {}}})
+        payload = {"items": [{
+            "id": "a-1", "status": "active", "type": "buy_now",
+            "title": "1999 Charizard PSA 9",
+            "url": "https://app.alt.xyz/item/a-1", "price": "$500",
+        }]}
+        rows = scraper._parse(payload, "Charizard", "fixed")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].buyer_fee_rate, 0)
+        self.assertEqual(rows[0].total_cost_now, 500)
+
+    def test_permission_gated_feed_does_not_make_network_call(self):
+        from scrapers.alt import AltScraper
+        scraper = AltScraper(
+            {"_config_dir": tempfile.mkdtemp(), "scraping": {},
+             "api_keys": {"alt": {"authorized": False,
+                                  "endpoint": "https://example.invalid"}}})
+        with mock.patch.object(scraper, "_get") as get:
+            self.assertEqual(scraper.search_auctions("Jordan"), [])
+        get.assert_not_called()
+
+
+class TestConnectorCapabilitiesAndDedupe(unittest.TestCase):
+    def test_fixed_price_support_is_not_ebay_specific(self):
+        from scrapers.base import BaseScraper
+
+        class NewMarketplace(BaseScraper):
+            capabilities = frozenset({"fixed"})
+
+        scraper = NewMarketplace(
+            {"_config_dir": tempfile.mkdtemp(), "scraping": {}})
+        self.assertTrue(scraper.supports("fixed"))
+        self.assertFalse(scraper.supports("auctions"))
+
+    def test_crosslisted_asset_keeps_lower_landed_cost(self):
+        ebay = Listing(
+            site="ebay", title="Jordan PSA 9", url="https://ebay/item/1",
+            listing_id="1", canonical_asset_id="PSA:12345678",
+            current_price=110)
+        alt = Listing(
+            site="alt", title="Jordan PSA 9", url="https://alt/item/2",
+            listing_id="2", canonical_asset_id="psa:12345678",
+            current_price=100)
+        rows, duplicates = scanner._dedupe_listings([ebay, alt])
+        self.assertEqual(duplicates, 1)
+        self.assertEqual(rows, [alt])
+
+    def test_same_title_without_asset_id_remains_two_items(self):
+        first = Listing(
+            site="ebay", title="Jordan PSA 9", url="https://ebay/item/1",
+            listing_id="1", current_price=100)
+        second = Listing(
+            site="alt", title="Jordan PSA 9", url="https://alt/item/2",
+            listing_id="2", current_price=100)
+        rows, duplicates = scanner._dedupe_listings([first, second])
+        self.assertEqual(duplicates, 0)
+        self.assertEqual(rows, [first, second])
+
+    def test_missing_identity_never_collapses_distinct_rows(self):
+        first = Listing(
+            site="source", title="Jordan PSA 9", url="", current_price=100)
+        second = Listing(
+            site="source", title="Jordan PSA 9", url="", current_price=100)
+        rows, duplicates = scanner._dedupe_listings([first, second])
+        self.assertEqual(duplicates, 0)
+        self.assertEqual(rows, [first, second])
+
+    def test_same_listing_across_queries_keeps_exact_context_once(self):
+        exact = Listing(
+            site="ebay",
+            title="1999 Pokemon Base Set Raichu Holo #14 PSA 8",
+            url="https://www.ebay.com/itm/123456789014",
+            listing_id="123456789014", current_price=500,
+            query="1999 1st Edition Base Set Raichu Holo PSA 8",
+            priority=True, discovery=False, category="Pokemon Cards")
+        broad = Listing(
+            site="ebay",
+            title=exact.title, url=exact.url, listing_id=exact.listing_id,
+            current_price=500, query="1999 1st Edition Pokemon Set",
+            priority=False, discovery=True, category="Pokemon Cards")
+        prepared = [
+            (broad.query, ["broad comps"],
+             [(scanner._listing_identity(broad), broad)], []),
+            (exact.query, ["exact comps"],
+             [(scanner._listing_identity(exact), exact)], []),
+        ]
+        deduped, duplicates = scanner._dedupe_prepared(prepared)
+        rows = [listing for _query, _comps, relevant, _asks in deduped
+                for _key, listing in relevant]
+        self.assertEqual(duplicates, 1)
+        self.assertEqual(rows, [exact])
+        self.assertEqual(exact.query,
+                         "1999 1st Edition Base Set Raichu Holo PSA 8")
+        self.assertEqual(
+            exact.matched_queries,
+            ["1999 1st Edition Base Set Raichu Holo PSA 8",
+             "1999 1st Edition Pokemon Set"])
+
+    def test_orchestration_calls_all_advertised_lanes(self):
+        auction = mock.Mock()
+        auction.supports.side_effect = lambda lane: lane == "auctions"
+        auction.search_auctions.return_value = [Listing(
+            site="auction_house", title="A", url="a", current_price=1)]
+        fixed = mock.Mock()
+        fixed.supports.side_effect = lambda lane: lane == "fixed"
+        fixed.search_fixed.return_value = [Listing(
+            site="marketplace", title="B", url="b", current_price=2,
+            listing_type="fixed")]
+        rows = scanner._search_marketplaces(
+            {"auction_house": auction, "marketplace": fixed},
+            "all", "Jordan", 20)
+        self.assertEqual([row.site for row in rows],
+                         ["auction_house", "marketplace"])
+        auction.search_auctions.assert_called_once_with("Jordan", 20)
+        fixed.search_fixed.assert_called_once_with("Jordan", 20)
+
+    def test_site_specific_result_cap_keeps_ebay_deep(self):
+        ebay = mock.Mock()
+        ebay.supports.side_effect = lambda lane: lane == "auctions"
+        ebay.search_auctions.return_value = []
+        other = mock.Mock()
+        other.supports.side_effect = lambda lane: lane == "auctions"
+        other.search_auctions.return_value = []
+
+        scanner._search_marketplaces(
+            {"ebay": ebay, "other": other},
+            "auctions", "Jordan", 40,
+            max_results_by_site={"ebay": 200})
+
+        ebay.search_auctions.assert_called_once_with(
+            "Jordan", 200, intl=True)
+        other.search_auctions.assert_called_once_with("Jordan", 40)
+
+    def test_local_export_matching_preserves_recall(self):
+        from scrapers.authorized_feed import AuthorizedFeedScraper
+        item = {
+            "title": "1999 Pokemon Venusaur Holo PSA 9",
+        }
+        self.assertTrue(AuthorizedFeedScraper._matches_export_query(
+            item, "1999 1st Edition Base Set Venusaur Holo PSA 9"))
+        self.assertFalse(AuthorizedFeedScraper._matches_export_query(
+            item, "1952 Topps Mickey Mantle PSA 9"))
+
+
+class TestEbayBrowsePagination(unittest.TestCase):
+    @staticmethod
+    def _item(number):
+        return {
+            "title": f"Card {number}",
+            "itemId": str(number),
+            "itemWebUrl": f"https://www.ebay.com/itm/{number}",
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "1.00", "currency": "USD"},
+        }
+
+    def test_follows_next_pages_past_the_200_item_page_limit(self):
+        from scrapers.ebay import EbayScraper
+        scraper = EbayScraper({
+            "_config_dir": tempfile.mkdtemp(),
+            "scraping": {},
+            "marketplaces": ["EBAY_US"],
+            "api_keys": {"ebay": {}},
+        })
+        scraper._token = "test-token"
+
+        responses = []
+        for start, count, response_limit, has_next in (
+                (0, 200, 200, True),
+                (200, 200, 200, True),
+                (400, 50, 200, False)):
+            response = mock.Mock()
+            response.json.return_value = {
+                "itemSummaries": [
+                    self._item(i) for i in range(start, start + count)
+                ],
+                "offset": start,
+                "limit": response_limit,
+                "next": "https://api.ebay.com/next" if has_next else None,
+            }
+            responses.append(response)
+
+        with mock.patch.object(
+                scraper, "_get", side_effect=responses) as get:
+            rows = scraper._search_api(
+                "Jordan", 450, buying="AUCTION", intl=False)
+
+        self.assertEqual(len(rows), 450)
+        self.assertEqual(
+            [call.kwargs["params"].get("offset", 0)
+             for call in get.call_args_list],
+            [0, 200, 400])
+        self.assertEqual(
+            [call.kwargs["params"]["limit"]
+             for call in get.call_args_list],
+            [200, 200, 200])
 
 
 class TestCrossoverPolicy(unittest.TestCase):
@@ -1222,6 +1702,114 @@ class TestGameGrading(unittest.TestCase):
                                           "Zelda NES Factory Sealed WATA 9.4"))
 
 
+class TestEbaySoldPacing(unittest.TestCase):
+    """Parallel scanner workers must look like one slow sold-page visitor."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _scraper(self, sold_delay=0):
+        from scrapers.ebay import EbayScraper
+        return EbayScraper({
+            "_config_dir": tempfile.mkdtemp(),
+            "scraping": {
+                "request_delay_seconds": 0,
+                "ebay_sold_request_delay_seconds": sold_delay,
+                "challenge_cooldown_seconds": 0,
+            },
+        })
+
+    def test_parallel_sold_searches_use_one_lifecycle_lane(self):
+        """The lock covers parsing/cooldowns too, not just the HTTP call."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        s = self._scraper()
+        in_flight = 0
+        peak = 0
+        calls_lock = threading.Lock()
+
+        def fake_search(*args, **kwargs):
+            nonlocal in_flight, peak
+            with calls_lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            time.sleep(0.005)
+            with calls_lock:
+                in_flight -= 1
+            return []
+
+        s._search_html = fake_search
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            rows = list(pool.map(
+                lambda n: s.search_sold(f"query {n}"), range(30)))
+
+        self.assertEqual(peak, 1)
+        self.assertEqual(rows, [[]] * 30)
+
+    def test_sold_searches_leave_configured_quiet_gap(self):
+        """The gap begins when the prior sold search has fully completed."""
+        s = self._scraper(sold_delay=10)
+        now = [100.0]
+        sleeps = []
+
+        class FakeTime:
+            @staticmethod
+            def monotonic():
+                return now[0]
+
+            @staticmethod
+            def sleep(seconds):
+                sleeps.append(seconds)
+                now[0] += seconds
+
+        s._search_html = lambda *args, **kwargs: []
+        with mock.patch("scrapers.ebay.time", FakeTime):
+            s.search_sold("first")
+            s.search_sold("second")
+
+        self.assertEqual(sleeps, [10.0])
+
+    def test_second_worker_cannot_enter_during_challenge_cooldown(self):
+        """A worker waiting/retrying a challenge keeps later queries out."""
+        s = self._scraper()
+        first_in_cooldown = threading.Event()
+        release_retry = threading.Event()
+        entered = []
+        entered_lock = threading.Lock()
+
+        def simulated_challenge_search(query, *args, **kwargs):
+            with entered_lock:
+                entered.append(query)
+            if query == "first":
+                first_in_cooldown.set()
+                release_retry.wait(timeout=2)
+            return []
+
+        s._search_html = simulated_challenge_search
+        first = threading.Thread(target=s.search_sold, args=("first",))
+        second = threading.Thread(target=s.search_sold, args=("second",))
+        first.start()
+        self.assertTrue(first_in_cooldown.wait(timeout=1))
+        second.start()
+        self.assertFalse(release_retry.wait(timeout=0.03))
+        with entered_lock:
+            self.assertEqual(entered, ["first"])
+        release_retry.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+        with entered_lock:
+            self.assertEqual(entered, ["first", "second"])
+
+    def test_cookie_reset_requires_a_fresh_homepage_warmup(self):
+        s = self._scraper()
+        s._warmed = True
+        s.reset_cookies()
+        self.assertFalse(s._warmed)
+
+
 class TestApiThrottling(unittest.TestCase):
     """Andrew's rule: after 3 straight failures an endpoint is left alone
     for the rest of the run. These breakers live in the shared network
@@ -1387,6 +1975,7 @@ class TestApiThrottling(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         g = PriceGuide({"database": {"file": os.path.join(tmp, "h.db")},
                         "api_keys": {"pricecharting": {"token": "t"}}})
+        g._pc_delay = 0
         import requests as _rq
         g.session.get = lambda *a, **k: (_ for _ in ()).throw(
             _rq.RequestException("guide down"))
@@ -1758,6 +2347,2107 @@ class TestMLDeploymentGate(unittest.TestCase):
         self.assertTrue(cv_mae < para_mae * 0.97, "old gate passed it")
         self.assertFalse(cv_mae < para_mae * 0.97 and cv_mae <= max_cv,
                          "new gate must reject it")
+
+
+class TestGuideDatabaseLocation(unittest.TestCase):
+    """2026-07-26: a stray 28KB history.db appeared in the PROJECT ROOT
+    holding guide_cache / guide_meta / guide_product_cache, while the real
+    20MB database/history.db sat one folder down. PriceGuide connected to a
+    bare relative "history.db", so any config that had not been through
+    main.load_config's path resolution silently created a second cache in
+    whatever directory the process started in. Guide values written there
+    were invisible to every later run, so the scanner re-paid PriceCharting
+    for lookups it had already made."""
+
+    def test_relative_db_file_resolves_against_the_config_folder(self):
+        from valuation.price_guide import guide_db_path
+        config = {"_config_dir": "/somewhere/ebay opportunities",
+                  "database": {"file": "database/history.db"}}
+        self.assertEqual(
+            guide_db_path(config),
+            "/somewhere/ebay opportunities/database/history.db")
+
+    def test_absolute_db_file_is_left_alone(self):
+        from valuation.price_guide import guide_db_path
+        config = {"_config_dir": "/somewhere/else",
+                  "database": {"file": "/var/data/history.db"}}
+        self.assertEqual(guide_db_path(config), "/var/data/history.db")
+
+    def test_missing_database_config_uses_the_database_folder(self):
+        from valuation.price_guide import guide_db_path
+        # The old default was a bare "history.db" - THAT is what landed in
+        # the project root. The default must be the database/ folder.
+        self.assertTrue(
+            guide_db_path({"_config_dir": "/proj"}).endswith(
+                os.path.join("database", "history.db")),
+            "guide must default to database/history.db, never bare CWD")
+
+    def test_guide_does_not_create_a_second_db_beside_the_process(self):
+        from valuation.price_guide import PriceGuide
+        with tempfile.TemporaryDirectory() as proj, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            db_file = os.path.join(proj, "database", "history.db")
+            os.makedirs(os.path.dirname(db_file), exist_ok=True)
+            config = {"_config_dir": proj, "api_keys": {},
+                      "database": {"file": "database/history.db"}}
+            cwd = os.getcwd()
+            os.chdir(elsewhere)          # cron-style: unrelated cwd
+            try:
+                guide = PriceGuide(config)
+                guide._db_put("charizard psa 9", 6718.0)
+            finally:
+                os.chdir(cwd)
+            self.assertTrue(os.path.exists(db_file), "real db not written")
+            self.assertFalse(
+                os.path.exists(os.path.join(elsewhere, "history.db")),
+                "guide created a stray history.db in the working directory")
+            conn = sqlite3.connect(db_file)
+            self.assertEqual(
+                conn.execute("SELECT value FROM guide_cache "
+                             "WHERE query=?", ("charizard psa 9",)
+                             ).fetchone()[0], 6718.0)
+            conn.close()
+
+
+class TestPokemonTcgKeyGate(unittest.TestCase):
+    """2026-07-26: the 11:54 full run reported pokemontcg/guide as
+    "disabled" in Source Health while simultaneously logging 7 ok, 10
+    failed and 348 skipped calls. source_health calls the source disabled
+    when api_keys.pokemontcg.api_key is empty, but the guide made
+    ANONYMOUS requests anyway. A source cannot be both disabled and live -
+    the operator reading Source Health has to be able to trust it."""
+
+    def test_no_key_means_no_request(self):
+        from scrapers.base import API_STATS, reset_api_stats
+        from valuation.price_guide import PriceGuide
+        reset_api_stats()
+        guide = PriceGuide({"api_keys": {"pokemontcg": {"api_key": ""}},
+                            "database": {}})
+        with mock.patch.object(guide.session, "get") as get:
+            self.assertIsNone(guide._pokemontcg("charizard base set"))
+            get.assert_not_called()
+        self.assertEqual(API_STATS[("pokemontcg.io", "ok")], 0)
+        self.assertEqual(API_STATS[("pokemontcg.io", "failed")], 0)
+        self.assertEqual(API_STATS[("pokemontcg.io", "skipped")], 1)
+
+    def test_source_health_disabled_agrees_with_runtime_silence(self):
+        """Bind the two together so they can never drift apart again."""
+        from scrapers.base import API_STATS, reset_api_stats
+        from source_health import capture
+        from valuation.price_guide import PriceGuide
+        with tempfile.TemporaryDirectory() as tmp:
+            reset_api_stats()
+            config = {
+                "sites": ["ebay"],
+                "database": {"file": os.path.join(tmp, "history.db"),
+                             "comp_cache_hours": 48},
+                "scraping": {"use_html_comps": True, "use_130point": False},
+                "api_keys": {"pokemontcg": {"api_key": ""}},
+            }
+            guide = PriceGuide(config)
+            with mock.patch.object(guide.session, "get") as get:
+                guide._pokemontcg("pikachu")
+                guide._pokemontcg("blastoise")
+                calls = get.call_count
+            row = next(r for r in capture(config, "all")
+                       if r["source"] == "pokemontcg/guide")
+            self.assertEqual(row["status"], "disabled")
+            self.assertEqual(calls, 0,
+                             "Source Health says disabled - the guide must "
+                             "not be calling the API behind its back")
+            self.assertEqual(row["ok"], 0)
+            self.assertEqual(row["failed"], 0)
+
+    def test_a_configured_key_still_queries(self):
+        from valuation.price_guide import PriceGuide
+        guide = PriceGuide({"api_keys": {"pokemontcg": {"api_key": "k"}},
+                            "database": {}})
+        reply = mock.Mock()
+        reply.raise_for_status = mock.Mock()
+        reply.json.return_value = {"data": []}
+        with mock.patch.object(guide.session, "get",
+                               return_value=reply) as get:
+            guide._pokemontcg("charizard base set")
+            get.assert_called_once()
+            self.assertEqual(
+                get.call_args.kwargs["headers"]["X-Api-Key"], "k")
+
+
+class TestBinResultCaps(unittest.TestCase):
+    """2026-07-26: the eBay 500-result ceiling went live between the 12:30
+    and 13:00 BIN sweeps. Sweep runtime went from 3m37s to over an hour -
+    one query alone returned 1,277 eBay rows - and the 13:30 sweep was
+    skipped because the 13:00 sweep still held the lock. A 30-minute sweep
+    that takes an hour drops every second sweep."""
+
+    SCFG = {"max_results_per_query": 40,
+            "max_results_per_query_by_site": {"ebay": 500},
+            "max_results_per_query_by_site_bin": {"ebay": 100}}
+
+    def test_full_scan_keeps_deep_ebay_recall(self):
+        self.assertEqual(
+            scanner.site_result_caps(self.SCFG, "all")["ebay"], 500)
+        self.assertEqual(
+            scanner.site_result_caps(self.SCFG, "auctions")["ebay"], 500)
+
+    def test_bin_sweep_uses_the_shallow_overlay(self):
+        self.assertEqual(
+            scanner.site_result_caps(self.SCFG, "bin")["ebay"], 100)
+
+    def test_overlay_only_touches_named_sites(self):
+        scfg = dict(self.SCFG,
+                    max_results_per_query_by_site={"ebay": 500,
+                                                   "goldin": 60})
+        self.assertEqual(scanner.site_result_caps(scfg, "bin"),
+                         {"ebay": 100, "goldin": 60})
+
+    def test_absent_overlay_is_backward_compatible(self):
+        scfg = {"max_results_per_query_by_site": {"ebay": 500}}
+        self.assertEqual(scanner.site_result_caps(scfg, "bin")["ebay"], 500)
+
+    def test_shipped_config_keeps_sweeps_no_deeper_than_full_scans(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config.yaml")
+        if not os.path.isfile(path):
+            self.skipTest("live config.yaml not present")
+        with open(path) as fh:
+            scfg = (yaml.safe_load(fh) or {}).get("scraping", {}) or {}
+        full = scanner.site_result_caps(scfg, "all")
+        sweep = scanner.site_result_caps(scfg, "bin")
+        for site, cap in sweep.items():
+            self.assertLessEqual(
+                cap, full.get(site, scfg.get("max_results_per_query", 40)),
+                f"{site}: BIN sweep must never dig deeper than a full scan")
+
+
+class TestPristineLandedCost(unittest.TestCase):
+    """Pristine shipping was configured as $0, which understates delivered
+    cost on every Pristine row. No Pristine row had reached Action yet, so
+    nothing was mispriced in production - but the moment one did, Max Bid
+    would have been too high by the whole shipping amount."""
+
+    def test_configured_shipping_reaches_landed_cost(self):
+        from scrapers.pristine import PristineScraper
+        future = int(time.time()) + 7200
+        html = f"""
+        <div class="row product" aria-label="Auction item"
+             data-pristine-product-venue-id="12868123"
+             data-pristine-title="1999 Charizard PSA 9">
+          <a class="title" href="/a12868123-charizard">1999 Charizard PSA 9</a>
+          <p class="high-bid" data-high-bid="100.00"></p>
+          <span class="end-time" data-pristine-end-time="{future}"></span>
+        </div>"""
+        rows = PristineScraper.parse_html(
+            html, "Charizard", 50, buyer_fee_rate=0.17, shipping_estimate=15.0)
+        self.assertEqual(len(rows), 1)
+        listing = rows[0]
+        self.assertEqual(listing.shipping, 15.0)
+        # $100 hammer + 17% premium + $15 shipping = $132
+        self.assertAlmostEqual(listing.landed_cost(100.0), 132.0, places=2)
+
+    def test_zero_shipping_is_still_honoured_when_configured(self):
+        from scrapers.pristine import PristineScraper
+        future = int(time.time()) + 7200
+        html = f"""
+        <div class="row product" aria-label="Auction item"
+             data-pristine-product-venue-id="1" data-pristine-title="x">
+          <a class="title" href="/a1-x">x</a>
+          <p class="high-bid" data-high-bid="100.00"></p>
+          <span class="end-time" data-pristine-end-time="{future}"></span>
+        </div>"""
+        rows = PristineScraper.parse_html(html, "x", 50, 0.17, 0.0)
+        self.assertAlmostEqual(rows[0].landed_cost(100.0), 117.0, places=2)
+
+
+# ==========================================================================
+# 2026-07-26: identity-led, PriceCharting-first valuation
+# ==========================================================================
+# The workbook of 2026-07-26 11:54 contained 4,237 valued rows carrying only
+# FIVE distinct (comps, guide) opinions. Fair value was a function of the
+# watchlist QUERY, and the price guide was a set-level product lookup that
+# silently carried 65% of the blend on every row that reached Action.
+#
+# Real rows from that run, all reproduced as fixtures below:
+#   * eight 2023 Topps Chrome Disney parallels at exactly $1,069.60
+#   * six "Superman 1940" rows at $2,821.29 - including a wax wrapper, a
+#     novelty coupon, Action Comics #22 and an $18 McFarlane plastic figure
+#   * five 1948 Bowman Mikan rows at $1,529.25 - authentic, altered and raw
+
+DISNEY_TITLES = [
+    "2023 Topps Chrome Disney 100 Cinderella Pink Refractor #/399 PSA 10",
+    "2023 Topps Chrome Disney 100 Meg Year Diamond Refractor #/100 PSA 10",
+    "2023 Topps Chrome Disney 100 Escape from a Plane Toy Story Black #/10 PSA 10",
+    "2023 Topps Chrome Disney 100 The Dance Beauty Beast Gold Wave #/50 PSA 10",
+    "2023 Topps Chrome Disney 100 Zurg Orange Wave Refractor #/25 PSA 10",
+    "2023 Topps Chrome Disney 100 Mirabel Madrigal Bruno Dual Auto #/99 PSA 10",
+]
+
+SUPERMAN_TITLES = [
+    ("1940 Superman Gum R145 Superman Racing the Shells #40 PSA 6", "card"),
+    ("1940 SUPERMAN Leader Novelty Premium Coupon R146 Vintage", "coupon"),
+    ("1940 Gum Inc. Superman Gum Wax Pack Wrapper VERY SCARCE!", "wrapper"),
+    ("1940 D.C. Comics Action Comics 22 Early Superman Cover", "comic"),
+    ('McFarlane DC Multiverse Superman Classic 1940 Animation 7" Figure',
+     "figure"),
+]
+
+
+class TestCardIdentityExtraction(unittest.TestCase):
+    def test_disney_parallels_are_distinct_assets(self):
+        from valuation.identity import identity_of
+        fps = {identity_of(t).fingerprint() for t in DISNEY_TITLES}
+        self.assertEqual(
+            len(fps), len(DISNEY_TITLES),
+            "a /10 Black and a /399 Pink Refractor are not the same asset")
+
+    def test_parallel_and_serial_are_extracted(self):
+        from valuation.identity import identity_of
+        i = identity_of(DISNEY_TITLES[0])
+        self.assertEqual(i.parallel, "pink refractor")
+        self.assertEqual(i.serial, 399)
+        self.assertEqual(i.grade, 10.0)
+        self.assertEqual(i.object_class, "card")
+
+    def test_parallel_word_order_does_not_matter(self):
+        from valuation.identity import parallel_of
+        self.assertEqual(parallel_of("Orange Wave Refractor"),
+                         parallel_of("Wave Orange Refractor"))
+
+    def test_object_classes_separate_the_superman_pool(self):
+        from valuation.identity import identity_of
+        for title, expected in SUPERMAN_TITLES:
+            self.assertEqual(identity_of(title).object_class, expected,
+                             f"misclassified: {title}")
+
+    def test_a_plastic_figure_never_matches_a_card(self):
+        from valuation.identity import identity_of
+        figure = identity_of(SUPERMAN_TITLES[4][0])
+        card = identity_of(SUPERMAN_TITLES[0][0])
+        self.assertIsNotNone(figure.conflicts_with(card))
+        self.assertIn("figure", figure.conflicts_with(card))
+
+    def test_grade_qualifiers_are_not_a_numeric_grade(self):
+        from valuation.identity import identity_of
+        auth = identity_of("1948 Bowman #69 George Mikan RC PSA AUTHENTIC")
+        altered = identity_of("1948 Bowman George Mikan #69 PSA Authentic Altered")
+        graded = identity_of('1948 Bowman George Mikan #69 PSA 3')
+        self.assertEqual(auth.qualifier, "authentic")
+        self.assertIsNone(auth.grade, "AUTHENTIC is not a numeric grade")
+        self.assertEqual(altered.qualifier, "altered")
+        self.assertEqual(graded.grade, 3.0)
+        self.assertEqual(len({auth.fingerprint(), altered.fingerprint(),
+                              graded.fingerprint()}), 3)
+
+    def test_watch_components_are_not_watches(self):
+        from valuation.identity import identity_of
+        self.assertEqual(
+            identity_of("Patek Philippe Ref 1593 platinum dial for restoration"
+                        ).object_class, "watch_part")
+        self.assertEqual(
+            identity_of("Patek Philippe Calatrava 4864R complete watch"
+                        ).object_class, "watch")
+
+    def test_specificity_gates_vague_listings(self):
+        from valuation.identity import identity_of
+        vague = identity_of("1940 Gum Inc. Superman Gum Wax Pack Wrapper")
+        exact = identity_of(DISNEY_TITLES[0])
+        self.assertLess(vague.specificity(), 0.70)
+        self.assertTrue(exact.is_specific(0.70))
+
+    def test_guide_query_carries_parallel_and_serial_not_grade(self):
+        from valuation.identity import identity_of
+        q = identity_of(DISNEY_TITLES[0]).guide_query()
+        self.assertIn("pink refractor", q)
+        self.assertIn("/399", q)
+        self.assertNotIn("PSA", q.upper())
+
+
+class TestPriceChartingProductResolution(unittest.TestCase):
+    """`/api/product?q=<phrase>` returns ONE best guess with no indication of
+    how good it is. `/api/products` returns up to 20 candidates, which is the
+    only way to know whether we actually landed the card."""
+
+    def _guide(self, calls):
+        from valuation.price_guide import PriceGuide
+        tmp = tempfile.mkdtemp()
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "tok"}}})
+        g._pc_call = lambda path, params, host=None: calls(path, params)
+        return g
+
+    def test_candidate_scoring_picks_the_right_parallel(self):
+        from valuation.identity import identity_of
+        products = {"status": "success", "products": [
+            {"id": "1", "product-name": "Cinderella #100",
+             "console-name": "2023 Topps Chrome Disney 100"},
+            {"id": "2", "product-name": "Cinderella #100 [Pink Refractor] /399",
+             "console-name": "2023 Topps Chrome Disney 100"},
+            {"id": "3", "product-name": "Cinderella #100 [Black] /10",
+             "console-name": "2023 Topps Chrome Disney 100"},
+        ]}
+        seen = {}
+
+        def calls(path, params, host=None):
+            seen[path] = params
+            if path == "products":
+                return products
+            return {"status": "success", "id": params.get("id"),
+                    "product-name": "Cinderella #100 [Pink Refractor] /399",
+                    "console-name": "2023 Topps Chrome Disney 100",
+                    "genre": "Pokemon Card", "manual-only-price": 106960,
+                    "sales-volume": 24}
+
+        g = self._guide(calls)
+        q = g.quote(identity_of(DISNEY_TITLES[0]))
+        self.assertEqual(q.product_id, "2",
+                         "must pick the /399 Pink Refractor, not the base "
+                         "card and not the /10 Black")
+        self.assertTrue(q.landed)
+        self.assertAlmostEqual(q.value, 1069.60, places=2)
+        self.assertEqual(q.sales_volume, 24)
+
+    def test_no_good_candidate_returns_no_value_and_says_why(self):
+        from valuation.identity import identity_of
+        products = {"status": "success", "products": [
+            {"id": "9", "product-name": "Charizard #4",
+             "console-name": "Pokemon Base Set"}]}
+        g = self._guide(lambda path, params: products)
+        q = g.quote(identity_of(DISNEY_TITLES[0]))
+        self.assertFalse(q.landed)
+        self.assertIsNone(q.value)
+        self.assertIn("best match only", q.note)
+
+    def test_genre_mismatch_rejects_the_product(self):
+        from valuation.identity import identity_of
+        def calls(path, params, host=None):
+            if path == "products":
+                return {"status": "success", "products": [
+                    {"id": "5",
+                     "product-name": "Superman Gum #40",
+                     "console-name": "1940 Gum Inc"}]}
+            return {"status": "success", "genre": "Comic",
+                    "product-name": "Superman Gum #40",
+                    "console-name": "1940 Gum Inc",
+                    "loose-price": 282128}
+        g = self._guide(calls)
+        ident = identity_of("1940 Superman Gum R145 Racing Shells #40 PSA 6")
+        self.assertEqual(ident.object_class, "card")
+        # The name matches well, so this would have been accepted on title
+        # alone. PriceCharting's own genre says it is a Comic - a CARD
+        # identity resolved onto a Comic product is a resolution failure,
+        # not a price.
+        q = g.quote(ident)
+        self.assertFalse(q.landed)
+        self.assertIsNone(q.value)
+        self.assertIn("not the same object", q.note)
+
+    def test_search_and_product_payloads_are_cached_once(self):
+        from valuation.identity import identity_of
+        hits = []
+
+        def calls(path, params, host=None):
+            hits.append(path)
+            if path == "products":
+                return {"status": "success", "products": [
+                    {"id": "2",
+                     "product-name": "Cinderella #100 [Pink Refractor] /399",
+                     "console-name": "2023 Topps Chrome Disney 100"}]}
+            return {"status": "success", "manual-only-price": 106960,
+                    "product-name": "Cinderella #100 [Pink Refractor] /399",
+                    "console-name": "2023 Topps Chrome Disney 100"}
+
+        g = self._guide(calls)
+        ident = identity_of(DISNEY_TITLES[0])
+        for _ in range(4):
+            g.quote(ident)
+        self.assertEqual(hits, ["products", "product"],
+                         "product ids are stable - resolve once per run")
+
+
+class TestGraderTopGradePrices(unittest.TestCase):
+    """PriceCharting publishes real CGC 10 / SGC 10 / BGS 10 markets. Those
+    prices already include the cross-grader discount, so applying Andrew's
+    one-grade-down shift on top of them would double-count it."""
+
+    PRODUCT = {"loose-price": 90000, "cib-price": 180000, "new-price": 330000,
+               "graded-price": 671800, "box-only-price": 1200000,
+               "manual-only-price": 2500000,
+               "condition-17-price": 900000,   # CGC 10
+               "condition-18-price": 850000,   # SGC 10
+               "bgs-10-price": 1500000}
+
+    def test_cgc_10_uses_the_published_cgc_price(self):
+        from valuation.price_guide import _guide_cents
+        cents, how = _guide_cents(self.PRODUCT, 9.0, grader="cgc",
+                                  printed_grade=10.0)
+        self.assertEqual(cents, 900000)
+        self.assertIn("condition-17-price", how)
+
+    def test_sgc_and_bgs_10_use_their_own_fields(self):
+        from valuation.price_guide import _guide_cents
+        self.assertEqual(
+            _guide_cents(self.PRODUCT, 9.0, grader="sgc",
+                         printed_grade=10.0)[0], 850000)
+        self.assertEqual(
+            _guide_cents(self.PRODUCT, 9.0, grader="bgs",
+                         printed_grade=10.0)[0], 1500000)
+
+    def test_missing_grader_field_falls_back_to_the_shift(self):
+        from valuation.price_guide import _guide_cents
+        product = dict(self.PRODUCT)
+        product.pop("condition-17-price")
+        cents, how = _guide_cents(product, 9.0, grader="cgc",
+                                  printed_grade=10.0)
+        self.assertEqual(cents, 671800, "falls back to PSA-9 graded-price")
+        self.assertEqual(how, "graded-price")
+
+    def test_psa_10_is_unaffected(self):
+        from valuation.price_guide import _guide_cents
+        cents, _ = _guide_cents(self.PRODUCT, 10.0, grader="psa",
+                                printed_grade=10.0)
+        self.assertEqual(cents, 2500000)
+
+    def test_a_cgc_9_still_shifts_normally(self):
+        from valuation.price_guide import _guide_cents
+        cents, _ = _guide_cents(self.PRODUCT, 8.0, grader="cgc",
+                                printed_grade=9.0)
+        self.assertEqual(cents, 330000, "CGC 9 -> PSA 8 -> new-price")
+
+
+class TestGuideLedValuation(unittest.TestCase):
+    """Andrew's rule: on an exact product match the paid guide SETS the
+    value; identity-matched comps may pull it down but never inflate it."""
+
+    def _engine(self, quote):
+        from valuation import ValuationEngine
+        tmp = tempfile.mkdtemp()
+        e = ValuationEngine({
+            "_config_dir": tmp,
+            "database": {"file": os.path.join(tmp, "h.db"),
+                         "comp_cache_hours": 48},
+            "algorithm": {"min_specific_comps": 3},
+        })
+        e.guide.quote = lambda ident: quote
+        return e
+
+    def _listing(self, title, **kw):
+        return Listing(site="ebay", title=title,
+                       url="https://www.ebay.com/itm/1",
+                       current_price=kw.pop("price", 400.0), bid_count=3,
+                       listing_id="1", query=kw.pop("query", "Disney Chrome 2023"),
+                       end_time=datetime.now(timezone.utc) + timedelta(hours=6),
+                       **kw)
+
+    def _quote(self, **kw):
+        from valuation.price_guide import GuideQuote
+        from valuation.identity import MATCH_EXACT
+        base = dict(value=1200.0, match=MATCH_EXACT, score=0.9,
+                    product_id="2", product_name="Cinderella [Pink] /399",
+                    how="manual-only-price")
+        base.update(kw)
+        return GuideQuote(**base)
+
+    def test_exact_match_lets_the_guide_set_the_value(self):
+        e = self._engine(self._quote())
+        opp = e.evaluate(self._listing(DISNEY_TITLES[0]), [])
+        self.assertAlmostEqual(opp.valuation.fair_value, 1200.0)
+        self.assertEqual(opp.valuation.identity_match, "exact")
+
+    def test_comps_may_lower_the_guide_but_never_raise_it(self):
+        e = self._engine(self._quote())
+        low = [SoldComp("2023 Topps Chrome Disney 100 Cinderella Pink "
+                        f"Refractor #/399 PSA 10 sale {i}", 800.0 + i)
+               for i in range(4)]
+        opp = e.evaluate(self._listing(DISNEY_TITLES[0]), low)
+        self.assertLess(opp.valuation.fair_value, 1000.0,
+                        "comps below the guide must pull the value down")
+        high = [SoldComp("2023 Topps Chrome Disney 100 Cinderella Pink "
+                         f"Refractor #/399 PSA 10 sale {i}", 5000.0 + i)
+                for i in range(4)]
+        opp = self._engine(self._quote()).evaluate(
+            self._listing(DISNEY_TITLES[0]), high)
+        self.assertAlmostEqual(opp.valuation.fair_value, 1200.0,
+                               msg="comps must never inflate an exact match")
+
+    def test_thin_comps_cannot_pull_the_guide_down(self):
+        e = self._engine(self._quote())
+        one = [SoldComp("2023 Topps Chrome Disney 100 Cinderella Pink "
+                        "Refractor #/399 PSA 10", 300.0)]
+        opp = e.evaluate(self._listing(DISNEY_TITLES[0]), one)
+        self.assertAlmostEqual(opp.valuation.fair_value, 1200.0)
+
+    def test_weak_match_is_browse_only_and_not_tradeable(self):
+        from quality import is_tradeable
+        from valuation.identity import MATCH_WEAK
+        e = self._engine(self._quote(match=MATCH_WEAK, score=0.5))
+        comps = [SoldComp("2023 Topps Chrome Disney 100 Cinderella Pink "
+                          f"Refractor #/399 PSA 10 sale {i}", 900.0 + i)
+                 for i in range(5)]
+        opp = e.evaluate(self._listing(DISNEY_TITLES[0]), comps)
+        self.assertTrue(any("IDENTITY UNRESOLVED" in n
+                            for n in opp.valuation.notes))
+        self.assertFalse(is_tradeable(opp))
+
+    def test_the_disney_eight_no_longer_share_one_value(self):
+        """The headline regression: 8 parallels, 8 different numbers."""
+        from valuation.price_guide import GuideQuote
+        from valuation.identity import MATCH_EXACT, identity_of
+        from valuation import ValuationEngine
+        tmp = tempfile.mkdtemp()
+        e = ValuationEngine({"_config_dir": tmp,
+                             "database": {"file": os.path.join(tmp, "h.db")},
+                             "algorithm": {"min_specific_comps": 3}})
+        # PriceCharting prices each parallel separately - as it does in
+        # reality, because each parallel is its own catalogue product.
+        prices = {}
+        for n, t in enumerate(DISNEY_TITLES):
+            prices[identity_of(t).fingerprint()] = 500.0 + 250.0 * n
+        e.guide.quote = lambda ident: GuideQuote(
+            value=prices[ident.fingerprint()], match=MATCH_EXACT, score=0.9,
+            product_id="x", product_name="p", how="manual-only-price")
+        values = [e.evaluate(self._listing(t), []).valuation.fair_value
+                  for t in DISNEY_TITLES]
+        self.assertEqual(len(set(values)), len(DISNEY_TITLES),
+                         "each parallel must get its own fair value")
+
+    def test_a_figure_cannot_inherit_a_card_pool(self):
+        from valuation.price_guide import GuideQuote
+        e = self._engine(GuideQuote())          # guide lands nothing
+        card_comps = [SoldComp(f"1940 Superman Gum R145 #40 PSA 6 sale {i}",
+                               2800.0 + i) for i in range(6)]
+        opp = e.evaluate(
+            self._listing(SUPERMAN_TITLES[4][0], price=18.0,
+                          query="Superman 1940"), card_comps)
+        v = opp.valuation
+        self.assertTrue(
+            any("identity filter dropped" in a for a in v.audit_notes),
+            "graded-card sales must not survive into a plastic figure's pool")
+
+    def test_stale_comps_discount_confidence(self):
+        e = self._engine(self._quote())
+        fresh = datetime.now(timezone.utc)
+        old = datetime.now(timezone.utc) - timedelta(hours=200)
+        def comps(ts):
+            return [SoldComp("2023 Topps Chrome Disney 100 Cinderella Pink "
+                             f"Refractor #/399 PSA 10 sale {i}", 1100.0 + i,
+                             sold_date=ts) for i in range(5)]
+        hot = e.evaluate(self._listing(DISNEY_TITLES[0]), comps(fresh))
+        cold = self._engine(self._quote()).evaluate(
+            self._listing(DISNEY_TITLES[0]), comps(old))
+        self.assertLess(cold.valuation.confidence, hot.valuation.confidence,
+                        "a 200-hour-old pool must not read as fresh conviction")
+        self.assertTrue(any("confidence discounted" in a
+                            for a in cold.valuation.audit_notes))
+
+
+class TestSpecificityByObjectClass(unittest.TestCase):
+    """The first specificity() demanded a card number and a parallel, so a
+    sealed WATA Super Mario Bros scored 50% and was permanently locked out
+    of guide-led valuation - despite video games being PriceCharting's
+    deepest and oldest catalogue. What counts as "pinned" depends on what
+    the thing IS."""
+
+    def _spec(self, title):
+        from valuation.identity import identity_of
+        return identity_of(title)
+
+    def test_a_sealed_graded_game_is_specific(self):
+        for title in ("Super Mario Bros NES Sealed WATA 9.4 A",
+                      "The Legend of Zelda NES Sealed VGA 85",
+                      "Pokemon Red Version Game Boy Sealed WATA 9.0"):
+            i = self._spec(title)
+            self.assertEqual(i.object_class, "game")
+            self.assertTrue(i.is_specific(),
+                            f"{title} -> {i.specificity():.0%}")
+
+    def test_a_graded_numbered_comic_is_specific(self):
+        i = self._spec("Action Comics #22 1940 DC Comics CGC 4.0")
+        self.assertTrue(i.is_specific())
+
+    def test_a_watch_stays_vague(self):
+        # PriceCharting does not carry watches; gating them is correct, and
+        # watches are excluded from Action by policy anyway.
+        i = self._spec("Rolex Submariner 5513 stainless steel watch")
+        self.assertFalse(i.is_specific())
+
+    def test_a_vintage_variant_counts_when_there_is_no_parallel(self):
+        i = self._spec("1997 Topsun Charizard Green Back PSA 8")
+        self.assertTrue(i.is_specific(),
+                        "Green Back is a real discriminator")
+
+
+class TestGameIdentity(unittest.TestCase):
+    """The 2026-07-26 coverage probe landed 0/3 sealed games despite video
+    games being PriceCharting's oldest catalogue. Subject extraction is
+    tuned for cards - it dropped "Super" as a generic adjective and "NES"
+    as a generic token, so we searched for 'mario bros' with no platform."""
+
+    def _i(self, t):
+        from valuation.identity import identity_of
+        return identity_of(t)
+
+    def test_the_game_title_survives_intact(self):
+        i = self._i("Super Mario Bros NES Sealed WATA 9.4 A")
+        q = i.guide_query()
+        self.assertIn("super", q)
+        self.assertIn("mario", q)
+        self.assertIn("nes", q)
+        self.assertNotIn("wata", q)
+        self.assertNotIn("sealed", q)
+
+    def test_the_platform_is_captured_as_a_set_token(self):
+        self.assertIn("nes", self._i("Super Mario Bros NES Sealed").set_tokens)
+        self.assertIn("gameboy",
+                      self._i("Pokemon Red Version GameBoy Sealed").set_tokens)
+
+    def test_a_sequel_is_not_the_original(self):
+        i = self._i("Super Mario Bros NES Sealed WATA 9.4")
+        original = i.score_candidate("Super Mario Bros", "NES")
+        sequel = i.score_candidate("Super Mario Bros 3", "NES")
+        compilation = i.score_candidate("Super Mario Bros and Duck Hunt",
+                                        "NES")
+        self.assertGreater(original, sequel + 0.05)
+        self.assertGreater(original, compilation + 0.05)
+
+    def test_the_shorter_wrong_game_does_not_win(self):
+        # "Mario Bros" outranked "Super Mario Bros" 72% to 69% before the
+        # recall term - a different and far cheaper game.
+        i = self._i("Super Mario Bros NES Sealed WATA 9.4")
+        self.assertGreater(i.score_candidate("Super Mario Bros", "NES"),
+                           i.score_candidate("Mario Bros", "NES"))
+
+    def test_a_pal_release_is_a_different_product(self):
+        i = self._i("Super Mario Bros NES Sealed WATA 9.4")
+        self.assertGreater(i.score_candidate("Super Mario Bros", "NES"),
+                           i.score_candidate("Super Mario Bros", "PAL NES"))
+
+    def test_a_cgc_graded_comic_is_a_comic_not_a_card(self):
+        # CGC grades both, so the grader cannot be the card signal.
+        i = self._i("Action Comics #22 1940 DC Comics CGC 4.0")
+        self.assertEqual(i.object_class, "comic")
+        self.assertTrue(i.is_specific())
+
+
+class TestAlphanumericCardNumbers(unittest.TestCase):
+    """Modern inserts number themselves #T264 / #IM-15 / #BC-15. comps
+    .card_number reads digits only - correct for the comp filter it was
+    built for - so the cards whose identity matters most had no number."""
+
+    def test_letter_prefixed_numbers_are_read(self):
+        from valuation.identity import card_number_of
+        self.assertEqual(card_number_of(
+            "2001 Topps Chrome Traded #T264 Ichiro PSA 10"), "T264")
+        self.assertEqual(card_number_of(
+            "Escape from a Plane #IM-15 Black"), "IM-15")
+
+    def test_plain_numbers_are_unchanged(self):
+        from valuation.identity import card_number_of
+        self.assertEqual(card_number_of("1952 Topps #311 Mantle"), "311")
+        self.assertEqual(card_number_of("Charizard #4 Holo"), "4")
+
+    def test_a_print_run_is_not_a_card_number(self):
+        from valuation.identity import card_number_of
+        self.assertIsNone(card_number_of("Pink Refractor #/399 PSA 10"))
+
+    def test_a_year_is_not_a_card_number(self):
+        from valuation.identity import card_number_of
+        self.assertIsNone(card_number_of("1933 Goudey Babe Ruth"))
+
+    def test_it_feeds_identity_and_lifts_specificity(self):
+        from valuation.identity import identity_of
+        i = identity_of("2001 Topps Chrome Traded #T264 Ichiro Rookie PSA 10")
+        self.assertEqual(i.number, "T264")
+        self.assertTrue(i.is_specific())
+
+
+class TestSportsCardHostRouting(unittest.TestCase):
+    """2026-07-26: pricecharting.com carries TCG, video games, comics, Funko
+    and LEGO but NOT sports cards - a 1952 Mantle search returned Funko POPs
+    and LEGO sets, 0/8 across two sports categories. sportscardspro.com is
+    the same company's sports catalogue, the same token reached it, and it
+    landed all six test cards at 90-100%."""
+
+    def _guide(self, responses):
+        from valuation.price_guide import PriceGuide
+        tmp = tempfile.mkdtemp()
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        g.hosts_called = []
+
+        def call(path, params, host=None):
+            g.hosts_called.append(host)
+            return responses(path, params, host)
+        g._pc_call = call
+        return g
+
+    def test_a_sports_card_falls_through_to_sportscardspro(self):
+        from valuation.identity import identity_of
+
+        def responses(path, params, host):
+            if "sportscardspro" not in (host or ""):
+                # what pricecharting really returned for this card
+                return {"status": "success", "products": [
+                    {"id": "1", "product-name": "Mugman #311",
+                     "console-name": "Funko POP Games"}]}
+            if path == "products":
+                return {"status": "success", "products": [
+                    {"id": "72584", "product-name": "Mickey Mantle #311",
+                     "console-name": "Baseball Cards 1952 Topps"}]}
+            return {"status": "success", "product-name": "Mickey Mantle #311",
+                    "console-name": "Baseball Cards 1952 Topps",
+                    "genre": "Baseball Card", "cib-price": 4138000}
+
+        g = self._guide(responses)
+        q = g.quote(identity_of("1952 Topps #311 Mickey Mantle PSA 7"))
+        self.assertTrue(q.landed, "SportsCardsPro has this card")
+        self.assertEqual(q.product_id, "72584")
+        self.assertTrue(any("sportscardspro" in (h or "")
+                            for h in g.hosts_called))
+
+    def test_a_pokemon_card_never_needs_the_second_host(self):
+        from valuation.identity import identity_of
+
+        def responses(path, params, host):
+            if path == "products":
+                return {"status": "success", "products": [
+                    {"id": "7096109",
+                     "product-name": "Charizard [1st Edition] #4",
+                     "console-name": "Pokemon Base Set"}]}
+            return {"status": "success",
+                    "product-name": "Charizard [1st Edition] #4",
+                    "console-name": "Pokemon Base Set",
+                    "genre": "Pokemon Card", "new-price": 2500000}
+
+        g = self._guide(responses)
+        q = g.quote(identity_of("1999 Pokemon Base Set 1st Edition "
+                                "Charizard #4 Holo PSA 8"))
+        self.assertTrue(q.landed)
+        self.assertFalse(any("sportscardspro" in (h or "")
+                             for h in g.hosts_called),
+                         "a card that lands on the first host must not cost "
+                         "a second lookup")
+
+    def test_the_two_hosts_never_share_a_cache_entry(self):
+        from valuation.price_guide import _host_tag
+        self.assertNotEqual(_host_tag("https://www.pricecharting.com"),
+                            _host_tag("https://www.sportscardspro.com"))
+
+    def test_an_unasked_bracket_variant_is_penalised(self):
+        """`Michael Jordan #57` 90% vs `[20th Anniversary] #57` 86% is four
+        points - a coin flip to the margin gate, though the listing says
+        nothing about an anniversary reprint."""
+        from valuation.identity import identity_of
+        i = identity_of("1986 Fleer #57 Michael Jordan Rookie PSA 9")
+        base = i.score_candidate("Michael Jordan #57",
+                                 "Basketball Cards 1986 Fleer")
+        variant = i.score_candidate("Michael Jordan [20th Anniversary] #57",
+                                    "Basketball Cards 1986 Fleer")
+        self.assertGreater(base, variant + 0.06,
+                           "the base card must clear the margin gate")
+
+    def test_the_wrong_player_scores_zero_however_well_numbered(self):
+        """SportsCardsPro returned `Chris Smith #T264` and `Mike Adams #T264`
+        at 64% each for an Ichiro listing - same set, same card number,
+        entirely the wrong person. The name on the card cannot be outvoted
+        by numbering and set agreement."""
+        from valuation.identity import identity_of
+        i = identity_of("2001 Topps Chrome Traded #T264 Ichiro Rookie PSA 10")
+        console = "Baseball Cards 2001 Topps Chrome Traded"
+        self.assertEqual(i.score_candidate("Chris Smith #T264", console), 0.0)
+        self.assertEqual(i.score_candidate("Mike Adams #T264", console), 0.0)
+        self.assertGreater(i.score_candidate("Ichiro Suzuki #T264", console),
+                           0.62)
+
+    def test_two_word_platforms_survive(self):
+        """'Game Boy' contributed nothing, so we searched for the product
+        'pokemon red boy'."""
+        from valuation.identity import identity_of, set_tokens_of
+        self.assertIn("gameboy", set_tokens_of("Pokemon Red Version Game Boy"))
+        i = identity_of("Pokemon Red Version Game Boy Sealed WATA 9.0")
+        q = i.guide_query()
+        self.assertIn("version", q)
+        # BOTH sides fold to the catalogue's single word, or our 'game'+'boy'
+        # never matches their 'GameBoy' and recall halves.
+        self.assertIn("gameboy", q)
+        self.assertGreater(i.score_candidate("Pokemon Red Version", "GameBoy"),
+                           0.62)
+        self.assertGreater(
+            i.score_candidate("Pokemon Red Version", "GameBoy"),
+            i.score_candidate("Pokemon Blue Version", "GameBoy") + 0.2)
+
+    def test_a_variant_we_DID_ask_for_is_not_penalised(self):
+        from valuation.identity import identity_of
+        i = identity_of("2018 Panini Prizm #280 Luka Doncic Silver PSA 10")
+        self.assertGreater(
+            i.score_candidate("Luka Doncic [Silver Prizm] #280",
+                              "Basketball Cards 2018 Panini Prizm"),
+            0.80)
+
+
+class TestLocalPriceGuideCsv(unittest.TestCase):
+    """A downloaded price-guide CSV carries the same columns as an API
+    response, so it can answer a lookup with no call and no latency. The
+    paid API is one call per second - the dominant cost of a full scan."""
+
+    HEADER = ("id,product-name,console-name,loose-price,cib-price,"
+              "new-price,graded-price,box-only-price,manual-only-price,"
+              "genre,sales-volume\n")
+
+    def _folder(self, body, name="set.csv"):
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "guide_csv"), exist_ok=True)
+        with open(os.path.join(tmp, "guide_csv", name), "w") as fh:
+            fh.write(self.HEADER + body)
+        return tmp
+
+    def test_it_loads_and_indexes_rows(self):
+        from valuation.guide_csv import load_index
+        tmp = self._folder(
+            "72584,Michael Jordan #57,Basketball Cards 1986 Fleer,"
+            "225500,413800,602295,,,,Basketball Card,145\n"
+            "72585,Michael Jordan #8,Basketball Cards 1986 Fleer Sticker,"
+            "50000,,,,,,Basketball Card,12\n")
+        idx = load_index(tmp)
+        self.assertEqual(len(idx), 2)
+        rows = idx.search("1986 fleer michael jordan #57")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["console-name"],
+                         "Basketball Cards 1986 Fleer")
+
+    def test_dollar_formatted_prices_are_normalised_to_cents(self):
+        from valuation.guide_csv import load_index
+        tmp = self._folder(
+            '1,Mickey Mantle #311,Baseball Cards 1952 Topps,"$2,255.00",'
+            '"$4,138.00",,,,,Baseball Card,\n')
+        row = load_index(tmp).rows[0]
+        self.assertEqual(row["loose-price"], 225500)
+        self.assertEqual(row["cib-price"], 413800)
+
+    def test_a_csv_answer_costs_no_api_call(self):
+        from valuation.price_guide import PriceGuide
+        tmp = self._folder(
+            "72584,Michael Jordan #57,Basketball Cards 1986 Fleer,"
+            "225500,413800,602295,4064100,,,Basketball Card,145\n")
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        calls = []
+        g._pc_call = lambda path, params, host=None: calls.append(path) or None
+        q = g.quote(self._ident_for(
+            "1986 Fleer #57 Michael Jordan Rookie PSA 9"))
+        self.assertTrue(q.landed, "the CSV has this card")
+        self.assertEqual(calls, [], "a local hit must not touch the network")
+        self.assertAlmostEqual(q.value, 40641.00, places=2)
+        self.assertEqual(q.sales_volume, 145)
+
+    def test_a_card_not_in_the_csv_still_uses_the_api(self):
+        from valuation.price_guide import PriceGuide
+        tmp = self._folder(
+            "72584,Michael Jordan #57,Basketball Cards 1986 Fleer,"
+            "225500,,,,,,Basketball Card,145\n")
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        calls = []
+
+        def call(path, params, host=None):
+            calls.append(path)
+            return {"status": "success", "products": []}
+        g._pc_call = call
+        g.quote(self._ident_for("1952 Topps #311 Mickey Mantle PSA 5"))
+        self.assertTrue(calls, "a miss must fall through to the API")
+
+    def test_a_junk_file_is_ignored_not_fatal(self):
+        from valuation.guide_csv import load_index
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "guide_csv"), exist_ok=True)
+        with open(os.path.join(tmp, "guide_csv", "notes.csv"), "w") as fh:
+            fh.write("date,amount\n2026-07-26,12.00\n")
+        self.assertEqual(len(load_index(tmp)), 0)
+
+    def test_no_folder_at_all_is_fine(self):
+        from valuation.guide_csv import load_index
+        self.assertEqual(len(load_index(tempfile.mkdtemp())), 0)
+
+    def test_the_csv_is_held_to_the_same_margin_gate(self):
+        """Local data gets no special trust: an ambiguous pair is refused
+        exactly as it would be from the API."""
+        from valuation.price_guide import PriceGuide
+        tmp = self._folder(
+            "1,Babe Ruth #53,Baseball Cards 1933 Goudey,100000,,,,,,"
+            "Baseball Card,\n"
+            "2,Babe Ruth #53,Baseball Cards 1933 Goudey,200000,,,,,,"
+            "Baseball Card,\n")
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        g._pc_call = lambda path, params, host=None: {"status": "success",
+                                                      "products": []}
+        q = g.quote(self._ident_for("1933 Goudey #53 Babe Ruth PSA 4"))
+        self.assertFalse(q.landed)
+
+    @staticmethod
+    def _ident_for(title):
+        from valuation.identity import identity_of
+        return identity_of(title)
+
+
+class TestGuideCsvDownloader(unittest.TestCase):
+    """`/price-guide/download-custom?t=TOKEN&category=<slug>` returns a whole
+    category in one request. Their limits are one CSV per 10 minutes and a
+    24-hour regeneration cycle, so the downloader must pace itself and must
+    not re-fetch files that are already current."""
+
+    def _mod(self):
+        import fetch_guide_csv
+        return fetch_guide_csv
+
+    def test_filenames_separate_the_two_sites(self):
+        m = self._mod()
+        self.assertEqual(m._filename(m.PC, "pokemon-cards"),
+                         "pricecharting--pokemon-cards.csv")
+        self.assertEqual(m._filename(m.SCP, "baseball-cards"),
+                         "sportscardspro--baseball-cards.csv")
+        # no category = the host default, which on PriceCharting is games
+        self.assertEqual(m._filename(m.PC, ""),
+                         "pricecharting--video-games.csv")
+
+    def test_an_html_response_is_rejected_not_saved(self):
+        """A refused token returns a web page. Writing that to guide_csv/
+        would poison every future lookup with garbage."""
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "out.csv")
+
+        class FakeResp:
+            status_code = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def iter_content(self, chunk_size=0):
+                yield b"<!DOCTYPE html><html><body>Login</body></html>"
+
+        with mock.patch.object(m.requests, "get", return_value=FakeResp()):
+            ok, detail = m.download(m.PC, "", "tok", path)
+        self.assertFalse(ok)
+        self.assertIn("web page", detail)
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_response_without_the_expected_header_is_rejected(self):
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "out.csv")
+
+        class FakeResp:
+            status_code = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def iter_content(self, chunk_size=0):
+                yield b"date,amount\n2026-01-01,5\n"
+
+        with mock.patch.object(m.requests, "get", return_value=FakeResp()):
+            ok, _ = m.download(m.PC, "", "tok", path)
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_real_csv_is_written(self):
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "out.csv")
+
+        class FakeResp:
+            status_code = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def iter_content(self, chunk_size=0):
+                yield (b"id,product-name,console-name,loose-price\n"
+                       b"1,Michael Jordan #57,Basketball Cards 1986 Fleer,225500\n")
+
+        with mock.patch.object(m.requests, "get", return_value=FakeResp()):
+            ok, detail = m.download(m.PC, "", "tok", path)
+        self.assertTrue(ok, detail)
+        self.assertTrue(os.path.exists(path))
+        from valuation.guide_csv import GuideCsvIndex
+        idx = GuideCsvIndex(tmp)
+        idx._load_file(path)
+        self.assertEqual(len(idx), 1)
+
+    def test_fresh_files_are_not_refetched(self):
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "x.csv")
+        open(path, "w").write("id,product-name,console-name\n")
+        age = m._age_hours(path)
+        self.assertIsNotNone(age)
+        self.assertLess(age, m.FRESH_HOURS,
+                        "a file just written must count as fresh")
+        self.assertIsNone(m._age_hours(os.path.join(tmp, "missing.csv")))
+
+    def test_the_cooldown_respects_their_documented_limit(self):
+        m = self._mod()
+        self.assertGreaterEqual(m.CSV_COOLDOWN_SECONDS, 600,
+                                "PriceCharting allows one CSV per 10 minutes")
+
+
+class TestLiveAuctionPricing(unittest.TestCase):
+    """2026-07-26: the projected close was circular - model the close as
+    fair x 0.92, then ask if that is cheap versus fair. With a 13.25% sell
+    fee and 8% buy tax you must acquire at <= 80.3% of fair to break even,
+    so any auction whose live bid had not yet started to dominate was
+    negative-EV BY ARITHMETIC and every auction beyond ~48h was invisible.
+    And 0.92 was never validated: the learner sits at n=0."""
+
+    def _engine(self, mode="live", **algo):
+        from valuation import ValuationEngine
+        from valuation.price_guide import GuideQuote
+        tmp = tempfile.mkdtemp()
+        cfg = {"_config_dir": tmp,
+               "database": {"file": os.path.join(tmp, "h.db")},
+               "algorithm": dict({"auction_pricing": mode,
+                                  "auction_settle_ratio": 0.92,
+                                  "resale_fee_rate": 0.1325,
+                                  "sales_tax_rate": 0.08}, **algo)}
+        e = ValuationEngine(cfg)
+        e.guide.quote = lambda ident: GuideQuote()
+        return e
+
+    def _auction(self, price, bids, hours):
+        return Listing(
+            site="ebay", title="1952 Topps #311 Mickey Mantle PSA 5",
+            url="https://www.ebay.com/itm/50", listing_id="50",
+            query="Mickey Mantle 1952", current_price=price, bid_count=bids,
+            listing_type="AUCTION",
+            end_time=datetime.now(timezone.utc) + timedelta(hours=hours))
+
+    def _value(self, engine, listing, fair=1000.0):
+        v = Valuation(fair_value=fair, comps_value=fair, n_comps=6,
+                      confidence=0.8)
+        return engine.score(listing, v)
+
+    def test_live_pricing_uses_the_current_bid(self):
+        e = self._engine("live")
+        v = self._value(e, self._auction(200.0, 5, hours=40))
+        self.assertAlmostEqual(v.expected_cost,
+                               e_cost := v.expected_cost)  # sanity
+        self.assertLess(v.expected_cost, 300.0,
+                        "a $200 bid must be costed near $200, not near fair")
+        self.assertGreater(v.expected_value, 0,
+                           "a $200 bid on a $1,000 card is a real dislocation")
+
+    def test_projected_pricing_buries_the_same_row(self):
+        """The exact row live pricing surfaces, the old model discards.
+
+        Measured on a $200 bid against a $1,000 card: projected EV crosses
+        zero at about 72 hours out and is -$126 by 10 days, while the same
+        row is +$652 under live pricing at every horizon. (An earlier note
+        of mine said this happened by ~48h - it is ~72h. The 72-hour cutoff
+        we now filter on is, by coincidence, almost exactly where the old
+        model stopped finding anything at all.)
+        """
+        e = self._engine("projected")
+        far = self._value(e, self._auction(200.0, 5, hours=120))
+        self.assertGreater(far.expected_cost, 900.0,
+                           "far out, projection drags cost to ~92% of fair")
+        self.assertLess(far.expected_value, 0,
+                        "which makes it negative-EV and invisible")
+        # Nearer in it survives, but at a fraction of the real dislocation.
+        near_proj = self._value(e, self._auction(200.0, 5, hours=40))
+        near_live = self._value(self._engine("live"),
+                                self._auction(200.0, 5, hours=40))
+        self.assertGreater(near_live.expected_value,
+                           near_proj.expected_value * 5)
+
+    def test_a_zero_bid_auction_far_from_close_is_not_a_market(self):
+        """A low opening bid is bait, and bait needs time to work. A $0.99
+        start on a $5,000 card shows $5,000 of edge and is unwinnable."""
+        e = self._engine("live")
+        v = self._value(e, self._auction(50.0, 0, hours=40))
+        self.assertGreater(v.expected_cost, 500.0,
+                           "far from close, fall back to the model")
+        self.assertTrue(any("not a market yet" in n for n in v.audit_notes))
+
+    def test_a_zero_bid_auction_near_close_is_takeable(self):
+        """Nobody has bid and it ends soon: opening at that price can
+        genuinely win it, and it means nobody noticed the card."""
+        e = self._engine("live")
+        v = self._value(e, self._auction(200.0, 0, hours=5))
+        self.assertLess(v.expected_cost, 300.0,
+                        "priced at the opening bid, which is takeable")
+        self.assertGreater(v.expected_value, 0)
+        self.assertTrue(any("NO BIDS YET" in n for n in v.notes),
+                        "the row must warn that one rival bid changes it")
+
+    def test_the_zero_bid_window_is_configurable(self):
+        e = self._engine("live", zero_bid_actionable_hours=6)
+        far = self._value(e, self._auction(200.0, 0, hours=12))
+        near = self._value(self._engine("live", zero_bid_actionable_hours=6),
+                           self._auction(200.0, 0, hours=3))
+        self.assertGreater(far.expected_cost, 500.0)
+        self.assertLess(near.expected_cost, 300.0)
+
+    def test_a_zero_bid_hybrid_still_uses_its_buy_it_now(self):
+        """The actual 2026-07-25 bug: a $499 opening bid on an item that
+        also had a Buy It Now. The BIN is takeable; the opening ask is not.
+        This must hold at every horizon."""
+        e = self._engine("live")
+        l = self._auction(499.0, 0, hours=5)
+        l.has_buy_now, l.buy_now_price = True, 700.0
+        v = self._value(e, l)
+        self.assertGreaterEqual(v.expected_cost, l.landed_cost(499.0),
+                                "must not be priced below the opening ask")
+
+    def test_output_ok_lets_a_near_close_zero_bid_row_through(self):
+        near = self._auction(200.0, 0, hours=5)
+        near.listing_type = "auction"
+        far = self._auction(200.0, 0, hours=48)
+        far.listing_type = "auction"
+        good = Valuation(fair_value=1000.0, expected_value=500.0, roi=0.5)
+        self.assertTrue(scanner.output_ok(
+            Opportunity(listing=near, valuation=good), zero_bid_hours=24))
+        self.assertFalse(scanner.output_ok(
+            Opportunity(listing=far, valuation=good), zero_bid_hours=24))
+
+    def test_live_rows_say_what_the_number_means(self):
+        e = self._engine("live")
+        v = self._value(e, self._auction(200.0, 5, hours=40))
+        self.assertTrue(any("live pricing" in n for n in v.audit_notes),
+                        "EV is edge-right-now, not a profit forecast - the "
+                        "row has to say so")
+
+    def test_a_hybrid_is_still_capped_at_its_buy_it_now(self):
+        e = self._engine("live")
+        l = self._auction(200.0, 3, hours=40)
+        l.has_buy_now, l.buy_now_price = True, 400.0
+        v = self._value(e, l)
+        self.assertLessEqual(v.expected_cost,
+                             l.landed_cost(400.0) * 1.10)
+
+
+class TestAuctionHorizonFilter(unittest.TestCase):
+    """Under live pricing, an auction six days out is quoting a bid the
+    market has barely tested. Cut before valuation so it costs neither
+    scoring time nor a paid guide lookup."""
+
+    def _auction(self, hours, kind="AUCTION"):
+        return Listing(
+            site="ebay", title="1952 Topps #311 Mickey Mantle PSA 5",
+            url="https://www.ebay.com/itm/60", listing_id="60",
+            query="Mickey Mantle 1952", current_price=100.0, bid_count=2,
+            listing_type=kind,
+            end_time=(datetime.now(timezone.utc) + timedelta(hours=hours))
+            if hours is not None else None)
+
+    def test_auctions_inside_the_window_are_kept(self):
+        for hrs in (1, 24, 71):
+            self.assertTrue(
+                scanner.within_auction_horizon(self._auction(hrs), 72))
+
+    def test_auctions_beyond_the_window_are_dropped(self):
+        for hrs in (73, 120, 400):
+            self.assertFalse(
+                scanner.within_auction_horizon(self._auction(hrs), 72))
+
+    def test_fixed_price_listings_are_unaffected(self):
+        self.assertTrue(
+            scanner.within_auction_horizon(self._auction(500, "BIN"), 72))
+
+    def test_an_unknown_end_time_is_kept(self):
+        self.assertTrue(
+            scanner.within_auction_horizon(self._auction(None), 72))
+
+    def test_zero_or_missing_config_disables_the_filter(self):
+        self.assertTrue(scanner.within_auction_horizon(self._auction(999), 0))
+        self.assertTrue(
+            scanner.within_auction_horizon(self._auction(999), None))
+
+    def test_the_shipped_config_sets_a_horizon(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config.yaml")
+        if not os.path.isfile(path):
+            self.skipTest("live config.yaml not present")
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        self.assertEqual(
+            (cfg.get("filters") or {}).get("max_auction_hours"), 72)
+        self.assertEqual(
+            (cfg.get("algorithm") or {}).get("auction_pricing"), "live")
+
+
+class TestRoiCeilingUnderLivePricing(unittest.TestCase):
+    """The ROI ceiling catches nonsense, but its right value depends on what
+    ROI MEANS. Live pricing changed that: a $200 bid on a $1,000 card was
+    30% ROI projected and is 302% live. A 200% ceiling would have deleted
+    precisely the dislocations live pricing exists to find."""
+
+    def test_the_live_ceiling_is_far_above_the_projected_one(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config.yaml")
+        if not os.path.isfile(path):
+            self.skipTest("live config.yaml not present")
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        flt = cfg.get("filters") or {}
+        self.assertGreaterEqual(flt.get("max_roi_live", 0), 3.0,
+                                "a 302% ROI row must survive the ceiling")
+        self.assertGreater(flt.get("max_roi_live", 0), flt.get("max_roi", 0))
+
+    def test_alerts_use_the_live_ceiling_too(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config.yaml")
+        if not os.path.isfile(path):
+            self.skipTest("live config.yaml not present")
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        self.assertGreaterEqual(
+            (cfg.get("alerts") or {}).get("max_roi_live", 0), 3.0,
+            "otherwise every cheap auction is muted instead of alerted")
+
+    def test_a_302_percent_row_survives_live_but_not_projected(self):
+        good = Valuation(fair_value=1000.0, expected_value=652.0, roi=3.02)
+        self.assertGreater(good.roi, 2.0, "would fail the projected ceiling")
+        self.assertLess(good.roi, 10.0, "and pass the live one")
+
+
+class TestCloseTrackingHasItsOwnFuse(unittest.TestCase):
+    """The closer fetched item pages through the shared "html" lane, so every
+    sold-comp scraping challenge starved close tracking - the ONLY source of
+    ground truth for the settle ratio. Symptom: "settled 0 real closes, 20
+    pending retry" every run for days, in 0s, because the breaker
+    short-circuited it before a request went out. The learner sat at n=0."""
+
+    def _scraper(self):
+        from scrapers.ebay import EbayScraper
+        tmp = tempfile.mkdtemp()
+        return EbayScraper({"_config_dir": tmp, "scraping": {}})
+
+    def test_a_cooling_html_lane_does_not_block_close_lookups(self):
+        s = self._scraper()
+        s._streaks["html"] = 99          # comp scraping is in the doghouse
+        self.assertTrue(s.lane_tripped("html"))
+        self.assertFalse(s.lane_tripped("close"),
+                         "close tracking must survive a comp-scrape outage")
+
+    def test_the_close_lane_still_trips_on_its_own_failures(self):
+        s = self._scraper()
+        for _ in range(s.trip_after):
+            s._streaks["close"] += 1
+        self.assertTrue(s.lane_tripped("close"),
+                        "its own fuse must still work - this is not a bypass")
+        self.assertFalse(s.lane_tripped("html"))
+
+    def test_arbitrary_lane_names_do_not_crash(self):
+        s = self._scraper()
+        self.assertFalse(s.lane_tripped("close"))
+        self.assertEqual(s._streaks["some-new-lane"], 0)
+
+    def test_the_closer_asks_for_the_close_lane(self):
+        import closer
+        src = open(closer.__file__.replace(".pyc", ".py")).read()
+        self.assertIn('lane="close"', src)
+        self.assertNotIn('ebay._streaks["html"]', src,
+                         "challenges must count against the close fuse")
+
+    def test_the_loop_guard_checks_the_close_lane_not_html(self):
+        """The 18:00 run STILL settled 0 closes after the lane change,
+        because `if ebay.tripped: break` consulted the HTML lane and broke
+        out before a single lookup. A private fuse is useless if the guard
+        in front of it asks a different lane."""
+        import closer
+        src = open(closer.__file__.replace(".pyc", ".py")).read()
+        self.assertNotIn("if ebay.tripped:", src)
+        self.assertIn('ebay.lane_tripped("close")', src)
+
+    def test_a_cooling_comp_lane_leaves_close_lookups_runnable(self):
+        s = self._scraper()
+        s._streaks["html"] = 99
+        self.assertTrue(s.tripped, "the html shorthand reports cooling")
+        self.assertFalse(s.lane_tripped("close"),
+                         "but close tracking must still be allowed to run")
+
+
+class TestUnresolvedRowsDoNotSwallowSheets(unittest.TestCase):
+    """2026-07-26 18:00: the Sports Cards tab was 20 rows of "Tiger Woods
+    UDA" all at $1,799.10, and Discovery was 47 rows of "Upper Deck
+    Authenticated Signed Jersey" all at $1,085. When the guide cannot land a
+    card every listing under that query falls back to the SAME broad median
+    - and because that median is inflated relative to the individual cards,
+    those are also the rows that clear the category floor. The correctly
+    valued cheap cards were cut beneath them."""
+
+    def _opp(self, title, fair, query, unresolved=True, score=0.5):
+        listing = Listing(site="ebay", title=title,
+                          url=f"https://www.ebay.com/itm/{abs(hash(title))}",
+                          listing_id=str(abs(hash(title))), query=query,
+                          current_price=100.0)
+        notes = (["IDENTITY UNRESOLVED: no PriceCharting product matched"]
+                 if unresolved else [])
+        v = Valuation(fair_value=fair, opportunity_score=score, notes=notes)
+        return Opportunity(listing=listing, valuation=v)
+
+    def test_one_unresolved_value_cannot_fill_a_sheet(self):
+        rows = [self._opp(f"Tiger Woods item {i}", 1799.10, "Tiger Woods UDA")
+                for i in range(20)]
+        kept = report_mod._cap_unresolved(rows, per_query=3)
+        self.assertEqual(len(kept), 3)
+
+    def test_identified_rows_are_never_capped(self):
+        rows = [self._opp(f"Real card {i}", 1000.0 + i, "q", unresolved=False)
+                for i in range(20)]
+        self.assertEqual(len(report_mod._cap_unresolved(rows, 3)), 20)
+
+    def test_different_queries_get_their_own_allowance(self):
+        rows = ([self._opp(f"a{i}", 1085.0, "Jerseys") for i in range(10)]
+                + [self._opp(f"b{i}", 1799.1, "Tiger Woods UDA")
+                   for i in range(10)])
+        self.assertEqual(len(report_mod._cap_unresolved(rows, 3)), 6)
+
+    def test_identified_rows_outrank_unresolved_ones(self):
+        weak = self._opp("mongrel median row", 5000.0, "q", score=0.9)
+        good = self._opp("real card", 1200.0, "q", unresolved=False,
+                         score=0.1)
+        self.assertIs(report_mod._sorted([weak, good])[0], good,
+                      "a card valued from itself beats one valued from a "
+                      "query-wide median, however big the median looked")
+
+    def test_ask_based_values_are_unresolved_too(self):
+        """The Sports Cards tab was NOT mixed-pool: all 20 Tiger Woods rows
+        shared $1,799.10 from one ASK-BASED estimate over 149 live asks
+        under the query. Same collapse, different mechanism."""
+        listing = Listing(site="ebay", title="Tiger Woods Framed Photo UDA",
+                          url="https://www.ebay.com/itm/1", listing_id="1",
+                          query="Tiger Woods UDA", current_price=140.0)
+        v = Valuation(fair_value=1799.10, notes=[
+            "ASK-BASED estimate from 149 live asks (no sold comps)"])
+        self.assertTrue(report_mod._is_unresolved(
+            Opportunity(listing=listing, valuation=v)))
+
+    def test_every_query_level_marker_is_covered(self):
+        for marker in ("IDENTITY UNRESOLVED", "MIXED POOL", "ASK-BASED"):
+            self.assertIn(marker, report_mod.UNRESOLVED_MARKERS)
+
+    def test_the_survivors_say_rows_were_hidden(self):
+        rows = [self._opp(f"x{i}", 1085.0, "Jerseys") for i in range(9)]
+        kept = report_mod._cap_unresolved(rows, per_query=3)
+        self.assertTrue(any("hidden here" in n
+                            for o in kept for n in o.valuation.notes))
+
+
+class TestAskBasedIsCardSpecific(unittest.TestCase):
+    """2026-07-26: the Sports Cards tab was 20 rows all at $1,799.10, from a
+    single ASK-BASED estimate over 149 live asks under "Tiger Woods UDA" -
+    framed photos, tournament-worn shirts, jersey cards, signed flags. The
+    ask pool was gathered per QUERY and never filtered to the card, so it
+    repeated the exact mistake the identity work fixed for comps."""
+
+    def _engine(self):
+        from valuation import ValuationEngine
+        from valuation.price_guide import GuideQuote
+        tmp = tempfile.mkdtemp()
+        e = ValuationEngine({
+            "_config_dir": tmp,
+            "database": {"file": os.path.join(tmp, "h.db")},
+            "algorithm": {"min_specific_comps": 3}})
+        e.guide.quote = lambda ident: GuideQuote()
+        return e
+
+    def _ask(self, title, price):
+        return Listing(site="ebay", title=title,
+                       url=f"https://www.ebay.com/itm/{abs(hash(title))}",
+                       listing_id=str(abs(hash(title))), query="Tiger Woods UDA",
+                       current_price=price, listing_type="fixed")
+
+    def test_asks_for_other_objects_are_excluded(self):
+        from valuation.identity import identity_of
+        e = self._engine()
+        ident = identity_of("2001 Upper Deck #1 Tiger Woods Rookie PSA 9")
+        pool = [self._ask("Tiger Woods Framed Photo UDA", 140.0),
+                self._ask("2002 Tiger Woods Tourney Worn Shirt UDA", 189.95),
+                self._ask("Tiger Woods Signed Flag UDA", 650.0),
+                self._ask("2001 Upper Deck #1 Tiger Woods Rookie PSA 9", 900.0)]
+        prices, dropped = e._ask_prices_for(ident, pool)
+        self.assertGreater(dropped, 0, "photos and shirts are not this card")
+        self.assertNotIn(140.0, prices)
+
+    def test_too_few_matching_asks_means_no_value(self):
+        e = self._engine()
+        listing = Listing(
+            site="ebay", title="2001 Upper Deck #1 Tiger Woods Rookie PSA 9",
+            url="https://www.ebay.com/itm/1", listing_id="1",
+            query="Tiger Woods UDA", current_price=800.0,
+            listing_type="fixed")
+        opp = e.evaluate(listing, [], asks=[
+            self._ask("Tiger Woods Framed Photo UDA", 140.0),
+            self._ask("Tiger Woods Signed Flag UDA", 650.0)])
+        self.assertEqual(opp.valuation.fair_value, 0.0,
+                         "a mongrel ask pool must not produce a value")
+
+    def test_enough_matching_asks_still_price_the_card(self):
+        e = self._engine()
+        listing = Listing(
+            site="ebay", title="2001 Upper Deck #1 Tiger Woods Rookie PSA 9",
+            url="https://www.ebay.com/itm/1", listing_id="1",
+            query="Tiger Woods UDA", current_price=800.0,
+            listing_type="fixed")
+        same = [self._ask(
+            f"2001 Upper Deck #1 Tiger Woods Rookie PSA 9 copy {i}",
+            900.0 + i * 10) for i in range(5)]
+        opp = e.evaluate(listing, [], asks=same)
+        self.assertGreater(opp.valuation.fair_value, 0)
+        self.assertTrue(any("live asks of this card" in n
+                            for n in opp.valuation.notes))
+
+    def test_bare_prices_still_work_for_the_legacy_path(self):
+        e = self._engine()
+        prices, dropped = e._ask_prices_for(None, [100.0, 200.0, 300.0])
+        self.assertEqual(prices, [100.0, 200.0, 300.0])
+        self.assertEqual(dropped, 0)
+
+
+class TestBinAgeWindow(unittest.TestCase):
+    """Andrew's rule: a BIN is interesting when FRESH (before the market has
+    seen it) or STALE (price set months ago, market has since moved). The
+    middle is picked-over inventory and the biggest source of weak rows."""
+
+    class _L:
+        def __init__(self, days, kind="BIN"):
+            self.age_hours = None if days is None else days * 24
+            self.listing_type = kind
+
+    def test_fresh_listings_are_kept(self):
+        for d in (0.1, 3, 6.9):
+            self.assertTrue(
+                scanner.within_bin_age_window(self._L(d), 7, 60), d)
+
+    def test_the_picked_over_middle_is_dropped(self):
+        for d in (7, 14, 30, 59.9):
+            self.assertFalse(
+                scanner.within_bin_age_window(self._L(d), 7, 60), d)
+
+    def test_stale_listings_come_back(self):
+        for d in (60, 90, 400):
+            self.assertTrue(
+                scanner.within_bin_age_window(self._L(d), 7, 60), d)
+
+    def test_auctions_are_unaffected(self):
+        self.assertTrue(scanner.within_bin_age_window(
+            self._L(30, "auction"), 7, 60))
+
+    def test_an_unknown_age_is_kept_not_guessed(self):
+        self.assertTrue(scanner.within_bin_age_window(self._L(None), 7, 60))
+
+    def test_zero_config_disables_the_window(self):
+        self.assertTrue(scanner.within_bin_age_window(self._L(30), 0, 0))
+
+
+class TestSheetOrder(unittest.TestCase):
+    def test_diagnostics_sit_at_the_back(self):
+        front, back = report_mod.SHEET_ORDER_FRONT, report_mod.SHEET_ORDER_BACK
+        for name in ("Filter Waterfall", "Research-Filtered", "Source Health",
+                     "About"):
+            self.assertIn(name, back)
+            self.assertNotIn(name, front)
+
+    def test_discovery_sits_just_before_watches(self):
+        front = report_mod.SHEET_ORDER_FRONT
+        self.assertEqual(front[front.index("Discovery") + 1], "Watches")
+
+    def test_today_leads_the_book(self):
+        self.assertEqual(report_mod.SHEET_ORDER_FRONT[0], "Today")
+
+
+class TestIdentityCollisionCanary(unittest.TestCase):
+    """A silent wrong answer is worse than a loud missing one. On 2026-07-26
+    4,237 valued rows carried five distinct opinions and nothing said so."""
+
+    def _opp(self, title, fair, key):
+        listing = Listing(site="ebay", title=title,
+                          url=f"https://www.ebay.com/itm/{abs(hash(title))}",
+                          current_price=100.0, listing_id=str(abs(hash(title))),
+                          query="q")
+        v = Valuation(fair_value=fair, identity_key=key)
+        return Opportunity(listing=listing, valuation=v)
+
+    def test_distinct_assets_sharing_one_value_are_flagged(self):
+        opps = [self._opp(t, 1069.60, f"key-{i}")
+                for i, t in enumerate(DISNEY_TITLES)]
+        found = scanner.find_value_collisions(opps)
+        self.assertEqual(len(found), 1)
+        fair, assets, rows, _ = found[0]
+        self.assertAlmostEqual(fair, 1069.60)
+        self.assertEqual(assets, len(DISNEY_TITLES))
+        self.assertEqual(rows, len(DISNEY_TITLES))
+
+    def test_many_copies_of_the_SAME_asset_are_not_a_collision(self):
+        opps = [self._opp(f"same card copy {i}", 500.0, "one-key")
+                for i in range(9)]
+        self.assertEqual(scanner.find_value_collisions(opps), [],
+                         "several listings of one card SHOULD share a value")
+
+    def test_distinct_values_are_silent(self):
+        opps = [self._opp(t, 100.0 * (i + 1), f"key-{i}")
+                for i, t in enumerate(DISNEY_TITLES)]
+        self.assertEqual(scanner.find_value_collisions(opps), [])
+
+    def test_zero_and_missing_values_are_ignored(self):
+        opps = [self._opp(f"t{i}", 0.0, f"key-{i}") for i in range(5)]
+        self.assertEqual(scanner.find_value_collisions(opps), [])
+
+
+class TestGuideLookupCost(unittest.TestCase):
+    """2026-07-26: identity resolution costs a /api/products search PLUS a
+    /api/product fetch. One BIN sweep made 661 calls in 19 minutes and was
+    still running. PriceCharting's default quota is 5,000/day at one call per
+    second, so an ungoverned run burns the day's budget and hours of clock."""
+
+    def _guide(self, budget=None):
+        from valuation.price_guide import PriceGuide
+        tmp = tempfile.mkdtemp()
+        algo = {} if budget is None else {"guide_lookups_per_run": budget}
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "algorithm": algo,
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        g.calls = []
+        def call(path, params, host=None):
+            g.calls.append(path)
+            return {"status": "success", "products": [], "loose-price": 100}
+        g._pc_call = call
+        return g
+
+    def test_run_budget_caps_outward_calls(self):
+        g = self._guide(budget=3)
+        for i in range(10):
+            g._cached_product(f"search:q{i}", "products", {"q": f"q{i}"})
+        self.assertEqual(len(g.calls), 3,
+                         "budget must cap outward PriceCharting calls")
+
+    def test_cached_lookups_are_free(self):
+        g = self._guide(budget=2)
+        for _ in range(8):
+            g._cached_product("search:same", "products", {"q": "same"})
+        self.assertEqual(len(g.calls), 1)
+        self.assertEqual(g._lookups_left, 1, "a cache hit must not be billed")
+
+    def test_vague_identities_never_reach_the_api(self):
+        from valuation import ValuationEngine
+        from valuation.identity import identity_of
+        tmp = tempfile.mkdtemp()
+        e = ValuationEngine({"_config_dir": tmp,
+                             "database": {"file": os.path.join(tmp, "h.db")},
+                             "algorithm": {}})
+        asked = []
+        e.guide.quote = lambda ident: asked.append(ident) or None
+        # Real wasted queries from the 2026-07-26 sweep.
+        for title in ("1933 Goudey Tues July 4 Babe Ruth reprint",
+                      "1933 ACEO Sketch Card Babe Ruth art",
+                      "1933 Washington Senators team photo"):
+            ident = identity_of(title)
+            self.assertFalse(ident.is_specific(e.identity_floor),
+                             f"should be too vague to bid on: {title}")
+        listing = Listing(site="ebay", title="1933 ACEO Sketch Card Babe Ruth",
+                          url="https://www.ebay.com/itm/1", current_price=10.0,
+                          listing_id="1", query="Babe Ruth 1933")
+        e.evaluate(listing, [])
+        self.assertEqual(asked, [],
+                         "a browse-only row must not cost a paid lookup")
+
+    def test_comps_far_below_the_floor_skip_the_lookup(self):
+        """91% of valued rows died at the fair-value floor in the 11:54 run,
+        most after paying for a guide call. When identity-matched comps
+        already put a row far below its floor, the guide cannot rescue it."""
+        from valuation import ValuationEngine
+        tmp = tempfile.mkdtemp()
+        e = ValuationEngine({
+            "_config_dir": tmp,
+            "database": {"file": os.path.join(tmp, "h.db")},
+            "filters": {"min_value": 1000},
+            "algorithm": {"min_specific_comps": 3}})
+        asked = []
+        e.guide.quote = lambda ident: asked.append(ident) or None
+        listing = Listing(
+            site="ebay", title="1952 Topps #311 Mickey Mantle PSA 5",
+            url="https://www.ebay.com/itm/9", current_price=40.0,
+            listing_id="9", query="Mickey Mantle 1952")
+        comps = [SoldComp(f"1952 Topps #311 Mickey Mantle PSA 5 sale {i}",
+                          80.0 + i) for i in range(5)]
+        e.evaluate(listing, comps)
+        self.assertEqual(asked, [],
+                         "$80 comps against a $1,000 floor cannot be rescued")
+
+    def test_a_cheap_listing_with_NO_comps_still_gets_priced(self):
+        """The skip must never blind us to the actual hunt: a $20 listing
+        with no comp evidence is exactly the case the guide exists for."""
+        from valuation import ValuationEngine
+        from valuation.price_guide import GuideQuote
+        tmp = tempfile.mkdtemp()
+        e = ValuationEngine({
+            "_config_dir": tmp,
+            "database": {"file": os.path.join(tmp, "h.db")},
+            "filters": {"min_value": 1000},
+            "algorithm": {"min_specific_comps": 3}})
+        asked = []
+        e.guide.quote = lambda ident: (asked.append(ident)
+                                       or GuideQuote(note="x"))
+        listing = Listing(
+            site="ebay", title="1952 Topps #311 Mickey Mantle PSA 5",
+            url="https://www.ebay.com/itm/10", current_price=20.0,
+            listing_id="10", query="Mickey Mantle 1952")
+        e.evaluate(listing, [])
+        self.assertEqual(len(asked), 1)
+
+    def test_a_grail_is_always_priced(self):
+        from valuation import ValuationEngine
+        from valuation.price_guide import GuideQuote
+        tmp = tempfile.mkdtemp()
+        e = ValuationEngine({
+            "_config_dir": tmp,
+            "database": {"file": os.path.join(tmp, "h.db")},
+            "filters": {"min_value": 1000},
+            "algorithm": {"min_specific_comps": 3}})
+        asked = []
+        e.guide.quote = lambda ident: (asked.append(ident)
+                                       or GuideQuote(note="x"))
+        listing = Listing(
+            site="ebay", title="1952 Topps #311 Mickey Mantle PSA 5",
+            url="https://www.ebay.com/itm/11", current_price=40.0,
+            listing_id="11", query="Mickey Mantle 1952", grail=True)
+        comps = [SoldComp(f"1952 Topps #311 Mickey Mantle PSA 5 s{i}", 80.0)
+                 for i in range(5)]
+        e.evaluate(listing, comps)
+        self.assertEqual(len(asked), 1, "grails are priced regardless of cost")
+
+    def test_a_specific_identity_still_gets_a_lookup(self):
+        from valuation import ValuationEngine
+        tmp = tempfile.mkdtemp()
+        e = ValuationEngine({"_config_dir": tmp,
+                             "database": {"file": os.path.join(tmp, "h.db")},
+                             "algorithm": {}})
+        asked = []
+        from valuation.price_guide import GuideQuote
+        e.guide.quote = lambda ident: (asked.append(ident)
+                                       or GuideQuote(note="x"))
+        listing = Listing(
+            site="ebay", title="1933 Goudey #149 Babe Ruth PSA 4",
+            url="https://www.ebay.com/itm/2", current_price=9000.0,
+            listing_id="2", query="Babe Ruth 1933")
+        e.evaluate(listing, [])
+        self.assertEqual(len(asked), 1)
+
+
+class TestParallelFalsePositives(unittest.TestCase):
+    """A bare colour is not a parallel. On 2026-07-26 a live sweep turned
+    'Tiger Woods Red Tiger' into the parallel 'red tiger' and paid for it."""
+
+    def test_tiger_woods_has_no_parallel(self):
+        from valuation.identity import identity_of, parallel_of
+        self.assertIsNone(parallel_of("2001 Tiger Woods Red Tiger Golf"))
+        self.assertIsNone(identity_of("2001 Upper Deck Tiger Woods #1").parallel)
+
+    def test_a_colour_needs_a_finish_or_a_serial(self):
+        from valuation.identity import parallel_of
+        self.assertIsNone(parallel_of("1952 Topps Mickey Mantle red back"))
+        self.assertEqual(parallel_of("Pink Refractor"), "pink refractor")
+        self.assertEqual(parallel_of("Black #/10"), "black")
+
+    def test_real_disney_parallels_still_resolve(self):
+        from valuation.identity import identity_of
+        fps = {identity_of(t).fingerprint() for t in DISNEY_TITLES}
+        self.assertEqual(len(fps), len(DISNEY_TITLES))
+
+    def test_ambiguous_finish_words_are_not_parallels(self):
+        from valuation.identity import parallel_of
+        for text in ("Sega Genesis Sonic", "The Flash #1 comic",
+                     "Detroit Tigers team card", "Aurora borealis print"):
+            self.assertIsNone(parallel_of(text), text)
+
+
+class TestCandidateScoringFromLiveData(unittest.TestCase):
+    """Fixtures are real /api/products responses observed on 2026-07-26.
+    The first probe run landed only 1 of 9 titles, and the cached payloads
+    showed PriceCharting HAD the right product every time - we were scoring
+    it below a sibling."""
+
+    def _ident(self, title):
+        from valuation.identity import identity_of
+        return identity_of(title)
+
+    def test_colour_beats_finish_when_ranking_parallels(self):
+        # "Pink Refractor" must prefer [Pink] over the generic [Refractor]:
+        # nearly every card in the set is some kind of refractor.
+        i = self._ident("2023 Topps Chrome Disney 100 Cinderella Pink "
+                        "Refractor #/399 PSA 10")
+        pink = i.score_candidate("Cinderella [Pink] #45",
+                                 "2023 Topps Chrome Disney 100")
+        refr = i.score_candidate("Cinderella [Refractor] #45",
+                                 "2023 Topps Chrome Disney 100")
+        other = i.score_candidate("Tinker Bell [Pink] #8",
+                                  "2023 Topps Chrome Disney 100")
+        self.assertGreater(pink, other, "wrong character must rank lower")
+        self.assertGreater(pink, 0.5)
+        self.assertGreater(refr, 0.5)
+
+    def test_word_order_and_extra_finish_words_still_match(self):
+        # Listing says "Orange Wave Refractor"; catalogue says "[Orange Wave]"
+        i = self._ident("2023 Topps Chrome Disney 100 Zurg Orange Wave "
+                        "Refractor #/25 PSA 10")
+        right = i.score_candidate("Zurg [Orange Wave] #28",
+                                  "2023 Topps Chrome Disney 100")
+        self.assertGreaterEqual(right, 0.62, "equality scoring gave this 22%")
+        wrong_colour = i.score_candidate("Zurg [Blue Wave] #28",
+                                         "2023 Topps Chrome Disney 100")
+        self.assertGreater(right, wrong_colour)
+
+    def test_set_membership_outvotes_a_better_card_name(self):
+        i = self._ident("1999 Pokemon Base Set 1st Edition Charizard #4 "
+                        "Holo PSA 8.5")
+        base = i.score_candidate("Charizard #4", "Pokemon Base Set")
+        foreign = i.score_candidate("Charizard [Holo] #4",
+                                    "Pokemon Chinese CSM2cC")
+        self.assertGreater(
+            base, foreign - 0.25,
+            "a card from the RIGHT set must not be buried by one from the "
+            "wrong set that happens to match the words better")
+
+    def test_ambiguous_candidates_are_refused_not_guessed(self):
+        from valuation.price_guide import PriceGuide
+        tmp = tempfile.mkdtemp()
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        # Base Set vs Base Set 2 are genuinely different sets with different
+        # money, and nothing in the listing title tells them apart.
+        payload = {"status": "success", "products": [
+            {"id": "1", "product-name": "Charizard [1st Edition] #4",
+             "console-name": "Pokemon Base Set"},
+            {"id": "2", "product-name": "Charizard [1st Edition] #4",
+             "console-name": "Pokemon Base Set 2"},
+        ]}
+        g._pc_call = lambda path, params, host=None: (
+            payload if path == "products"
+            else {"status": "success", "loose-price": 100000})
+        q = g.quote(self._ident("1999 Pokemon Base Set 1st Edition "
+                                "Charizard #4 Holo PSA 8.5"))
+        self.assertFalse(q.landed, "a near-tie is not an identification")
+        self.assertIsNone(q.value)
+        self.assertIn("ambiguous", q.note)
+
+    def test_a_clear_winner_still_lands(self):
+        from valuation.price_guide import PriceGuide
+        tmp = tempfile.mkdtemp()
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        payload = {"status": "success", "products": [
+            {"id": "1", "product-name": "Zurg [Orange Wave] #28",
+             "console-name": "2023 Topps Chrome Disney 100"},
+            {"id": "2", "product-name": "Mickey Mouse #1",
+             "console-name": "1998 Some Other Set"},
+        ]}
+        g._pc_call = lambda path, params, host=None: (
+            payload if path == "products"
+            else {"status": "success", "manual-only-price": 50000})
+        q = g.quote(self._ident("2023 Topps Chrome Disney 100 Zurg Orange "
+                                "Wave Refractor #/25 PSA 10"))
+        self.assertTrue(q.landed)
+        self.assertEqual(q.product_id, "1")
+
+    def test_a_ruled_out_runner_up_does_not_suppress_the_winner(self):
+        """A 1st Edition listing ranked the 1st Edition product first at 95%
+        with the unlimited printing 5% behind. That is discrimination, not
+        ambiguity - the margin gate must not treat it as a tie."""
+        from valuation.price_guide import PriceGuide
+        tmp = tempfile.mkdtemp()
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        payload = {"status": "success", "products": [
+            {"id": "1", "product-name": "Charizard [1st Edition] #4",
+             "console-name": "Pokemon Base Set"},
+            {"id": "2", "product-name": "Charizard #4",
+             "console-name": "Pokemon Base Set"},
+        ]}
+        g._pc_call = lambda path, params, host=None: (
+            payload if path == "products"
+            else {"status": "success", "new-price": 2500000})
+        q = g.quote(self._ident("1999 Pokemon Base Set 1st Edition "
+                                "Charizard #4 Holo PSA 8"))
+        self.assertTrue(q.landed, "we stated 1st Edition and matched it")
+        self.assertEqual(q.product_id, "1")
+
+    def test_discriminates_only_on_fields_we_actually_stated(self):
+        from valuation.identity import identity_of
+        listing = identity_of("1999 Pokemon Base Set 1st Edition Charizard #4")
+        first = identity_of("Charizard [1st Edition] #4 Pokemon Base Set")
+        unlim = identity_of("Charizard #4 Pokemon Base Set")
+        self.assertTrue(listing.discriminates(first, unlim))
+        # A listing that never says which edition cannot rule either out.
+        silent = identity_of("Pokemon Base Set Charizard #4")
+        self.assertFalse(silent.discriminates(first, unlim))
+
+    def test_foreign_printings_are_pushed_down(self):
+        i = self._ident("1999 Pokemon Base Set 1st Edition Charizard #4 Holo")
+        english = i.score_candidate("Charizard [1st Edition] #4",
+                                    "Pokemon Base Set")
+        korean = i.score_candidate("Charizard [1st Edition] #4",
+                                   "Pokemon Korean Base Set")
+        self.assertGreater(english, korean + 0.15)
+
+    def test_every_returned_candidate_is_scored(self):
+        """PriceCharting documents 20 results but returns up to 100. Slicing
+        to 20 before scoring discarded correct products unseen."""
+        from valuation.price_guide import candidates_of
+        payload = {"products": [{"id": str(n)} for n in range(100)]}
+        self.assertEqual(len(candidates_of(payload)), 100)
+
+    def test_a_bracketed_parallel_needs_no_corroboration(self):
+        """PriceCharting declares the parallel in brackets: `Cinderella
+        [Pink] #45`. A bare colour in an eBay title needs a finish word or a
+        print run to count, but inside brackets the declaration IS the
+        corroboration. Without this, [Pink] parsed to no parallel at all and
+        the generic [Refractor] outranked it 57% to 54%."""
+        from valuation.identity import catalogue_parallel
+        self.assertEqual(catalogue_parallel("Cinderella [Pink] #45"), "pink")
+        self.assertEqual(catalogue_parallel("Zurg [Orange Wave] #28"),
+                         "orange wave")
+        self.assertIsNone(catalogue_parallel("Charizard #4"))
+
+    def test_the_declared_colour_wins_over_a_generic_finish(self):
+        i = self._ident("2023 Topps Chrome Disney 100 Cinderella Pink "
+                        "Refractor #/399 PSA 10")
+        console = "2023 Topps Chrome Disney 100"
+        pink = i.score_candidate("Cinderella [Pink] #45", console)
+        refr = i.score_candidate("Cinderella [Refractor] #45", console)
+        other_char = i.score_candidate("Tinker Bell [Pink] #8", console)
+        self.assertGreater(pink, refr)
+        self.assertGreater(pink, other_char)
+
+    def test_naming_the_character_discriminates(self):
+        from valuation.identity import identity_of
+        listing = identity_of("2023 Topps Chrome Disney 100 Cinderella Pink "
+                              "Refractor #/399 PSA 10")
+        won = identity_of("Cinderella [Pink] #45 2023 Topps Chrome Disney 100")
+        lost = identity_of("Tinker Bell [Pink] #8 2023 Topps Chrome Disney 100")
+        self.assertTrue(listing.discriminates(won, lost))
+
+    def test_a_matched_product_with_no_price_says_so(self):
+        """Identified the card but PriceCharting publishes nothing at that
+        grade. That is not the same as picking the wrong product, and the
+        note has to distinguish them."""
+        from valuation.price_guide import PriceGuide
+        tmp = tempfile.mkdtemp()
+        g = PriceGuide({"_config_dir": tmp,
+                        "database": {"file": os.path.join(tmp, "h.db")},
+                        "api_keys": {"pricecharting": {"token": "t"}}})
+        g._pc_call = lambda path, params, host=None: (
+            {"status": "success", "products": [
+                {"id": "1", "product-name": "Zurg [Orange Wave] #28",
+                 "console-name": "2023 Topps Chrome Disney 100"}]}
+            if path == "products"
+            else {"status": "success", "product-name": "Zurg [Orange Wave] #28",
+                  "console-name": "2023 Topps Chrome Disney 100"})
+        q = g.quote(self._ident("2023 Topps Chrome Disney 100 Zurg Orange "
+                                "Wave Refractor #/25 PSA 10"))
+        self.assertFalse(q.landed)
+        self.assertIsNone(q.value)
+        self.assertIn("no price at this grade", q.note)
+        self.assertIsNotNone(q.product_id, "we DID identify the card")
+
+    def test_set_tokens_are_extracted_for_the_console_field(self):
+        from valuation.identity import set_tokens_of
+        self.assertIn("bowman", set_tokens_of("1948 Bowman #69 George Mikan"))
+        self.assertIn("chrome", set_tokens_of("2023 Topps Chrome Disney 100"))
+        self.assertIn("base", set_tokens_of("Pokemon Base Set Charizard"))
+
+class TestTradeBlotter(unittest.TestCase):
+    def _opportunity(self, listing_id="123456789012") -> Opportunity:
+        listing = Listing(
+            site="ebay", title="1986 Fleer Michael Jordan #57 PSA 8",
+            url=f"https://www.ebay.com/itm/{listing_id}",
+            listing_id=listing_id, current_price=1000, shipping=15,
+            query="1986 Fleer Michael Jordan #57 PSA 8",
+            matched_queries=[
+                "1986 Fleer Michael Jordan #57 PSA 8",
+                "1986 Fleer Michael Jordan PSA 8"],
+            category="Sports Cards", listing_type="auction",
+            priority=True,
+            end_time=datetime.now(timezone.utc) + timedelta(hours=4))
+        valuation = Valuation(
+            fair_value=2000, n_comps=8, confidence=0.8,
+            expected_cost=1200, expected_value=535, edge_now=720,
+            roi=0.45, capture=0.8, opportunity_score=0.36,
+            resale_channel="ebay", net_proceeds=1735)
+        return Opportunity(listing, valuation)
+
+    def _config(self, tmp):
+        return {
+            "_config_dir": tmp,
+            "trade_blotter": {
+                "enabled": True,
+                "file": "trade_blotter/trade_blotter.csv",
+                "auto_capture_top_n": 50,
+            },
+            "algorithm": {
+                "sales_tax_rate": 0.08,
+                "psa_vault": {
+                    "enabled": True, "min_price": 500,
+                    "sell_fee_rate": 0.07,
+                },
+            },
+            "output": {"today": {"max_bid_target_roi": 0.15}},
+        }
+
+    def test_sync_adds_once_and_preserves_user_fields(self):
+        import csv
+        import trade_blotter
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp)
+            rows = trade_blotter.sync(
+                [self._opportunity()], config)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "Discovered")
+            path = os.path.join(
+                tmp, "trade_blotter", "trade_blotter.csv")
+            with open(path, newline="", encoding="utf-8") as handle:
+                stored = list(csv.DictReader(handle))
+            stored[0]["status"] = "Bid/Offer Placed"
+            stored[0]["planned_bid_or_offer"] = "1300"
+            stored[0]["notes"] = "verify the cert"
+            trade_blotter.write_rows(path, stored)
+
+            refreshed = trade_blotter.sync(
+                [self._opportunity()], config)
+            self.assertEqual(len(refreshed), 1)
+            self.assertEqual(
+                refreshed[0]["status"], "Bid/Offer Placed")
+            self.assertEqual(
+                refreshed[0]["planned_bid_or_offer"], "1300")
+            self.assertEqual(refreshed[0]["notes"], "verify the cert")
+
+    def test_realized_pnl_is_derived_from_actual_cash_flows(self):
+        import trade_blotter
+        row = {field: "" for field in trade_blotter.FIELDS}
+        row.update({
+            "actual_purchase_price": "1000",
+            "buyer_fees_paid": "200",
+            "shipping_paid": "25",
+            "tax_paid": "0",
+            "sale_proceeds": "1500",
+            "date_won": "2026-07-01",
+            "date_sold": "2026-07-21",
+        })
+        trade_blotter.derive(row)
+        self.assertEqual(row["actual_landed_cost"], "1225.00")
+        self.assertEqual(row["realized_profit"], "275.00")
+        self.assertEqual(row["realized_roi"], "0.224490")
+        self.assertEqual(row["holding_days"], "20")
+
+    def test_report_contains_blotter_snapshot(self):
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "blotter.xlsx")
+            report_mod.write_report(
+                [], path, config={}, trade_blotter=[{
+                    "status": "Watching", "verified": "yes",
+                    "site": "ebay", "listing_type": "auction",
+                    "title": "Jordan PSA 8", "query": "Jordan",
+                    "current_price": "1000", "fair_value": "2000",
+                    "edge_now": "700", "roi": "0.4",
+                }])
+            workbook = load_workbook(path, read_only=True)
+            self.assertIn("Trade Blotter", workbook.sheetnames)
+            self.assertEqual(
+                workbook["Trade Blotter"]["A2"].value, "Watching")
+            workbook.close()
+
+
+class TestSourceOnboarding(unittest.TestCase):
+    def _manifest(self, tmp, *, manifest_id="example_house",
+                  enabled=True):
+        os.makedirs(os.path.join(tmp, "source_manifests"), exist_ok=True)
+        path = os.path.join(
+            tmp, "source_manifests", f"{manifest_id}.yaml")
+        data = {
+            "id": manifest_id,
+            "display_name": "Example House",
+            "enabled": enabled,
+            "capabilities": ["auctions", "fixed"],
+            "access": {"feed_file": "imports/example.csv"},
+            "field_map": {
+                "listing_id": "lot_id",
+                "title": "description",
+                "url": "link",
+                "current_price": "hammer",
+                "listing_type": "sale_type",
+            },
+            "economics": {
+                "buyer_fee_rate": 0.20,
+                "shipping": 12,
+            },
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(data, handle, sort_keys=False)
+        return path
+
+    def test_valid_manifest_auto_registers_enabled_source(self):
+        import source_registry
+        with tempfile.TemporaryDirectory() as tmp:
+            self._manifest(tmp)
+            config = {"_config_dir": tmp, "scraping": {}, "api_keys": {}}
+            manifests = source_registry.load_manifests(config)
+            self.assertEqual([m.source_id for m in manifests],
+                             ["example_house"])
+            registry = source_registry.scraper_registry(config)
+            self.assertIn("example_house", registry)
+            self.assertIn(
+                "example_house",
+                source_registry.enabled_source_ids(config))
+            from source_health import (_configured_sources,
+                                       _endpoint_matches)
+            health = _configured_sources(config)
+            self.assertTrue(health["example_house/listings"][0])
+            self.assertTrue(_endpoint_matches(
+                "example_house/listings", "example_house/feed"))
+
+    def test_manifest_rejects_embedded_secrets(self):
+        import source_registry
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._manifest(tmp)
+            with open(path, encoding="utf-8") as handle:
+                data = yaml.safe_load(handle)
+            data["access"]["api_key"] = "do-not-store-this"
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(data, handle)
+            with self.assertRaises(source_registry.ManifestError):
+                source_registry.validate_manifest_file(path)
+
+    def test_csv_field_mapping_produces_normalized_listing(self):
+        import source_registry
+        with tempfile.TemporaryDirectory() as tmp:
+            self._manifest(tmp)
+            os.makedirs(os.path.join(tmp, "imports"), exist_ok=True)
+            feed = os.path.join(tmp, "imports", "example.csv")
+            with open(feed, "w", encoding="utf-8", newline="") as handle:
+                handle.write(
+                    "lot_id,description,link,hammer,sale_type,status\n"
+                    "lot-7,1986 Fleer Michael Jordan PSA 8,"
+                    "https://example.test/lot-7,1000,auction,live\n")
+            config = {"_config_dir": tmp, "scraping": {}, "api_keys": {}}
+            factory = source_registry.scraper_registry(config)[
+                "example_house"]
+            scraper = factory(config)
+            with mock.patch.object(scraper, "_get") as get:
+                rows = scraper.search_auctions(
+                    "Michael Jordan PSA 8", 10)
+            get.assert_not_called()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].listing_id, "lot-7")
+            self.assertEqual(rows[0].buyer_fee_rate, 0.20)
+            self.assertEqual(rows[0].shipping, 12)
 
 
 if __name__ == "__main__":
