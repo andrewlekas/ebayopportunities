@@ -94,6 +94,11 @@ class GuideCsvIndex:
         return self
 
     def _load_file(self, path: str) -> None:
+        basename = os.path.basename(path)
+        guide_host = ("sportscardspro" if basename.casefold().startswith(
+            "sportscardspro--") else
+            "pricecharting" if basename.casefold().startswith(
+                "pricecharting--") else "")
         with open(path, newline="", encoding="utf-8-sig") as fh:
             reader = csv.DictReader(fh)
             if not reader.fieldnames or not all(
@@ -111,7 +116,8 @@ class GuideCsvIndex:
                 if not name:
                     continue
                 row = {"product-name": name,
-                       "console-name": (raw.get("console-name") or "").strip()}
+                       "console-name": (raw.get("console-name") or "").strip(),
+                       "_guide-host": guide_host}
                 for key in CARRY:
                     val = raw.get(key)
                     if val in (None, ""):

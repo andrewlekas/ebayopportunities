@@ -14,6 +14,7 @@ NOTE_BLOCKERS = (
     ("ASK-BASED", "ask-based valuation"),
     ("MIXED POOL", "mixed comp pool"),
     ("SUSPICIOUS", "suspicious listing"),
+    ("BELOW DECISION FLOOR", "below decision value floor"),
     # 2026-07-26: a value built on a set-level pool is browsing information,
     # never a bid target - however confident its sources look. Eight Disney
     # parallels once shared one $1,069.60 with 84% comps/guide "agreement",

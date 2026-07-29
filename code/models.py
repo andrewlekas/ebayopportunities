@@ -29,6 +29,19 @@ class Listing:
     matched_queries: list[str] = field(default_factory=list)
     priority: bool = False        # from watchlist entry's priority flag
     discovery: bool = False       # broad theme query: browse, don't trust EV
+    # A high-specificity row found by a broad discovery query may be promoted
+    # after exact guide/sold evidence resolves the physical card. Keep the
+    # provenance separate from ``discovery`` so reports can explain why the
+    # row became decision-eligible.
+    promoted_from_discovery: bool = False
+    # Structured targets are generated from year/set/player/number/grade
+    # fields rather than a hand-written phrase. Their returned listings are
+    # held to the expected identity before valuation.
+    structured_target: bool = False
+    # Personal set-needs are searched like priority watchlist entries but may
+    # override the ordinary category fair-value floor.
+    set_need: bool = False
+    value_floor_override: Optional[float] = None
     misspell_from: str = ""       # typo'd search that surfaced this listing
     listing_type: str = "auction"  # "auction" or "fixed" (BIN)
     best_offer: bool = False

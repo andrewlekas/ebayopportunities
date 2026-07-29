@@ -340,8 +340,15 @@ def years_in(text: str) -> set[str]:
     folded = fold(text)
     found = set(YEAR_RE.findall(folded))
     for m in re.finditer(r"\b(1[89]\d{2}|20\d{2})\s*[-/]\s*(\d{2})\b", folded):
-        century = m.group(1)[:2]
-        found.add(century + m.group(2))
+        start = int(m.group(1))
+        suffix = int(m.group(2))
+        # Sports seasons cross centuries: 1999-00 means 1999 and 2000, not
+        # 1900. Build the end year in the start year's century, then roll it
+        # forward when the suffix wrapped.
+        end = (start // 100) * 100 + suffix
+        if end < start:
+            end += 100
+        found.add(str(end))
     return found
 
 
@@ -360,9 +367,20 @@ def year_conflict(query: str, title: str) -> bool:
 
 def card_number(text: str) -> str | None:
     """The card's number within its set, or None."""
-    m = CARD_NUMBER_RE.search(fold(text))
+    folded = fold(text)
+    m = CARD_NUMBER_RE.search(folded)
     if not m:
         return None
+    # ``4/102`` is a Pokemon set position; ``17/75`` on a sports card is the
+    # copy's serial stamp. The old generic slash rule treated both as card
+    # numbers, which turned Exquisite serials into fictitious #17/#5 cards.
+    if m.group(3):
+        tcg_context = re.search(
+            r"\b(pokemon|charizard|pikachu|blastoise|venusaur|holo|"
+            r"carddass|topsun|base\s+set|jungle|fossil|rocket)\b",
+            folded, re.I)
+        if not tcg_context:
+            return None
     num = next((g for g in m.groups() if g), None)
     if num is None:
         return None

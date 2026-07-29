@@ -99,6 +99,8 @@ class ValuationEngine:
         # value may become a bid target. Below this the row is browse-only,
         # however confident the underlying sources look.
         self.identity_floor = algo.get("identity_specificity_floor", 0.70)
+        self.discovery_promotion_floor = algo.get(
+            "discovery_promotion_specificity_floor", 0.80)
         # Comps older than this stop counting as current market and start
         # discounting confidence. The 2026-07-26 run priced live auctions
         # off 144-hour-old pools while printing 56.7% confidence.
@@ -116,8 +118,11 @@ class ValuationEngine:
         # that spend bought nothing. These two gates skip the call when the
         # answer cannot change the outcome.
         flt = config.get("filters", {})
-        self.value_floor = flt.get("min_value", 0) or 0
-        self.value_floor_by_cat = flt.get("min_value_by_category") or {}
+        self.value_floor = flt.get(
+            "browse_min_value", flt.get("min_value", 0)) or 0
+        self.value_floor_by_cat = (
+            flt.get("browse_min_value_by_category")
+            or flt.get("min_value_by_category") or {})
         self.poke_grade_floor = flt.get("pokemon_grade_floor", 3.0)
         # Skip the guide when identity-matched comps already put the row
         # this far below its category floor. Deliberately generous: at 50%
@@ -152,6 +157,9 @@ class ValuationEngine:
         self.guide = PriceGuide(config)
 
     def _floor_for(self, listing: Listing) -> float:
+        if (listing is not None
+                and listing.value_floor_override is not None):
+            return float(listing.value_floor_override)
         cat = getattr(listing, "category", None)
         return float(self.value_floor_by_cat.get(cat, self.value_floor) or 0)
 
@@ -160,6 +168,9 @@ class ValuationEngine:
         """Would a guide lookup change what happens to this row?"""
         if listing is not None and getattr(listing, "grail", False):
             return True, ""          # grails are priced regardless of cost
+        if ident.object_class not in {"card", "game", "comic"}:
+            return False, (
+                f"{ident.object_class} is not covered by the static/card guide")
         if not ident.is_specific(self.identity_floor):
             return False, (f"identity only {ident.specificity():.0%} specific "
                            "- browse-only whatever the guide says")
@@ -320,7 +331,12 @@ class ValuationEngine:
         # never have landed a product.
         worth, why_not = self._guide_worth_calling(ident, listing, cv, n)
         if worth:
-            quote = self.guide.quote(ident)
+            category = getattr(listing, "category", None)
+            # Test doubles and older integrations expose quote(identity)
+            # only. Production listings always carry a category; empty legacy
+            # listings retain the original one-argument call contract.
+            quote = (self.guide.quote(ident, category=category)
+                     if category else self.guide.quote(ident))
         else:
             from .price_guide import GuideQuote
             quote = GuideQuote(note=f"guide not consulted - {why_not}")
@@ -418,7 +434,9 @@ class ValuationEngine:
                 "IDENTITY UNRESOLVED: this listing does not name one specific "
                 f"card ({v.identity_specificity:.0%} specific) - browsing "
                 "value only, NOT a bid target")
-        elif not quote.landed:
+        elif (not quote.landed
+              and not (targeted and not broad_fallback
+                       and n >= self.min_specific_comps)):
             v.notes.append(
                 "IDENTITY UNRESOLVED: no PriceCharting product matched this "
                 f"exact card (best {quote.score:.0%}) - browsing value only, "
@@ -873,9 +891,21 @@ class ValuationEngine:
         Broad searches remain useful for discovery, but they must not supply
         the final price.  Once a live listing exposes the card number and
         grade, this query fetches a separate sold pool for that identity.
-        Discovery-only rows deliberately stay broad.
+        A high-specificity discovery row is promoted into an exact evidence
+        request; lower-specificity discovery rows deliberately stay broad.
         """
-        if listing.discovery or card_number(listing.title) is None:
+        ident = identity_of(listing.title or "")
+        if listing.discovery:
+            if not (ident.object_class == "card"
+                    and ident.number
+                    and ident.grade is not None
+                    and ident.specificity() >= self.discovery_promotion_floor):
+                return None
+            query = ident.guide_query()
+            if ident.grader and ident.printed_grade is not None:
+                query += f" {ident.grader.upper()} {ident.printed_grade:g}"
+            return query.strip() or None
+        if card_number(listing.title) is None:
             return None
         specific = self._valuation_query(listing)
         if specific is None:
@@ -901,7 +931,26 @@ class ValuationEngine:
                                     listing=listing)
             if v.fair_value > 0 or v.notes:
                 if listing.discovery:
-                    v.notes.append("discovery query - browsing only")
+                    blockers = " | ".join(v.notes).upper()
+                    promoted = (
+                        targeted
+                        and v.fair_value > 0
+                        and v.identity_specificity
+                        >= self.discovery_promotion_floor
+                        and (v.identity_match in (MATCH_EXACT, MATCH_STRONG)
+                             or v.n_comps >= self.min_specific_comps)
+                        and not v.disputed
+                        and not any(marker in blockers for marker in (
+                            "ASK-BASED", "MIXED POOL", "IDENTITY UNRESOLVED",
+                            "SUSPICIOUS")))
+                    if promoted:
+                        listing.discovery = False
+                        listing.promoted_from_discovery = True
+                        v.notes.append(
+                            "PROMOTED FROM DISCOVERY: exact identity evidence "
+                            "resolved this card")
+                    else:
+                        v.notes.append("discovery query - browsing only")
                 return Opportunity(listing=listing,
                                    valuation=self.score(listing, v))
 

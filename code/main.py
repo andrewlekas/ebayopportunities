@@ -28,6 +28,7 @@ from quality import (evidence_rejection, is_tradeable,
                      tradeability_rejection)
 from report import write_report
 from source_registry import enabled_source_ids, scraper_registry
+from targets import configured_scan_entries, structured_target_mismatch
 from valuation import ValuationEngine
 from report import _category
 import valuation.comps as comps_mod
@@ -115,6 +116,8 @@ def _query_context_rank(listing: Listing) -> tuple:
     except Exception:
         match = 0.0
     return (
+        0 if listing.set_need else 1,
+        0 if listing.structured_target else 1,
         1 if listing.discovery else 0,
         0 if listing.priority else 1,
         -match,
@@ -157,6 +160,17 @@ def _dedupe_prepared(prepared: list[tuple]) -> tuple[list[tuple], int]:
                               for _i, candidate in candidates)
         winner.discovery = all(candidate.discovery
                                for _i, candidate in candidates)
+        winner.promoted_from_discovery = any(
+            candidate.promoted_from_discovery for _i, candidate in candidates)
+        winner.structured_target = any(
+            candidate.structured_target for _i, candidate in candidates)
+        winner.set_need = any(candidate.set_need
+                              for _i, candidate in candidates)
+        overrides = [
+            candidate.value_floor_override for _i, candidate in candidates
+            if candidate.value_floor_override is not None]
+        if overrides:
+            winner.value_floor_override = min(overrides)
         grails = [
             candidate for _i, candidate in candidates if candidate.grail]
         if grails:
@@ -424,7 +438,7 @@ def collection_ok(o, config: dict, drops=None) -> bool:
     if l.grail:
         return True
     flt = config.get("filters", {}) or {}
-    cat = _category(l.query)
+    cat = l.category or _category(l.query, l.title)
 
     if cat == "Pokemon Cards" and flt.get("pokemon_eras_only", True):
         markers = [str(m).lower() for m in
@@ -523,7 +537,8 @@ def output_ok(o, *, min_ev: float = 0.0, poke_floor: float = 3.0,
             return True
         gi = grade_info(l.title)
         if (gi and float(gi[2]) <= poke_floor
-                and _category(l.query) == "Pokemon Cards"):
+                and (l.category or _category(l.query, l.title))
+                == "Pokemon Cards"):
             return _drop("graded Pokemon at or below PSA %g" % poke_floor)
         if v.expected_value < min_ev:
             return _drop("expected value < $%g" % min_ev)
@@ -592,7 +607,7 @@ def plan_targeted_comp_queries(listings: list, engine: ValuationEngine,
         return []
     candidates: dict[str, tuple] = {}
     for listing in listings:
-        if (_category(listing.query)
+        if ((listing.category or _category(listing.query, listing.title))
                 not in {"Pokemon Cards", "Sports Cards"}):
             continue
         query = engine.targeted_comp_query(listing)
@@ -655,7 +670,7 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
             use_html = True
             log.info("eBay sold-page fetching auto-resumed (cooldown over)")
 
-    entries = config.get("watchlist", [])
+    entries = configured_scan_entries(config)
     if mode == "bin" and config.get("bin", {}).get("priority_only", True):
         entries = [e for e in entries
                    if e.get("priority") or GRADE_RE.search(e["query"])]
@@ -761,6 +776,9 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
         listing.site
         for _, _, _, listings in results
         for listing in listings)
+    raw_by_query: collections.Counter = collections.Counter()
+    for entry, _cached, _fetched, listings in results:
+        raw_by_query[entry["query"]] += len(listings)
     raw_count = sum(raw_by_site.values())
     n_comp_junk = [0]        # list so the loop below can accumulate into it
     t_val = time.monotonic()
@@ -806,6 +824,13 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
             if _excluded(listing.title, exclude):
                 relevance_skips["excluded keyword"] += 1
                 continue
+            if entry.get("structured_target"):
+                mismatch = structured_target_mismatch(
+                    str(entry.get("target_identity") or query), listing.title)
+                if mismatch:
+                    relevance_skips[
+                        f"structured target mismatch: {mismatch}"] += 1
+                    continue
             # relevance guard: wrong grade or barely-matching title = out
             # (Japanese titles can't fuzzy-match English; they're exempt
             # and handled by the engine's JP confidence rule instead)
@@ -847,7 +872,12 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
                 continue
             listing.priority = priority
             listing.discovery = discovery
-            listing.category = _category(query)
+            listing.structured_target = bool(entry.get("structured_target"))
+            listing.set_need = bool(entry.get("set_need"))
+            if entry.get("value_floor_override") is not None:
+                listing.value_floor_override = float(
+                    entry.get("value_floor_override"))
+            listing.category = _category(query, listing.title)
             listing.resale_channel = str(
                 entry.get("resale_channel")
                 or config.get("algorithm", {}).get(
@@ -1020,14 +1050,18 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
                  "; ".join(f"{reason} x{n}"
                            for reason, n in evidence_skips.most_common()))
     relevant_count = sum(len(rows) for _, _, rows, _ in prepared)
+    relevant_by_query: collections.Counter = collections.Counter(
+        listing.query for _, _, rows, _ in prepared for _, listing in rows)
     if diagnostics is not None:
         diagnostics.update({
             "queries": len(plans),
             "raw_listings": raw_count,
             "raw_by_site": dict(raw_by_site),
+            "raw_by_query": dict(raw_by_query),
             "relevance_removed": sum(relevance_skips.values()),
             "relevance_reasons": dict(relevance_skips),
             "relevant_listings": relevant_count,
+            "relevant_by_query": dict(relevant_by_query),
             "valued_listings": len(opps),
             "evidence_quarantined": sum(evidence_skips.values()),
             "evidence_reasons": dict(evidence_skips),
@@ -1094,8 +1128,14 @@ def classify_report_rows(opps: list[Opportunity], config: dict
     """
     import collections
 
-    min_value = config.get("filters", {}).get("min_value", 0)
-    by_cat = config.get("filters", {}).get("min_value_by_category") or {}
+    filter_cfg = config.get("filters", {}) or {}
+    legacy_min = filter_cfg.get("min_value", 0)
+    browse_min = filter_cfg.get("browse_min_value", legacy_min)
+    decision_min = filter_cfg.get("decision_min_value", legacy_min)
+    browse_by_cat = (filter_cfg.get("browse_min_value_by_category")
+                     or filter_cfg.get("min_value_by_category") or {})
+    decision_by_cat = (filter_cfg.get("decision_min_value_by_category")
+                       or filter_cfg.get("min_value_by_category") or {})
     # The ROI ceiling catches nonsense (a $2 comp pool against a $2,000
     # listing). Its right value depends on what ROI MEANS, which changed on
     # 2026-07-26: under projected pricing a live $200 bid on a $1,000 card
@@ -1128,15 +1168,23 @@ def classify_report_rows(opps: list[Opportunity], config: dict
         })
 
     for o in opps:
-        floor = max(
-            by_cat.get(_category(o.listing.query), min_value), 0.01)
-        if o.valuation.fair_value < floor:
+        category = (o.listing.category or
+                    _category(o.listing.query, o.listing.title))
+        override = o.listing.value_floor_override
+        browse_floor = (float(override) if override is not None else
+                        float(browse_by_cat.get(category, browse_min) or 0))
+        decision_floor = (float(override) if override is not None else
+                          float(decision_by_cat.get(
+                              category, decision_min) or 0))
+        browse_floor = max(browse_floor, 0.01)
+        decision_floor = max(decision_floor, 0.01)
+        if o.valuation.fair_value < browse_floor:
             reject(
                 o, "Fair-value floor",
                 "fair value $%s below %s floor $%s" % (
                     f"{o.valuation.fair_value:,.0f}",
-                    _category(o.listing.query),
-                    f"{floor:,.0f}"))
+                    category,
+                    f"{browse_floor:,.0f}"))
             continue
         if o.valuation.roi > max_roi:
             reject(
@@ -1158,6 +1206,13 @@ def classify_report_rows(opps: list[Opportunity], config: dict
             reason = next(iter(output_drops), "output rule")
             reject(o, "Output economics", reason)
             continue
+        if o.valuation.fair_value < decision_floor:
+            marker = (
+                "BELOW DECISION FLOOR: fair value "
+                f"${o.valuation.fair_value:,.0f} below {category} "
+                f"decision floor ${decision_floor:,.0f}")
+            if marker not in o.valuation.notes:
+                o.valuation.notes.append(marker)
         kept.append(o)
 
     if len(kept) > max_rows:
@@ -1193,6 +1248,92 @@ def classify_report_rows(opps: list[Opportunity], config: dict
         "stage_counts": dict(counts),
         "reason_counts": dict(reasons),
     }
+
+
+def build_sports_coverage(valued: list[Opportunity],
+                          kept: list[Opportunity],
+                          research: list[dict],
+                          diagnostics: dict) -> list[dict]:
+    """Per-query sports funnel for diagnosing missing players/cards."""
+    import collections
+    from valuation.identity import identity_of
+
+    raw = diagnostics.get("raw_by_query") or {}
+    relevant = diagnostics.get("relevant_by_query") or {}
+    valued_by: collections.Counter = collections.Counter()
+    guide_by: collections.Counter = collections.Counter()
+    comps_by: collections.Counter = collections.Counter()
+    promoted_by: collections.Counter = collections.Counter()
+    ask_by: collections.Counter = collections.Counter()
+    category_by: dict[str, str] = {}
+    for o in valued:
+        l, v = o.listing, o.valuation
+        category = l.category or _category(l.query, l.title)
+        if category not in {"Sports Cards", "Sports Memorabilia"}:
+            continue
+        query = l.query
+        category_by[query] = category
+        valued_by[query] += 1
+        if v.identity_match in {"exact", "strong"} and v.guide_value:
+            guide_by[query] += 1
+        if v.n_comps >= 3 and not any(
+                "MIXED POOL" in str(note).upper() for note in v.notes):
+            comps_by[query] += 1
+        if l.promoted_from_discovery:
+            promoted_by[query] += 1
+        if any("ASK-BASED" in str(note).upper() for note in v.notes):
+            ask_by[query] += 1
+
+    browse_by: collections.Counter = collections.Counter()
+    action_by: collections.Counter = collections.Counter()
+    for o in kept:
+        l = o.listing
+        category = l.category or _category(l.query, l.title)
+        if category not in {"Sports Cards", "Sports Memorabilia"}:
+            continue
+        category_by[l.query] = category
+        browse_by[l.query] += 1
+        if is_tradeable(o) and o.valuation.expected_value > 0:
+            action_by[l.query] += 1
+
+    rejects: dict[str, collections.Counter] = {}
+    for row in research:
+        o = row.get("opportunity")
+        if not o:
+            continue
+        l = o.listing
+        category = l.category or _category(l.query, l.title)
+        if category not in {"Sports Cards", "Sports Memorabilia"}:
+            continue
+        rejects.setdefault(l.query, collections.Counter())[
+            str(row.get("reason") or "unknown")] += 1
+
+    queries = set(category_by)
+    queries.update(
+        query for query in set(raw) | set(relevant)
+        if _category(query) in {"Sports Cards", "Sports Memorabilia"})
+    rows = []
+    for query in sorted(queries):
+        ident = identity_of(query)
+        player = " ".join(ident.subject).title() or query
+        top = rejects.get(query, collections.Counter()).most_common(1)
+        rows.append({
+            "player": player,
+            "query": query,
+            "category": category_by.get(query, _category(query)),
+            "raw": int(raw.get(query, 0)),
+            "relevant": int(relevant.get(query, 0)),
+            "valued": int(valued_by.get(query, 0)),
+            "guide_resolved": int(guide_by.get(query, 0)),
+            "exact_comps": int(comps_by.get(query, 0)),
+            "promoted": int(promoted_by.get(query, 0)),
+            "browse": int(browse_by.get(query, 0)),
+            "action": int(action_by.get(query, 0)),
+            "ask_based": int(ask_by.get(query, 0)),
+            "top_rejection": (
+                f"{top[0][0]} x{top[0][1]}" if top else ""),
+        })
+    return rows
 
 
 def main() -> int:
@@ -1361,6 +1502,8 @@ def main() -> int:
     valued_opps = list(opps)
     kept, research_rows, report_diagnostics = classify_report_rows(
         valued_opps, config)
+    sports_coverage_rows = build_sports_coverage(
+        valued_opps, kept, research_rows, scan_diagnostics)
     stage_counts = report_diagnostics["stage_counts"]
 
     raw = int(scan_diagnostics.get("raw_listings", len(valued_opps)))
@@ -1523,7 +1666,8 @@ def main() -> int:
     write_report(
         kept, out, portfolio=portfolio_rows, config=config,
         source_health=health_rows, research=research_rows,
-        filter_waterfall=waterfall_rows, trade_blotter=trade_rows)
+        filter_waterfall=waterfall_rows, trade_blotter=trade_rows,
+        sports_coverage=sports_coverage_rows)
     opps = kept
 
     if not args.demo and opps:
@@ -1543,7 +1687,8 @@ def main() -> int:
                 # 09:30-13:30 right after the too-good-to-be-true line,
                 # before the report was written).
                 watch_qs = {o.listing.query for o in opps
-                            if _category(o.listing.query) == "Watches"}
+                            if (o.listing.category or _category(
+                                o.listing.query, o.listing.title)) == "Watches"}
                 n_msg = send_digest(opps, config, watch_qs)
                 if n_msg:
                     log.info("digest: sent %d telegram message(s)", n_msg)

@@ -124,6 +124,7 @@ MEMORABILIA_RE = re.compile(
     r"\b(photo|photograph|flag|pennant|banner|poster|print|plaque|"
     r"shirt|jersey|cap|hat|glove|helmet|bat\b|ball\b|puck|club|driver|"
     r"ticket|program|magazine|cut\s*signature|display\s*case|"
+    r"lithograph|blow[-\s]*up\s*card|custom\s*framed|"
     r"tourney\s*worn|game\s*worn|match\s*worn)\b", re.I)
 
 OBJECT_CLASSES = ("watch_part", "watch", "figure", "wrapper", "pack",
@@ -151,6 +152,12 @@ def object_class(text: str) -> str:
         return "coupon"
     if PACK_RE.search(t):
         return "pack"
+    # Authentication companies also encapsulate/autograph-authenticate
+    # photos, jerseys and cuts. ``PSA/DNA signed photo`` must not become a
+    # card merely because the title contains PSA. Real jersey/relic cards
+    # retain explicit card-product vocabulary and continue below.
+    if MEMORABILIA_RE.search(t) and not CARD_ONLY_RE.search(t):
+        return "memorabilia"
     grader = (grader_of(t) or "").lower()
     if grader in CARD_GRADERS:
         # A card grader on a comic still means a comic (CGC grades both), so
@@ -259,13 +266,17 @@ def serial_of(text: str) -> int | None:
     t = text or ""
     if ONE_OF_ONE_RE.search(t):
         return 1
+    set_number = card_number(t)
     best = None
     for m in SERIAL_RE.finditer(t):
         try:
             n = int(m.group(1))
         except (TypeError, ValueError):
             continue
-        # A card number like "6/102" is a set position, not a print run.
+        # A TCG card number like "6/102" is a set position, not a print run.
+        if (set_number and re.search(
+                rf"\b{re.escape(set_number)}\s*/\s*{n}\b", t, re.I)):
+            continue
         # Print runs in this hobby are <= 5000; set sizes usually exceed the
         # numerator.  Keep the smallest plausible run.
         if 1 <= n <= 5000 and (best is None or n < best):
@@ -891,7 +902,7 @@ def genre_class(genre: str | None) -> str | None:
     if "comic" in g:
         return "comic"
     if any(w in g for w in ("rpg", "action", "fighting", "shooter", "puzzle",
-                            "platform", "racing", "sports game", "strategy",
+                            "platform", "racing", "sports", "strategy",
                             "adventure", "simulation", "party")):
         return "game"
     return None

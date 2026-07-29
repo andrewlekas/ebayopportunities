@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main as scanner                                     # noqa: E402
 from valuation.guide_csv import load_index                  # noqa: E402
 from valuation.identity import identity_of                  # noqa: E402
+from targets import configured_scan_entries                 # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -45,7 +46,7 @@ def main() -> int:
 
     # Which watchlist queries can the CSVs already answer?
     watch = [w.get("query") if isinstance(w, dict) else str(w)
-             for w in (config.get("watchlist") or [])]
+             for w in configured_scan_entries(config)]
     watch = [w for w in watch if w]
     if not watch:
         return 0

@@ -78,6 +78,16 @@ def _notify_macos(title: str, body: str, sound: bool) -> bool:
 
 
 def _send_telegram(fresh: list[Opportunity], tg: dict) -> bool:
+    # Last-line invariant: a fixed-price listing is immediately takeable, so
+    # negative EV means "do not buy" regardless of grail/set-need status.
+    # Keep this guard at the transport boundary as well as in send_alerts so
+    # future alert paths cannot accidentally Telegram an above-market BIN.
+    fresh = [
+        o for o in fresh
+        if not (o.listing.listing_type == "fixed"
+                and o.valuation.expected_value < 0)]
+    if not fresh:
+        return False
     token, chat = tg.get("bot_token"), tg.get("chat_id")
     if not (token and chat):
         return False
@@ -175,8 +185,9 @@ def send_alerts(opps: list[Opportunity], config: dict, db_path: str) -> int:
              min_edge, min_roi, max_roi, min_conf, min_capture, priority_only)
 
     # grail alerts: a different question than profit - "is a card Andrew
-    # WANTS newly available or about to close?" Bypasses every profit gate
-    # (a grail at fair is still a grail) but only for actionable moments:
+    # WANTS newly available or about to close?" Auctions may bypass profit
+    # gates (a grail at fair is still a grail); negative-EV BINs never do.
+    # Only actionable moments qualify:
     # freshly-listed BINs and auctions entering the endgame. Capped and
     # sorted by significance so generic grails can't flood the phone.
     gcfg = acfg.get("grails") or {}
@@ -204,6 +215,15 @@ def send_alerts(opps: list[Opportunity], config: dict, db_path: str) -> int:
             log.info("alerts: %d grail candidate(s) (fresh<=%sh or "
                      "ending<=%sh)", len(gh), fresh_h, ending_h)
             hot = hot + [o for o in gh if o not in hot]
+
+    negative_bins = [
+        o for o in hot
+        if o.listing.listing_type == "fixed"
+        and o.valuation.expected_value < 0]
+    if negative_bins:
+        log.info("alerts: blocked %d negative-EV BIN(s) before Telegram",
+                 len(negative_bins))
+        hot = [o for o in hot if o not in negative_bins]
 
     if not hot:
         return 0

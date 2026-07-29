@@ -30,6 +30,7 @@ from quality import is_tradeable
 from textutil import fold
 from valuation.comps import (_subject_tokens, grade_info, title_match_score,
                              variant_conflict)
+from valuation.identity import object_class
 
 HEADERS = [
     ("Rank", 6), ("Pri", 5), ("Type", 10), ("Site", 11), ("Title", 56),
@@ -70,23 +71,40 @@ POKE_KW = ["pokemon", "charizard", "blastoise", "venusaur", "pikachu",
 POP_KW = ["superman", "batman", "disney", "skywalker", "star wars", "marvel"]
 
 
-CATEGORIES = ("Pokemon Cards", "Sports Cards", "Video Games", "Watches",
-              "Other")
+CATEGORIES = ("Pokemon Cards", "Sports Cards", "Sports Memorabilia",
+              "Video Games", "Watches", "Other")
 
 
-def _category(query: str) -> str:
+def _category(query: str, title: str = "") -> str:
+    """Category of the physical listing, with query-only fallback.
+
+    Query routing alone put Tiger Woods shirts, photos and flags in Sports
+    Cards because every unknown collectible defaulted there. The title's
+    object class now gets the final say for sports memorabilia while all
+    existing one-argument callers remain backward compatible.
+    """
     q = fold(query).lower()
     if any(k in q for k in WATCH_KW):
-        return "Watches"
-    if any(k in q for k in GAME_PLATFORM_KW):
-        return "Video Games"
-    if any(k in q for k in POKE_KW):
-        return "Pokemon Cards"
-    if any(k in q for k in GAME_TITLE_KW):
-        return "Video Games"
-    if any(k in q for k in POP_KW):
-        return "Other"
-    return "Sports Cards"
+        category = "Watches"
+    elif any(k in q for k in GAME_PLATFORM_KW):
+        category = "Video Games"
+    elif any(k in q for k in POKE_KW):
+        category = "Pokemon Cards"
+    elif any(k in q for k in GAME_TITLE_KW):
+        category = "Video Games"
+    elif any(k in q for k in POP_KW):
+        category = "Other"
+    else:
+        category = "Sports Cards"
+    if title and category == "Sports Cards" and object_class(title) == "memorabilia":
+        return "Sports Memorabilia"
+    return category
+
+
+def _listing_category(listing) -> str:
+    return (getattr(listing, "category", "") or
+            _category(getattr(listing, "query", ""),
+                      getattr(listing, "title", "")))
 
 
 def _timing(l) -> tuple[str, str]:
@@ -556,7 +574,7 @@ def _crossover_tab(wb, opps: list[Opportunity], config: dict) -> None:
             continue
         if v.fair_value <= 0 or v.disputed:
             continue
-        if _category(l.query) not in allowed_categories:
+        if _listing_category(l) not in allowed_categories:
             continue
         fee = grading_fee(v.fair_value)
         profit = v.edge_now - fee
@@ -781,6 +799,37 @@ def _source_health_tab(wb, rows: list[dict]) -> None:
     ws.auto_filter.ref = f"A1:I{len(rows) + 1}"
 
 
+def _sports_coverage_tab(wb, rows: list[dict]) -> None:
+    """Explain the sports funnel by player/query in one compact sheet."""
+    if not rows:
+        return
+    ws = wb.create_sheet("Sports Coverage")
+    columns = [
+        ("Player", "player", 22), ("Query", "query", 40),
+        ("Category", "category", 20), ("Raw", "raw", 9),
+        ("Relevant", "relevant", 10), ("Valued", "valued", 9),
+        ("Guide Resolved", "guide_resolved", 14),
+        ("Exact Comps", "exact_comps", 12),
+        ("Promoted", "promoted", 10), ("Browse", "browse", 9),
+        ("Action", "action", 9), ("Ask-Based", "ask_based", 10),
+        ("Top Rejection", "top_rejection", 48),
+    ]
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    band = PatternFill("solid", fgColor="DCE6F1")
+    for column, (label, _key, width) in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=column, value=label)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        ws.column_dimensions[get_column_letter(column)].width = width
+    for row_i, record in enumerate(rows, 2):
+        for column, (_label, key, _width) in enumerate(columns, 1):
+            cell = ws.cell(row=row_i, column=column, value=record.get(key))
+            if row_i % 2 == 0:
+                cell.fill = band
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:M{len(rows) + 1}"
+
+
 def _filter_waterfall_tab(wb, rows: list[dict]) -> None:
     """Visible count reconciliation from source hits to decision rows."""
     if not rows:
@@ -888,7 +937,8 @@ def write_report(opps: list[Opportunity], path: str,
                  source_health: list[dict] | None = None,
                  research: list[dict] | None = None,
                  filter_waterfall: list[dict] | None = None,
-                 trade_blotter: list[dict] | None = None) -> str:
+                 trade_blotter: list[dict] | None = None,
+                 sports_coverage: list[dict] | None = None) -> str:
     grail_rows = [o for o in opps if o.listing.grail]
     main = [o for o in opps if not o.listing.discovery and not o.listing.grail]
     disc = [o for o in opps
@@ -904,7 +954,7 @@ def write_report(opps: list[Opportunity], path: str,
     # so they never mix into the Action view
     action_pool = [
         o for o in main
-        if _category(o.listing.query) != "Watches" and is_tradeable(o)
+        if _listing_category(o.listing) != "Watches" and is_tradeable(o)
     ]
     # same card from N sellers = one row ("+N more from $X" in Notes);
     # category tabs keep the full uncollapsed book
@@ -927,6 +977,10 @@ def write_report(opps: list[Opportunity], path: str,
     ws.title = "Action"
     _fill_sheet(ws, _sorted(action))
 
+    set_needs = [o for o in opps if o.listing.set_need]
+    if set_needs:
+        _fill_sheet(wb.create_sheet("Set Needs"), _sorted(set_needs))
+
     # Today: the end-of-day decision list, first tab in the book
     _today_tab(wb, action_pool, config or {})
     if "Today" in wb.sheetnames:
@@ -945,7 +999,7 @@ def write_report(opps: list[Opportunity], path: str,
     # category tabs
     by_cat: dict[str, list] = {}
     for o in main:
-        by_cat.setdefault(_category(o.listing.query), []).append(o)
+        by_cat.setdefault(_listing_category(o.listing), []).append(o)
     for cat in CATEGORIES:
         if by_cat.get(cat):
             _fill_sheet(wb.create_sheet(cat),
@@ -961,6 +1015,7 @@ def write_report(opps: list[Opportunity], path: str,
 
     if source_health:
         _source_health_tab(wb, source_health)
+    _sports_coverage_tab(wb, sports_coverage or [])
 
     if disc:
         _fill_sheet(wb.create_sheet("Discovery"),
@@ -1014,6 +1069,7 @@ def write_report(opps: list[Opportunity], path: str,
         ("Ann ROI", "ROI annualized by turnover: same edge on a faster-trading card = higher capital velocity"),
         ("Pri (star)", "query names a specific grade; alerts enabled"),
         ("Crossover tab", "restricted to configured card categories and graders (default CGC/BGS/SGC/BVG Pokemon and sports cards). Profit = edge now minus the PSA grading tier; risk: the card comes back below the modeled shift grade"),
+        ("Sports Coverage", "per sports query: raw/relevant/valued listings, guide and exact-comp resolution, discovery promotions, browse/action survivors and the top rejection reason"),
         ("Source Health", "this run's persisted source readiness: request and parser successes/failures, breaker skips, disabled sources and comp-cache freshness"),
         ("Filter Waterfall", "complete count reconciliation from raw marketplace hits through relevance, valuation, value/ROI/collection/economics rules and final kept rows"),
         ("Research-Filtered", "valued listings rejected before the main report plus browsable rows quarantined from Action/Today/alerts; Stage and Reason explain every row"),
@@ -1035,12 +1091,12 @@ def write_report(opps: list[Opportunity], path: str,
 # Reading order, front to back. Decision tabs first, then the research book,
 # then the diagnostics you only open to ask "why is this row missing?".
 # Anything not named here keeps its position between the two groups.
-SHEET_ORDER_FRONT = ("Today", "Action", "Trade Blotter",
-                     "Pokemon Cards", "Sports Cards",
+SHEET_ORDER_FRONT = ("Today", "Action", "Trade Blotter", "Set Needs",
+                     "Pokemon Cards", "Sports Cards", "Sports Memorabilia",
                      "Video Games", "Discovery", "Watches", "Other",
                      "Grails", "Crossover", "Portfolio", "Movers")
-SHEET_ORDER_BACK = ("Source Health", "Filter Waterfall", "Research-Filtered",
-                    "About")
+SHEET_ORDER_BACK = ("Sports Coverage", "Source Health", "Filter Waterfall",
+                    "Research-Filtered", "About")
 
 
 def _order_sheets(wb) -> None:

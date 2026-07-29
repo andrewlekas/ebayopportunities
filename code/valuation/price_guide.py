@@ -59,7 +59,7 @@ GRADER_TOP_FIELD = {
 }
 # Bump this whenever the grade->price rule changes, so cached values priced
 # under the old rule are dropped instead of being served for the whole TTL.
-GUIDE_CACHE_VERSION = "2026-07-25-landed-trust-v2"
+GUIDE_CACHE_VERSION = "2026-07-28-sports-identity-v3"
 
 
 def _pricecharting_product_key(query: str) -> str:
@@ -302,6 +302,10 @@ class PriceGuide:
             self.csv_index = GuideCsvIndex("")
         self.lookup_budget = int(algo.get("guide_lookups_per_run", 400))
         self._lookups_left = self.lookup_budget
+        raw_buckets = algo.get("guide_lookups_per_run_by_category") or {}
+        self._category_lookups_left = {
+            str(category): int(limit)
+            for category, limit in raw_buckets.items()}
         self._budget_skips = 0
         # True when the last guide lookup failed due to a request error
         # (timeout/429/etc.) rather than a genuine "no match" - such misses
@@ -520,7 +524,8 @@ class PriceGuide:
         return None
 
     def _cached_product(self, cache_key: str, path: str,
-                        params: dict, host: str | None = None) -> dict | None:
+                        params: dict, host: str | None = None,
+                        budget_category: str | None = None) -> dict | None:
         """Fetch-once-and-remember for any PriceCharting payload."""
         if cache_key in self._pc_products:
             return self._pc_products[cache_key]
@@ -541,17 +546,22 @@ class PriceGuide:
             # fetch, so an ungoverned run can burn the day's quota (and
             # hours of wall clock) in a single sweep: on 2026-07-26 one BIN
             # sweep made 661 calls in 19 minutes and was still going.
-            if self._lookups_left <= 0:
+            category_left = self._category_lookups_left.get(budget_category)
+            if self._lookups_left <= 0 or (
+                    category_left is not None and category_left <= 0):
                 self._budget_skips += 1
                 if self._budget_skips == 1:
                     log.warning(
-                        "pricecharting: run budget of %d lookups is spent - "
+                        "pricecharting: run/category budget is spent "
+                        "(total=%d, category=%s) - "
                         "remaining rows use comps only. Raise "
                         "algorithm.guide_lookups_per_run if this is too low.",
-                        self.lookup_budget)
+                        self.lookup_budget, budget_category or "unreserved")
                 note_api("pricecharting", "skipped")
                 return None
             self._lookups_left -= 1
+            if category_left is not None:
+                self._category_lookups_left[budget_category] = category_left - 1
             product = self._pc_call(path, params, host=host)
             if product is None:
                 return None
@@ -560,7 +570,8 @@ class PriceGuide:
             return product
 
     # ---- identity-based resolution (the card, not the phrase) ----
-    def quote(self, ident: CardIdentity) -> GuideQuote:
+    def quote(self, ident: CardIdentity,
+              category: str | None = None) -> GuideQuote:
         """Resolve against each configured guide host, first landing wins.
 
         pricecharting.com carries TCG, video games, comics, Funko and LEGO
@@ -579,26 +590,36 @@ class PriceGuide:
         if len(self.csv_index):
             local = self._quote_from_rows(
                 ident, self.csv_index.search(ident.guide_query()),
-                source="local CSV")
+                source="local CSV", category=category)
             if local.landed:
                 return local
         best_miss = None
-        for host in self.guide_hosts:
-            q = self._quote_from(ident, host)
+        hosts = list(self.guide_hosts)
+        if category == "Sports Cards":
+            hosts = [host for host in hosts if "sportscardspro" in host]
+        elif category in {"Video Games", "Pokemon Cards", "Other"}:
+            primary = [host for host in hosts if "sportscardspro" not in host]
+            hosts = primary or hosts
+        if category == "Sports Memorabilia":
+            hosts = []
+        for host in hosts:
+            q = self._quote_from(ident, host, category=category)
             if q.landed:
                 return q
             if best_miss is None or q.score > best_miss.score:
                 best_miss = q
         return best_miss or GuideQuote(note="no guide host configured")
 
-    def _quote_from(self, ident: CardIdentity, host: str) -> GuideQuote:
+    def _quote_from(self, ident: CardIdentity, host: str,
+                    category: str | None = None) -> GuideQuote:
         """Search one guide host, then price the winning product."""
         q = ident.guide_query()
         if not self.pc_token or not q:
             return GuideQuote(note="no PriceCharting token or query")
         tag = "" if host == self.guide_hosts[0] else f"@{_host_tag(host)}"
         listing = self._cached_product(
-            f"search:{q}{tag}", "products", {"q": q}, host=host)
+            f"search:{q}{tag}", "products", {"q": q}, host=host,
+            budget_category=category)
         if not listing or listing.get("status") == "error":
             return GuideQuote(note=f"no PriceCharting match for {q!r}")
 
@@ -606,14 +627,16 @@ class PriceGuide:
             pid = str(best.get("id") or "")
             if not pid:
                 return best
-            return self._cached_product(f"id:{pid}{tag}", "product",
-                                        {"id": pid}, host=host)
+            return self._cached_product(
+                f"id:{pid}{tag}", "product", {"id": pid}, host=host,
+                budget_category=category)
 
         return self._quote_from_rows(
-            ident, candidates_of(listing), source=_host_tag(host), fetch=fetch)
+            ident, candidates_of(listing), source=_host_tag(host), fetch=fetch,
+            category=category)
 
     def _quote_from_rows(self, ident: CardIdentity, rows, source: str,
-                         fetch=None) -> GuideQuote:
+                         fetch=None, category: str | None = None) -> GuideQuote:
         """Score candidate product rows and price the winner.
 
         Shared by the paid API and the local CSVs on purpose: a row from a
@@ -632,6 +655,27 @@ class PriceGuide:
         """
         q = ident.guide_query()
         candidates = [r for r in (rows or []) if isinstance(r, dict)]
+        if category == "Sports Cards":
+            guarded = []
+            for candidate in candidates:
+                origin = str(candidate.get("_guide-host") or "")
+                if origin and origin != "sportscardspro":
+                    continue
+                genre = genre_class(candidate.get("genre"))
+                if genre and genre != "card":
+                    continue
+                other = CardIdentity.from_text(
+                    f"{candidate.get('product-name', '')} "
+                    f"{candidate.get('console-name', '')}".strip())
+                if ident.number and other.number != ident.number:
+                    continue
+                if ident.year and other.year != ident.year:
+                    continue
+                if (ident.set_tokens and not
+                        (set(ident.set_tokens) & set(other.set_tokens))):
+                    continue
+                guarded.append(candidate)
+            candidates = guarded
         scored = sorted(
             ((ident.score_candidate(c.get("product-name", ""),
                                     c.get("console-name", "")), c)

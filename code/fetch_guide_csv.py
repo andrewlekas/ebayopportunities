@@ -15,9 +15,9 @@ Two limits shape how this behaves, both from PriceCharting's own docs:
   * CSV requests are limited to ONE EVERY TEN MINUTES. We therefore wait
     between downloads. A first run covering several categories takes a
     while; that is the API's rule, not our choice.
-  * The files are regenerated once every 24 hours, so re-downloading more
-    often than daily achieves nothing. We skip anything already fresh
-    unless you pass --force.
+  * The upstream files may regenerate daily, but collectible guide prices do
+    not need daily refreshes for this scanner. The default refresh target is
+    once per week and can be changed with guide_csv.fresh_hours.
 
 The token is read from config.yaml and is never printed, logged, or written
 anywhere. Only the resulting .csv files are saved.
@@ -55,7 +55,7 @@ DEFAULT_GUIDES = [
 ]
 
 CSV_COOLDOWN_SECONDS = 610        # their documented 1-per-10-minutes, plus a nudge
-FRESH_HOURS = 20                  # files regenerate every 24h
+FRESH_HOURS = 168                 # weekly refresh; older files remain usable
 
 
 def _age_hours(path: str) -> float | None:
@@ -117,6 +117,8 @@ def download(host: str, slug: str, token: str, path: str) -> tuple[bool, str]:
 def main() -> int:
     force = "--force" in sys.argv[1:]
     config = scanner.load_config(os.path.join(ROOT, "config.yaml"))
+    fresh_hours = float(
+        (config.get("guide_csv") or {}).get("fresh_hours", FRESH_HOURS))
     token = ((config.get("api_keys", {}) or {}).get("pricecharting")
              or {}).get("token")
     if not token:
@@ -136,7 +138,7 @@ def main() -> int:
     for slug, host, name in guides:
         path = os.path.join(FOLDER, _filename(host, slug))
         age = _age_hours(path)
-        if age is not None and age < FRESH_HOURS and not force:
+        if age is not None and age < fresh_hours and not force:
             print(f"  fresh ({age:4.1f}h)  {name}")
         else:
             todo.append((slug, host, name, path))
@@ -144,8 +146,9 @@ def main() -> int:
 
     if not todo:
         print()
-        print("Everything is current. PriceCharting regenerates these files")
-        print("once a day, so there is nothing to gain by downloading again.")
+        print(f"Everything is current (refresh target: {fresh_hours:g}h).")
+        print("Older CSVs remain usable by the pricer; this only controls")
+        print("when the download helper offers to replace them.")
         print("Use --force if you really want to.")
         return 0
 

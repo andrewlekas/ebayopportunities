@@ -1555,10 +1555,18 @@ class TestTargetedCompRouting(unittest.TestCase):
         self.assertIn("#288", query)
         self.assertIn("PSA 8", query)
 
-    def test_discovery_and_already_exact_queries_do_not_multiply(self):
+    def test_specific_discovery_is_promoted_to_exact_comp_search(self):
         engine = self._engine()
-        self.assertIsNone(
-            engine.targeted_comp_query(self._listing(discovery=True)))
+        promoted = engine.targeted_comp_query(self._listing(discovery=True))
+        self.assertIsNotNone(promoted)
+        self.assertIn("#288", promoted)
+        self.assertIn("PSA 8", promoted)
+        vague = self._listing(discovery=True)
+        vague.title = "Michael Jordan Fleer card collection"
+        self.assertIsNone(engine.targeted_comp_query(vague))
+
+    def test_already_exact_queries_do_not_multiply(self):
+        engine = self._engine()
         exact = self._listing()
         exact.query = "Michael Jordan 1984 Star #288 PSA 8"
         self.assertIsNone(engine.targeted_comp_query(exact))
