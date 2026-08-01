@@ -3334,11 +3334,12 @@ class TestGuideCsvDownloader(unittest.TestCase):
             status_code = 200
             def __enter__(self): return self
             def __exit__(self, *a): return False
+            def close(self): pass
             def iter_content(self, chunk_size=0):
                 yield b"<!DOCTYPE html><html><body>Login</body></html>"
 
         with mock.patch.object(m.requests, "get", return_value=FakeResp()):
-            ok, detail = m.download(m.PC, "", "tok", path)
+            ok, detail, kind = m.download(m.PC, "", "tok", path)
         self.assertFalse(ok)
         self.assertIn("web page", detail)
         self.assertFalse(os.path.exists(path))
@@ -3352,11 +3353,12 @@ class TestGuideCsvDownloader(unittest.TestCase):
             status_code = 200
             def __enter__(self): return self
             def __exit__(self, *a): return False
+            def close(self): pass
             def iter_content(self, chunk_size=0):
                 yield b"date,amount\n2026-01-01,5\n"
 
         with mock.patch.object(m.requests, "get", return_value=FakeResp()):
-            ok, _ = m.download(m.PC, "", "tok", path)
+            ok, _, _kind = m.download(m.PC, "", "tok", path)
         self.assertFalse(ok)
         self.assertFalse(os.path.exists(path))
 
@@ -3369,12 +3371,13 @@ class TestGuideCsvDownloader(unittest.TestCase):
             status_code = 200
             def __enter__(self): return self
             def __exit__(self, *a): return False
+            def close(self): pass
             def iter_content(self, chunk_size=0):
                 yield (b"id,product-name,console-name,loose-price\n"
                        b"1,Michael Jordan #57,Basketball Cards 1986 Fleer,225500\n")
 
         with mock.patch.object(m.requests, "get", return_value=FakeResp()):
-            ok, detail = m.download(m.PC, "", "tok", path)
+            ok, detail, kind = m.download(m.PC, "", "tok", path)
         self.assertTrue(ok, detail)
         self.assertTrue(os.path.exists(path))
         from valuation.guide_csv import GuideCsvIndex
@@ -3397,6 +3400,398 @@ class TestGuideCsvDownloader(unittest.TestCase):
         m = self._mod()
         self.assertGreaterEqual(m.CSV_COOLDOWN_SECONDS, 600,
                                 "PriceCharting allows one CSV per 10 minutes")
+
+    # --- failure kinds -------------------------------------------------
+    # 2026-07-28: all four PriceCharting categories downloaded cleanly at
+    # ~10-minute spacing while all four SportsCardsPro ones failed. That is
+    # a per-site subscription boundary, not a rate limit - but the old
+    # 2-tuple return could not express the difference, so the run slept ten
+    # minutes before each of the three remaining doomed attempts.
+
+    def _resp(self, status=200, body=b"", ):
+        class FakeResp:
+            status_code = status
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                if body:
+                    yield body
+        return FakeResp()
+
+    def test_403_is_a_subscription_problem_not_a_rate_limit(self):
+        m = self._mod()
+        with mock.patch.object(m.requests, "get",
+                               return_value=self._resp(403)):
+            ok, _detail, kind = m.download(m.SCP, "baseball-cards", "t",
+                                           os.path.join(tempfile.mkdtemp(),
+                                                        "x.csv"))
+        self.assertFalse(ok)
+        self.assertEqual(kind, m.KIND_NOT_COVERED)
+
+    def test_429_is_a_rate_limit(self):
+        m = self._mod()
+        with mock.patch.object(m.requests, "get",
+                               return_value=self._resp(429)):
+            ok, _detail, kind = m.download(m.PC, "", "t",
+                                           os.path.join(tempfile.mkdtemp(),
+                                                        "x.csv"))
+        self.assertFalse(ok)
+        self.assertEqual(kind, m.KIND_RATE)
+
+    def test_an_html_login_page_is_a_subscription_problem(self):
+        m = self._mod()
+        page = b"<!DOCTYPE html><html><body>Please subscribe</body></html>"
+        with mock.patch.object(m.requests, "get",
+                               return_value=self._resp(200, page)):
+            ok, _detail, kind = m.download(m.SCP, "baseball-cards", "t",
+                                           os.path.join(tempfile.mkdtemp(),
+                                                        "x.csv"))
+        self.assertFalse(ok)
+        self.assertEqual(kind, m.KIND_NOT_COVERED)
+
+    def test_an_html_slow_down_page_is_a_rate_limit(self):
+        m = self._mod()
+        page = b"<!DOCTYPE html><html><body>Too many requests, try again</body></html>"
+        with mock.patch.object(m.requests, "get",
+                               return_value=self._resp(200, page)):
+            ok, _detail, kind = m.download(m.PC, "", "t",
+                                           os.path.join(tempfile.mkdtemp(),
+                                                        "x.csv"))
+        self.assertFalse(ok)
+        self.assertEqual(kind, m.KIND_RATE)
+
+    def test_a_refused_host_skips_its_remaining_categories_without_sleeping(self):
+        """The whole point: one 403 must not cost 45 more minutes of sleep."""
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "guide_csv"), exist_ok=True)
+        sleeps, tried = [], []
+
+        def fake_download(host, slug, token, path, console_uids=None):
+            tried.append((m._host_label(host), console_uids or slug
+                          or "video-games"))
+            if "sportscardspro" in host:
+                return False, "HTTP 403", m.KIND_NOT_COVERED
+            with open(path, "w") as fh:
+                fh.write("id,product-name,console-name\n1,a,b\n")
+            return True, "1.0 MB", m.KIND_OK
+
+        sports_sets = [
+            {"name": f"set {u}", "host": m.SCP, "console_uids": u}
+            for u in ("G155", "G156", "G157", "G158")]
+        with mock.patch.object(m, "FOLDER", os.path.join(tmp, "guide_csv")), \
+             mock.patch.object(m, "download", fake_download), \
+             mock.patch.object(m.time, "sleep", lambda s: sleeps.append(s)), \
+             mock.patch.object(m.scanner, "load_config", lambda p: {
+                 "api_keys": {"pricecharting": {"token": "t"}},
+                 "guide_csv": {"cooldown_seconds": 900,
+                               "extra_guides": sports_sets}}), \
+             mock.patch.object(m.sys, "argv", ["x"]):
+            m.main()
+
+        scp = [t for t in tried if t[0] == "SportsCardsPro"]
+        self.assertEqual(len(scp), 1,
+                         "only the FIRST SportsCardsPro category should be "
+                         "attempted once the host has refused")
+        self.assertEqual(len(sleeps), 4,
+                         "no sleeping between the skipped categories")
+
+    def test_a_rate_limited_file_is_retried_once(self):
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "guide_csv"), exist_ok=True)
+        attempts = []
+
+        def fake_download(host, slug, token, path, console_uids=None):
+            attempts.append(slug or "video-games")
+            if attempts.count(slug or "video-games") == 1:
+                return False, "HTTP 429", m.KIND_RATE
+            with open(path, "w") as fh:
+                fh.write("id,product-name,console-name\n1,a,b\n")
+            return True, "1.0 MB", m.KIND_OK
+
+        with mock.patch.object(m, "FOLDER", os.path.join(tmp, "guide_csv")), \
+             mock.patch.object(m, "download", fake_download), \
+             mock.patch.object(m.time, "sleep", lambda s: None), \
+             mock.patch.object(m, "DEFAULT_GUIDES", [("", m.PC, "video games")]), \
+             mock.patch.object(m.scanner, "load_config", lambda p: {
+                 "api_keys": {"pricecharting": {"token": "t"}}}), \
+             mock.patch.object(m.sys, "argv", ["x"]):
+            rc = m.main()
+        self.assertEqual(attempts.count("video-games"), 2,
+                         "a genuine rate limit deserves one retry")
+        self.assertEqual(rc, 0)
+
+    def test_the_cooldown_is_configurable(self):
+        m = self._mod()
+        self.assertGreaterEqual(m.CSV_COOLDOWN_SECONDS, 900,
+                                "default is now 15 minutes for headroom")
+
+    # --- per-host selector ---------------------------------------------
+    # 2026-07-28: every SportsCardsPro download returned 403 and looked like
+    # a subscription problem. The account holds SportsCardsPro Legendary,
+    # which includes downloads. The real cause was the selector: that host
+    # takes `console-uids` per SET, while PriceCharting takes `category`
+    # per catalogue. Same path, same token, different parameter.
+
+    def test_sportscardspro_uses_console_uids_not_category(self):
+        m = self._mod()
+        seen = {}
+
+        class FakeResp:
+            status_code = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                yield b"id,product-name,console-name\n1,Jordan #57,1986 Fleer\n"
+
+        def fake_get(url, params=None, **kw):
+            seen.update(params or {})
+            return FakeResp()
+
+        with mock.patch.object(m.requests, "get", fake_get):
+            ok, _d, _k = m.download(m.SCP, "", "tok",
+                                    os.path.join(tempfile.mkdtemp(), "x.csv"),
+                                    console_uids="G155")
+        self.assertTrue(ok)
+        self.assertEqual(seen.get("console-uids"), "G155")
+        self.assertNotIn("category", seen,
+                         "sending category= to SportsCardsPro is the 403")
+
+    def test_pricecharting_still_uses_category(self):
+        m = self._mod()
+        seen = {}
+
+        class FakeResp:
+            status_code = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                yield b"id,product-name,console-name\n1,a,b\n"
+
+        with mock.patch.object(m.requests, "get",
+                               lambda url, params=None, **kw: (
+                                   seen.update(params or {}) or FakeResp())):
+            m.download(m.PC, "pokemon-cards", "tok",
+                       os.path.join(tempfile.mkdtemp(), "x.csv"))
+        self.assertEqual(seen.get("category"), "pokemon-cards")
+        self.assertNotIn("console-uids", seen)
+
+    def test_a_uid_guide_keeps_sportscardspro_provenance(self):
+        """The filename prefix is what lets these rows price Sports Cards.
+        A sports guide saved under pricecharting-- would be refused by the
+        category guard and the download would be wasted."""
+        m = self._mod()
+        g = m._normalise_guides([{"name": "1986 Fleer Basketball",
+                                  "host": m.SCP, "console_uids": "G155"}])[0]
+        self.assertEqual(g["console_uids"], "G155")
+        self.assertIsNone(g["category"])
+        self.assertTrue(
+            m._filename(g["host"], g["slug"]).startswith("sportscardspro--"))
+
+    def test_a_uid_list_is_joined(self):
+        m = self._mod()
+        g = m._normalise_guides([{"name": "sets", "host": m.SCP,
+                                  "console_uids": ["G155", "G156"]}])[0]
+        self.assertEqual(g["console_uids"], "G155,G156")
+
+    def test_legacy_tuple_guides_still_work(self):
+        m = self._mod()
+        g = m._normalise_guides([("pokemon-cards", m.PC, "Pokemon cards")])[0]
+        self.assertEqual(g["category"], "pokemon-cards")
+        self.assertIsNone(g["console_uids"])
+
+    def test_a_403_reports_the_server_reason_not_just_the_status(self):
+        """Same URL, same token, same parameter as the browser link, still
+        403. The status alone cannot distinguish "log in" from "subscription
+        required" from "bad token", and guessing wasted two rounds."""
+        m = self._mod()
+
+        class FakeResp:
+            status_code = 403
+            content = (b"<html><body><h1>Forbidden</h1>"
+                       b"<p>You must be logged in.</p></body></html>")
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                yield b""
+
+        with mock.patch.object(m.requests, "get", return_value=FakeResp()):
+            ok, detail, kind = m.download(m.SCP, "", "tok",
+                                          os.path.join(tempfile.mkdtemp(),
+                                                       "x.csv"),
+                                          console_uids="G155")
+        self.assertFalse(ok)
+        self.assertEqual(kind, m.KIND_NOT_COVERED)
+        self.assertIn("logged in", detail)
+
+    def test_an_echoed_token_is_never_printed(self):
+        """security.redact_text only strips credential-shaped QUERY params,
+        so a page echoing the token in body text would reach the screen."""
+        m = self._mod()
+
+        class FakeResp:
+            content = (b"<html>bad token "
+                       b"3ede03b3e2e44af62695a1235e632392dc4b9bbb</html>")
+
+        reason = m._reason_from(FakeResp())
+        self.assertNotIn("3ede03b3", reason)
+        self.assertIn("<redacted>", reason)
+
+    def test_a_cloudflare_interstitial_is_not_a_subscription_problem(self):
+        """The real 2026-07-31 body. Calling this "not covered by this
+        subscription" sent the investigation at the account page twice when
+        the account was fine - the site is simply behind a bot challenge."""
+        m = self._mod()
+
+        class FakeResp:
+            status_code = 403
+            content = (b"<html><head><title>Just a moment...</title>"
+                       b"<meta http-equiv=\"content-security-policy\" "
+                       b"content=\"script-src https://challenges."
+                       b"cloudflare.com\"></head></html>")
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                yield b""
+
+        with mock.patch.object(m.requests, "get", return_value=FakeResp()):
+            ok, detail, kind = m.download(m.SCP, "", "tok",
+                                          os.path.join(tempfile.mkdtemp(),
+                                                       "x.csv"),
+                                          console_uids="G155")
+        self.assertFalse(ok)
+        self.assertEqual(kind, m.KIND_CHALLENGE)
+        self.assertNotEqual(kind, m.KIND_NOT_COVERED)
+        self.assertIn("Cloudflare", detail)
+
+    def test_challenge_markers_cover_the_usual_wording(self):
+        m = self._mod()
+        for body in ("Just a moment...", "Checking your browser before",
+                     "Attention Required! | Cloudflare",
+                     "Enable JavaScript and cookies to continue"):
+            self.assertTrue(m._looks_like_challenge(body), body)
+        self.assertFalse(m._looks_like_challenge(
+            "You must be logged in to download price lists"))
+
+    def test_a_challenged_host_also_stops_costing_sleep(self):
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "guide_csv"), exist_ok=True)
+        sleeps, tried = [], []
+
+        def fake_download(host, slug, token, path, console_uids=None):
+            tried.append(console_uids or slug)
+            if "sportscardspro" in host:
+                return (False, "blocked by a Cloudflare bot challenge",
+                        m.KIND_CHALLENGE)
+            with open(path, "w") as fh:
+                fh.write("id,product-name,console-name\n1,a,b\n")
+            return True, "1.0 MB", m.KIND_OK
+
+        sets = [{"name": f"set {u}", "host": m.SCP, "console_uids": u}
+                for u in ("G155", "G156", "G157")]
+        with mock.patch.object(m, "FOLDER", os.path.join(tmp, "guide_csv")), \
+             mock.patch.object(m, "download", fake_download), \
+             mock.patch.object(m.time, "sleep", lambda s: sleeps.append(s)), \
+             mock.patch.object(m.scanner, "load_config", lambda p: {
+                 "api_keys": {"pricecharting": {"token": "t"}},
+                 "guide_csv": {"extra_guides": sets}}), \
+             mock.patch.object(m.sys, "argv", ["x"]):
+            m.main()
+        self.assertEqual(len([t for t in tried if str(t).startswith("G")]), 1,
+                         "one challenge is enough to know the rest will fail")
+
+    def test_downloads_go_through_the_impersonating_client(self):
+        """This endpoint serves a Cloudflare interstitial to bare requests.
+
+        scrapers/base.py has used curl_cffi for eBay and Goldin for the same
+        reason; the downloader was the last caller still on plain requests.
+        """
+        m = self._mod()
+        calls = []
+
+        class FakeResp:
+            status_code = 200
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                yield b"id,product-name,console-name\n1,a,b\n"
+
+        class FakeCurl:
+            @staticmethod
+            def get(url, params=None, impersonate=None, **kw):
+                calls.append(impersonate)
+                return FakeResp()
+
+        with mock.patch.object(m, "curl_requests", FakeCurl):
+            m.download(m.PC, "", "tok",
+                       os.path.join(tempfile.mkdtemp(), "x.csv"))
+        self.assertEqual(calls, ["chrome"])
+
+    def test_no_spoofed_user_agent_without_matching_tls(self):
+        """Claiming to be Chrome over Python's TLS handshake is a bot signal
+        in itself - worse than sending nothing. So the fallback path, used
+        only when curl_cffi is missing, sends no User-Agent."""
+        m = self._mod()
+        seen = {}
+
+        class FakeResp:
+            status_code = 200
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                yield b"id,product-name,console-name\n1,a,b\n"
+
+        def fake_get(url, params=None, headers=None, **kw):
+            seen["headers"] = headers
+            return FakeResp()
+
+        with mock.patch.object(m, "curl_requests", None), \
+                mock.patch.object(m.requests, "get", fake_get):
+            m.download(m.PC, "", "tok",
+                       os.path.join(tempfile.mkdtemp(), "x.csv"))
+        self.assertIn("Mozilla", "".join(m.BROWSER_HEADERS.values()),
+                      "the header set still exists for the diagnose harness")
+        self.assertFalse(seen.get("headers"),
+                         "but it must not be sent over plain requests")
+
+    def test_falls_back_to_plain_requests_if_curl_cffi_errors(self):
+        """A broken optional dependency must not stop the download."""
+        m = self._mod()
+        used = []
+
+        class FakeResp:
+            status_code = 200
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                used.append("plain")
+                yield b"id,product-name,console-name\n1,a,b\n"
+
+        class Exploding:
+            @staticmethod
+            def get(*a, **kw):
+                raise RuntimeError("libcurl missing")
+
+        with mock.patch.object(m, "curl_requests", Exploding), \
+                mock.patch.object(m.requests, "get",
+                                  lambda *a, **kw: FakeResp()):
+            ok, _msg, _kind = m.download(
+                m.PC, "", "tok", os.path.join(tempfile.mkdtemp(), "x.csv"))
+        self.assertTrue(ok)
+        self.assertEqual(used, ["plain"])
+
+    def test_defaults_no_longer_send_category_to_sportscardspro(self):
+        """Those four entries could only ever 403."""
+        m = self._mod()
+        for g in m._normalise_guides(m.DEFAULT_GUIDES):
+            if "sportscardspro" in g["host"]:
+                self.assertIsNone(
+                    g["category"],
+                    "a SportsCardsPro default must not use category=")
 
 
 class TestLiveAuctionPricing(unittest.TestCase):
