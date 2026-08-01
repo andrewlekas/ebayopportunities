@@ -3733,6 +3733,61 @@ class TestGuideCsvDownloader(unittest.TestCase):
                        os.path.join(tempfile.mkdtemp(), "x.csv"))
         self.assertEqual(calls, ["chrome"])
 
+    def test_download_requests_stream_mode(self):
+        """Regression: 2026-07-31. Switching to curl_cffi dropped
+        stream=True. curl_cffi then raises 'stream mode is not enabled' from
+        iter_content - but only AFTER a clean 200, so a working download
+        looked like a site failure. The 50MB comic guide also should not be
+        held in memory. Both clients must be asked to stream."""
+        m = self._mod()
+        seen = {}
+
+        class FakeResp:
+            status_code = 200
+            content = b""
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                yield b"id,product-name,console-name\n1,a,b\n"
+
+        def record(client):
+            def _get(url, params=None, **kw):
+                seen[client] = kw.get("stream")
+                return FakeResp()
+            return _get
+
+        class FakeCurl:
+            get = staticmethod(record("curl"))
+
+        with mock.patch.object(m, "curl_requests", FakeCurl):
+            m.download(m.PC, "", "tok",
+                       os.path.join(tempfile.mkdtemp(), "x.csv"))
+        with mock.patch.object(m, "curl_requests", None), \
+                mock.patch.object(m.requests, "get", record("plain")):
+            m.download(m.PC, "", "tok",
+                       os.path.join(tempfile.mkdtemp(), "y.csv"))
+        self.assertEqual(seen, {"curl": True, "plain": True})
+
+    def test_error_body_is_read_even_when_streaming(self):
+        """A streamed response has an empty .content until something pulls
+        it, and the error page is exactly what we need on a 403."""
+        m = self._mod()
+
+        class FakeResp:
+            status_code = 403
+            content = b""
+            def close(self): pass
+            def iter_content(self, chunk_size=0):
+                yield b"<html><body>Subscription does not cover this</body>"
+
+        with mock.patch.object(m, "curl_requests", None), \
+                mock.patch.object(m.requests, "get",
+                                  lambda *a, **kw: FakeResp()):
+            ok, detail, kind = m.download(
+                m.PC, "", "tok", os.path.join(tempfile.mkdtemp(), "x.csv"))
+        self.assertFalse(ok)
+        self.assertIn("Subscription does not cover", detail)
+        self.assertEqual(kind, m.KIND_NOT_COVERED)
+
     def test_no_spoofed_user_agent_without_matching_tls(self):
         """Claiming to be Chrome over Python's TLS handshake is a bot signal
         in itself - worse than sending nothing. So the fallback path, used

@@ -153,14 +153,20 @@ def _http_get(url: str, params: dict, impersonate: str = "chrome"):
     endpoint was the one place still using bare requests, and it is the one
     place returning a Cloudflare interstitial - so it gets the same
     treatment rather than a special case.
+
+    stream=True is REQUIRED, not an optimisation: the comic-books guide is
+    50MB and the caller reads it in chunks. curl_cffi raises "stream mode is
+    not enabled" from iter_content() without it - and does so only AFTER a
+    successful 200, so omitting it looks like a download failure rather than
+    a programming error. Caller must close the response; `closing` does.
     """
     if curl_requests is not None:
         try:
-            return curl_requests.get(url, params=params,
+            return curl_requests.get(url, params=params, stream=True,
                                      impersonate=impersonate, timeout=600)
         except Exception:                                   # noqa: BLE001
             pass          # fall through to plain requests below
-    return requests.get(url, params=params, timeout=600)
+    return requests.get(url, params=params, stream=True, timeout=600)
 
 
 # These tokens are 40 hex characters. security.redact_text only strips
@@ -172,7 +178,16 @@ _HEXTOKEN_RE = re.compile(r"\b[0-9a-f]{32,64}\b", re.I)
 def _reason_from(response) -> str:
     """A short, credential-safe explanation from an error response body."""
     try:
-        snippet = response.content[:600].decode("utf-8", "replace")
+        raw = response.content or b""
+        if not raw:
+            # In stream mode the body has not been pulled off the wire yet,
+            # so .content is empty until something iterates it. Reading the
+            # error page is the entire point of this function, so do that.
+            for chunk in response.iter_content(chunk_size=1 << 16):
+                raw += chunk or b""
+                if len(raw) >= 600:
+                    break
+        snippet = raw[:600].decode("utf-8", "replace")
     except Exception:                                      # noqa: BLE001
         return "no response body"
     text = re.sub(r"<[^>]+>", " ", snippet)          # strip tags
