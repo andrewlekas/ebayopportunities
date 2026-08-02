@@ -3309,6 +3309,25 @@ class TestGuideCsvDownloader(unittest.TestCase):
     24-hour regeneration cycle, so the downloader must pace itself and must
     not re-fetch files that are already current."""
 
+    def setUp(self):
+        """Neutralise curl_cffi for every test in this class.
+
+        Regression: 2026-08-01. `_http_get` prefers curl_cffi and only falls
+        back to `requests`. Tests that patch `m.requests.get` therefore did
+        NOT intercept anything on a machine where curl_cffi is installed -
+        they made LIVE network calls, failed, and the self-test gate then
+        blocked every scan. They passed on a machine without curl_cffi,
+        which is the worst possible failure mode: green where it is not
+        installed, red and networked where it is.
+
+        Defaulting it off means a test reaches the network only if it
+        deliberately re-patches `curl_requests` itself.
+        """
+        import fetch_guide_csv
+        patcher = mock.patch.object(fetch_guide_csv, "curl_requests", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _mod(self):
         import fetch_guide_csv
         return fetch_guide_csv
