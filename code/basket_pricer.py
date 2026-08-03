@@ -302,6 +302,26 @@ class ExactIndex:
         return [], ""
 
 
+# Words that change WHAT THE OBJECT IS rather than describing it. If your
+# list says one of these and the closest product does not, they are not the
+# same asset, however well the rest of the name lines up.
+_DISTINGUISHING = (
+    "sticker", "promo", "error", "refractor", "prizm", "patch", "jersey",
+    "auto", "autograph", "relic", "insert", "box topper", "oversized",
+    "mini", "die-cut", "die cut", "reprint", "proof", "blank back",
+)
+
+
+def _distinguishing_mismatch(supplied: str, matched: str) -> str:
+    """The first identity-changing word present in one name and not the
+    other, or "" when they agree."""
+    a, b = _norm(supplied), _norm(matched)
+    for word in _DISTINGUISHING:
+        if (word in a) != (word in b):
+            return word
+    return ""
+
+
 def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
               api_budget: list[int]) -> dict:
     """Price one basket line. Never guesses between conflicting products."""
@@ -337,6 +357,18 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
         candidates = candidates[:1]
 
     if candidates:
+        missing = _distinguishing_mismatch(
+            name, candidates[0].get("product-name") or "")
+        if missing:
+            # 2026-08-02: "Michael Jordan 1986 Fleer Sticker RC" resolved to
+            # "Michael Jordan #57" - the base rookie - and was priced at
+            # $15,604. The sticker is a different product entirely. A word
+            # that changes what the object IS must appear on both sides.
+            out.update(matched_name=candidates[0].get("product-name") or "",
+                       matched_set=candidates[0].get("console-name") or "")
+            out["note"] = (f"refused: your list says {missing!r} but the "
+                           f"closest product does not - different product")
+            return out
         product = candidates[0]
         cents, how = _guide_cents(product, eff, grader=grader,
                                   printed_grade=printed)
@@ -371,6 +403,16 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
     if paid_allowed:
         api_budget[0] -= 1
     if quote.value:
+        # Same guard as the exact path. This is the branch the Jordan
+        # STICKER actually came through: the identity resolver matched it
+        # to the base rookie "Michael Jordan #57" and priced it $15,604.
+        missing = _distinguishing_mismatch(name, quote.product_name or "")
+        if missing:
+            out.update(matched_name=quote.product_name or "",
+                       matched_set=quote.console_name or "",
+                       note=f"refused: your list says {missing!r} but the "
+                            f"closest product does not - different product")
+            return out
         out.update(price=round(float(quote.value), 2),
                    source=f"guide lookup ({quote.match})",
                    how=quote.how, matched_name=quote.product_name or "",

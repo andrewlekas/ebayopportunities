@@ -5396,6 +5396,38 @@ class TestCustomBasketPricer(unittest.TestCase):
         self.assertFalse(m._is_sealed("Dratini [1st Edition] #26"))
         self.assertTrue(m._is_sealed("Booster Box [1st Edition]"))
 
+    def test_an_identity_changing_word_must_appear_on_both_sides(self):
+        """2026-08-02: 'Michael Jordan 1986 Fleer Sticker RC' resolved to
+        'Michael Jordan #57' - the base rookie - and priced at $15,604.
+        The sticker is a different product."""
+        m = self._mod()
+        index = m.ExactIndex(self._rows() + [{
+            "console-name": "Basketball Cards 1986 Fleer",
+            "product-name": "Michael Jordan #57",
+            "loose-price": 45500, "cib-price": 120000, "new-price": 250000,
+            "graded-price": 4263945, "manual-only-price": 30000000,
+            "box-only-price": "", "bgs-10-price": "",
+            "condition-17-price": "", "condition-18-price": ""}])
+        class FakeGuide:
+            guide_hosts = []
+            def quote(self, ident, category=None):
+                class Q:
+                    value = 15604.11; match = "strong"
+                    how = "graded-price"; note = ""
+                    product_name = "Michael Jordan #57"
+                    console_name = "Basketball Cards 1986 Fleer"
+                return Q()
+
+        got = m.price_row({"name": "Michael Jordan 1986 Fleer Sticker RC",
+                           "grade": "BGS 8.5", "set": "", "line": 2},
+                          index, FakeGuide(), [0])
+        self.assertIsNone(got["price"])
+        self.assertIn("sticker", got["note"])
+        plain = m.price_row({"name": "Michael Jordan #57", "grade": "PSA 9",
+                             "set": "Basketball Cards 1986 Fleer",
+                             "line": 3}, index, None, [0])
+        self.assertAlmostEqual(plain["price"], 42639.45, places=2)
+
     def test_the_api_cap_limits_paid_calls_but_not_free_ones(self):
         """A 500-row basket must not drain the quota - but the fallback
         reads the LOCAL CSVs before it reaches the API, so the cap must gate
