@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import sys
 from collections import defaultdict
 
@@ -61,6 +62,13 @@ MAX_ROWS = 500
 NAME_HEADERS = ("card", "name", "product", "product-name", "item", "title")
 GRADE_HEADERS = ("grade", "condition", "slab")
 SET_HEADERS = ("set", "console", "console-name", "series")
+# If your list records what you paid, the report carries it through and
+# computes PnL. Absent, the workbook is just a valuation.
+COST_HEADERS = ("cost", "paid", "basis", "purchase", "purchase price")
+
+# Priced holdings land here rather than beside the scan reports, so a
+# personal valuation is never mistaken for a scan output.
+REPORT_DIR = os.path.join(ROOT, "reports", "basket pricer")
 
 
 def _as_float(value) -> float | None:
@@ -68,6 +76,14 @@ def _as_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _money(text) -> float | None:
+    """$5,200 / 5200 / (blank) -> 5200.0 / None."""
+    cleaned = str(text or "").replace("$", "").replace(",", "").strip()
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = "-" + cleaned[1:-1]
+    return _as_float(cleaned)
 
 
 def _norm(text) -> str:
@@ -109,6 +125,7 @@ def read_basket(path: str) -> tuple[list[dict], list[str]]:
     i_name = _pick_column(headers, NAME_HEADERS)
     i_grade = _pick_column(headers, GRADE_HEADERS)
     i_set = _pick_column(headers, SET_HEADERS)
+    i_cost = _pick_column(headers, COST_HEADERS)
 
     warnings = []
     body = table[1:]
@@ -133,7 +150,8 @@ def read_basket(path: str) -> tuple[list[dict], list[str]]:
         if not name:
             continue
         rows.append({"name": name, "grade": cell(i_grade),
-                     "set": cell(i_set), "line": n})
+                     "set": cell(i_set), "line": n,
+                     "cost": _money(cell(i_cost))})
     if len(rows) > MAX_ROWS:
         warnings.append(f"{len(rows)} rows supplied - pricing the first "
                         f"{MAX_ROWS} and ignoring the rest")
@@ -152,6 +170,71 @@ def _read_xlsx(path: str) -> list[list]:
 
 
 # -------------------------------------------------------------- matching ---
+# People do not write card names the way a price guide stores them. The
+# guide says "Alakazam [1st Edition] #1"; a collector's own list says
+# "1999 1st Edition Alakazam". Both name one card, and refusing the second
+# would make the tool useless for the lists people actually keep.
+_YEAR_PREFIX_RE = re.compile(r"^\s*(?:19|20)\d{2}(?:\s*[-/]\s*\d{2,4})?\s+")
+_VARIANT_WORDS = (
+    "1st edition", "first edition", "shadowless", "no rarity", "no symbol",
+    "red cheeks", "yellow cheeks", "ghost stamp", "gray stamp", "grey stamp",
+    "1999-2000", "error", "black dot error",
+)
+# Base Set Pikachu is three products at #58 and the guide labels only the
+# unusual ones. "Yellow" is the ordinary card and carries no label, so a
+# list saying "Pikachu Yellow" must land on the UNLABELLED product - the
+# opposite of what a substring search would do.
+_VARIANT_ALIASES = {
+    "yellow": "", "yellow cheeks": "", "red": "red cheeks",
+    "1st ed": "1st edition", "1st": "1st edition",
+}
+
+
+_BRACKET_RE = re.compile(r"\[([^\]]*)\]")
+
+
+def _product_variants(product_name: str) -> tuple[str, list[str]]:
+    """Fast path for GUIDE names, which have a fixed shape.
+
+    'Charizard [1st Edition] #4' -> ('Charizard', ['1st edition'])
+
+    This runs once per row over a million-row index, so it must not do what
+    the input-side parser does (a dozen regex passes per name). Doing so
+    took the index build from under a second to minutes.
+    """
+    name = str(product_name or "")
+    core = name.split("[")[0].split("#")[0].strip()
+    variants: list[str] = []
+    if "[" in name:
+        for chunk in _BRACKET_RE.findall(name):
+            low = chunk.casefold()
+            for word in sorted(_VARIANT_WORDS, key=len, reverse=True):
+                if word in low:
+                    variants.append(word)
+                    low = low.replace(word, " ")
+    return core, variants
+
+
+def _split_variants(name: str) -> tuple[str, list[str]]:
+    """('Alakazam', ['1st edition']) from '1999 1st Edition Alakazam'."""
+    text = _YEAR_PREFIX_RE.sub("", str(name or "")).strip()
+    found = []
+    for word in sorted(_VARIANT_WORDS, key=len, reverse=True):
+        pattern = re.compile(rf"\[?\b{re.escape(word)}\b\]?", re.I)
+        if pattern.search(text):
+            found.append(word)
+            text = pattern.sub(" ", text)
+    # trailing colour words that name a Pikachu variant rather than a card
+    words = text.split()
+    while words and words[-1].casefold() in _VARIANT_ALIASES:
+        mapped = _VARIANT_ALIASES[words.pop().casefold()]
+        if mapped:
+            found.append(mapped)
+    core = re.sub(r"#\s*\d+", " ", " ".join(words))
+    core = " ".join(core.replace("[", " ").replace("]", " ").split())
+    return core, [f.casefold() for f in found]
+
+
 class ExactIndex:
     """(set, product-name) -> rows, plus product-name -> rows.
 
@@ -163,6 +246,7 @@ class ExactIndex:
     def __init__(self, rows):
         self.by_set_name: dict[tuple, list] = defaultdict(list)
         self.by_name: dict[str, list] = defaultdict(list)
+        self.by_core: dict[str, list] = defaultdict(list)
         for row in rows:
             name = _norm(row.get("product-name"))
             console = _norm(row.get("console-name"))
@@ -170,6 +254,31 @@ class ExactIndex:
                 continue
             self.by_set_name[(console, name)].append(row)
             self.by_name[name].append(row)
+            core, _ = _product_variants(row.get("product-name") or "")
+            if core:
+                self.by_core[_norm(core)].append(row)
+
+    def flexible(self, name: str, set_name: str = "") -> tuple[list, str]:
+        """Resolve a human-written name to products. Never guesses.
+
+        Requires the variant words to match EXACTLY both ways: a list
+        saying "1st Edition" must not match a Shadowless product, and a
+        list saying plain "Charizard" must not match the 1st Edition one.
+        """
+        core, want = _split_variants(name)
+        rows = list(self.by_core.get(_norm(core), []))
+        if set_name:
+            key = _norm(set_name)
+            narrowed = [r for r in rows
+                        if key in _norm(r.get("console-name"))
+                        or _norm(r.get("console-name")) in key]
+            rows = narrowed or rows
+        hits = []
+        for row in rows:
+            _, have = _product_variants(row.get("product-name") or "")
+            if sorted(set(have)) == sorted(set(want)):
+                hits.append(row)
+        return hits, ("name + variant" if hits else "")
 
     def lookup(self, name: str, set_name: str = "") -> tuple[list, str]:
         """(candidate rows, how). Empty list means no exact hit."""
@@ -213,6 +322,8 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
                matched_name="", matched_set="", note="")
 
     candidates, how_matched = index.lookup(name, set_name)
+    if not candidates:
+        candidates, how_matched = index.flexible(name, set_name)
 
     if len(candidates) > 1:
         # Collapse duplicates of the SAME product across files (a set can
@@ -331,25 +442,40 @@ def write_report(path: str, priced: list[dict], warnings: list[str],
 
     ok = [r for r in priced if r["price"] is not None]
     bad = [r for r in priced if r["price"] is None]
+    has_cost = any(r.get("cost") is not None for r in priced)
     wb = openpyxl.Workbook()
 
     ws = wb.active
     ws.title = "Priced"
-    headers = ["Line", "Card", "Set", "Grade", "Price", "Matched Product",
-               "Matched Set", "Source", "Price Field"]
+    headers = ["Line", "Card", "Set", "Grade"]
+    if has_cost:
+        headers += ["Cost", "Value", "PnL"]
+    else:
+        headers += ["Value"]
+    headers += ["Matched Product", "Matched Set", "Source", "Price Field"]
     ws.append(headers)
     for r in ok:
-        ws.append([r["line"], r["name"], r["set"], r["grade"], r["price"],
-                   r["matched_name"], r["matched_set"], r["source"],
-                   r["how"]])
+        row = [r["line"], r["name"], r["set"], r["grade"]]
+        if has_cost:
+            cost = r.get("cost")
+            pnl = (r["price"] - cost) if cost is not None else None
+            row += [cost, r["price"], pnl]
+        else:
+            row += [r["price"]]
+        row += [r["matched_name"], r["matched_set"], r["source"], r["how"]]
+        ws.append(row)
     for c in ws[1]:
         c.font = Font(bold=True)
     ws.freeze_panes = "A2"
-    for i, w in enumerate([6, 42, 26, 10, 14, 42, 26, 26, 34], start=1):
+    widths = ([6, 42, 26, 10] + ([14, 14, 14] if has_cost else [14])
+              + [42, 26, 26, 34])
+    for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
-    for row in ws.iter_rows(min_row=2, min_col=5, max_col=5):
+    money_first, money_last = 5, (7 if has_cost else 5)
+    for row in ws.iter_rows(min_row=2, min_col=money_first,
+                            max_col=money_last):
         for c in row:
-            c.number_format = '"$"#,##0.00'
+            c.number_format = '"$"#,##0.00;[Red]-"$"#,##0.00'
 
     ws2 = wb.create_sheet("Not Priced")
     ws2.append(["Line", "Card", "Set", "Grade", "Why"])
@@ -364,6 +490,7 @@ def write_report(path: str, priced: list[dict], warnings: list[str],
 
     ws3 = wb.create_sheet("Summary")
     total = sum(r["price"] for r in ok)
+    cost_total = sum(r["cost"] for r in priced if r.get("cost") is not None)
     local = sum(1 for r in ok if r["source"].startswith("local"))
     lines = [
         ("Basket", basket_name),
@@ -372,6 +499,9 @@ def write_report(path: str, priced: list[dict], warnings: list[str],
         ("Not priced", len(bad)),
         ("", ""),
         ("Total value", total),
+        ("Total cost", cost_total) if has_cost else ("", ""),
+        ("Total PnL", total - cost_total) if has_cost else ("", ""),
+        ("", ""),
         ("Priced from local CSV (no API calls)", local),
         ("Priced via guide lookup", len(ok) - local),
         ("", ""),
@@ -383,7 +513,8 @@ def write_report(path: str, priced: list[dict], warnings: list[str],
         ws3.append([label, value])
     for w in warnings:
         ws3.append(["WARNING", w])
-    ws3["B6"].number_format = '"$"#,##0.00'
+    for cell in ("B6", "B7", "B8"):
+        ws3[cell].number_format = '"$"#,##0.00;[Red]-"$"#,##0.00'
     for c in ws3["A"]:
         c.font = Font(bold=True)
     ws3.column_dimensions["A"].width = 38
@@ -486,7 +617,7 @@ def main(argv=None) -> int:
 
     basket_name = os.path.basename(args.infile)
     out = args.out or os.path.join(
-        ROOT, "reports", f"basket_{_slug(os.path.splitext(basket_name)[0])}.xlsx")
+        REPORT_DIR, f"{_slug(os.path.splitext(basket_name)[0])}.xlsx")
     write_report(out, priced, warnings, basket_name)
 
     ok = [r for r in priced if r["price"] is not None]
@@ -495,6 +626,10 @@ def main(argv=None) -> int:
     print(f"  priced      {len(ok)} of {len(priced)}")
     print(f"  total       ${total:,.2f}")
     print(f"  local CSV   {local} (no API calls)   guide lookups {len(ok)-local}")
+    costs = [r["cost"] for r in priced if r.get("cost") is not None]
+    if costs:
+        print(f"  cost        ${sum(costs):,.2f}")
+        print(f"  PnL         ${total - sum(costs):,.2f}")
     if len(priced) - len(ok):
         print(f"  not priced  {len(priced)-len(ok)} - see the 'Not Priced' tab")
     for w in warnings:

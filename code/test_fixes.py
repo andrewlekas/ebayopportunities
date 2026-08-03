@@ -5340,6 +5340,42 @@ class TestCustomBasketPricer(unittest.TestCase):
         self.assertEqual(rows[0]["set"], "Pokemon Base Set")
         self.assertFalse(warnings)
 
+    def test_resolves_names_written_the_way_collectors_write_them(self):
+        """The guide says 'Alakazam [1st Edition] #1'; a personal list says
+        '1999 1st Edition Alakazam'. Both name one card."""
+        m = self._mod()
+        index = m.ExactIndex(self._rows())
+        got = m.price_row({"name": "1999 1st Edition Charizard",
+                           "grade": "PSA 10", "set": "Pokemon Base Set",
+                           "line": 2}, index, None, [0])
+        self.assertEqual(got["matched_name"], "Charizard [1st Edition] #4")
+        self.assertEqual(got["price"], 343098.00)
+
+    def test_variants_must_match_exactly_both_ways(self):
+        """'1st Edition' must not match the Shadowless product, and a plain
+        name must not match a 1st Edition one. Silently pricing a $3,099
+        1st Edition as a $370 base copy is the failure that matters."""
+        m = self._mod()
+        index = m.ExactIndex(self._rows())
+        rows, _ = index.flexible("1999 Shadowless Charizard",
+                                 "Pokemon Base Set")
+        self.assertEqual([r["product-name"] for r in rows],
+                         ["Charizard [Shadowless] #4"])
+        rows, _ = index.flexible("1999 1st Edition Charizard",
+                                 "Pokemon Base Set")
+        self.assertEqual([r["product-name"] for r in rows],
+                         ["Charizard [1st Edition] #4"])
+
+    def test_cost_column_produces_pnl(self):
+        m = self._mod()
+        tmp = os.path.join(tempfile.mkdtemp(), "h.csv")
+        with open(tmp, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["Card", "Grade", "Cost"])
+            w.writerow(["1999 1st Edition Charizard", "PSA 10", "$2,034"])
+        rows, _ = m.read_basket(tmp)
+        self.assertEqual(rows[0]["cost"], 2034.0)
+
     def test_a_basket_over_the_limit_is_truncated_loudly(self):
         m = self._mod()
         tmp = os.path.join(tempfile.mkdtemp(), "big.csv")
