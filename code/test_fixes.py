@@ -3480,7 +3480,17 @@ class TestGuideCsvDownloader(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(kind, m.KIND_RATE)
 
-    def test_a_refused_host_skips_its_remaining_categories_without_sleeping(self):
+    def _run_main(self, m, tmp, guides, fake_download, sleeps):
+        with mock.patch.object(m, "FOLDER", os.path.join(tmp, "guide_csv")), \
+             mock.patch.object(m, "download", fake_download), \
+             mock.patch.object(m.time, "sleep", lambda s: sleeps.append(s)), \
+             mock.patch.object(m.scanner, "load_config", lambda p: {
+                 "api_keys": {"pricecharting": {"token": "t"}},
+                 "guide_csv": dict(cooldown_seconds=900, **guides)}), \
+             mock.patch.object(m.sys, "argv", ["x"]):
+            m.main()
+
+    def test_a_refusal_skips_the_rest_of_that_shape_without_sleeping(self):
         """The whole point: one 403 must not cost 45 more minutes of sleep."""
         m = self._mod()
         tmp = tempfile.mkdtemp()
@@ -3488,33 +3498,45 @@ class TestGuideCsvDownloader(unittest.TestCase):
         sleeps, tried = [], []
 
         def fake_download(host, slug, token, path, console_uids=None):
-            tried.append((m._host_label(host), console_uids or slug
-                          or "video-games"))
-            if "sportscardspro" in host:
-                return False, "HTTP 403", m.KIND_NOT_COVERED
-            with open(path, "w") as fh:
-                fh.write("id,product-name,console-name\n1,a,b\n")
-            return True, "1.0 MB", m.KIND_OK
+            tried.append(console_uids or slug)
+            return False, "HTTP 403", m.KIND_NOT_COVERED
 
-        sports_sets = [
-            {"name": f"set {u}", "host": m.SCP, "console_uids": u}
-            for u in ("G155", "G156", "G157", "G158")]
-        with mock.patch.object(m, "FOLDER", os.path.join(tmp, "guide_csv")), \
-             mock.patch.object(m, "download", fake_download), \
-             mock.patch.object(m.time, "sleep", lambda s: sleeps.append(s)), \
-             mock.patch.object(m.scanner, "load_config", lambda p: {
-                 "api_keys": {"pricecharting": {"token": "t"}},
-                 "guide_csv": {"cooldown_seconds": 900,
-                               "extra_guides": sports_sets}}), \
-             mock.patch.object(m.sys, "argv", ["x"]):
-            m.main()
+        cats = [{"name": f"{s} cards", "host": m.SCP, "category": f"{s}-cards"}
+                for s in ("baseball", "basketball", "football", "hockey")]
+        self._run_main(m, tmp, {"guides": cats}, fake_download, sleeps)
 
-        scp = [t for t in tried if t[0] == "SportsCardsPro"]
-        self.assertEqual(len(scp), 1,
-                         "only the FIRST SportsCardsPro category should be "
-                         "attempted once the host has refused")
-        self.assertEqual(len(sleeps), 4,
-                         "no sleeping between the skipped categories")
+        self.assertEqual(tried, ["baseball-cards"],
+                         "one refusal is enough to know the rest of the "
+                         "catalogues will be refused too")
+        self.assertFalse(sleeps, "and no sleeping between the skipped ones")
+
+    def test_a_refused_catalogue_does_not_skip_a_working_set_download(self):
+        """Regression: 2026-08-01. The skip was keyed by host, so a
+        speculative `category=` refusal would also skip `console-uids=`
+        downloads on that host - which are the ones known to work. The two
+        selectors must be judged separately."""
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "guide_csv"), exist_ok=True)
+        sleeps, tried = [], []
+
+        def fake_download(host, slug, token, path, console_uids=None):
+            tried.append(console_uids or slug)
+            if console_uids:                       # the proven selector
+                with open(path, "w") as fh:
+                    fh.write("id,product-name,console-name\n1,a,b\n")
+                return True, "25 KB", m.KIND_OK
+            return False, "HTTP 403", m.KIND_NOT_COVERED
+
+        cats = [{"name": f"{s} cards", "host": m.SCP, "category": f"{s}-cards"}
+                for s in ("baseball", "basketball")]
+        sets = [{"name": f"set {u}", "host": m.SCP, "console_uids": u}
+                for u in ("G155", "G156")]
+        self._run_main(m, tmp, {"guides": cats, "extra_guides": sets},
+                       fake_download, sleeps)
+
+        self.assertEqual(tried, ["baseball-cards", "G155", "G156"],
+                         "the catalogue refusal must not poison the sets")
 
     def test_a_rate_limited_file_is_retried_once(self):
         m = self._mod()
@@ -3858,14 +3880,30 @@ class TestGuideCsvDownloader(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(used, ["plain"])
 
-    def test_defaults_no_longer_send_category_to_sportscardspro(self):
-        """Those four entries could only ever 403."""
+    def test_defaults_cover_the_four_sports_catalogues(self):
+        """Restored 2026-08-01. They were dropped for returning 403, but at
+        the time EVERY request to that host was being challenged, so the 403
+        was not evidence about the parameter. Sports is the largest guide
+        gap and a whole sport per file dwarfs a set at a time, so they are
+        back - failing cheaply now if the site really does refuse them."""
+        m = self._mod()
+        scp = [g for g in m._normalise_guides(m.DEFAULT_GUIDES)
+               if "sportscardspro" in g["host"]]
+        self.assertEqual(sorted(g["category"] for g in scp),
+                         ["baseball-cards", "basketball-cards",
+                          "football-cards", "hockey-cards"])
+        for g in scp:
+            self.assertIsNone(g["console_uids"],
+                              "a catalogue entry selects by category, and "
+                              "sending both selectors is ambiguous")
+
+    def test_each_default_sends_exactly_one_selector(self):
+        """`download` sends console-uids if present, category otherwise. An
+        entry carrying both would silently drop the category."""
         m = self._mod()
         for g in m._normalise_guides(m.DEFAULT_GUIDES):
-            if "sportscardspro" in g["host"]:
-                self.assertIsNone(
-                    g["category"],
-                    "a SportsCardsPro default must not use category=")
+            self.assertFalse(g["category"] and g["console_uids"],
+                             f"{g['name']} sets both selectors")
 
 
 class TestLiveAuctionPricing(unittest.TestCase):

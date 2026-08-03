@@ -83,6 +83,19 @@ DEFAULT_GUIDES = [
     ("pokemon-cards", PC, "Pokemon cards"),
     ("comic-books", PC, "comic books"),
     ("other-cards", PC, "other non-TCG cards"),
+    # Restored 2026-08-01. These four were removed on 2026-07-28 because
+    # they returned 403, which I read as "this host selects by console-uids,
+    # not category". That conclusion is no longer supported: the 403 was a
+    # Cloudflare challenge, and every SportsCardsPro request was getting one
+    # regardless of parameters. With curl_cffi clearing the challenge, the
+    # slugs deserve a fair test - a whole sport per file is worth far more
+    # than a set at a time, and sports cards are the largest guide gap.
+    # If they really are unsupported the run now says so in one cheap
+    # failure instead of four expensive ones.
+    ("baseball-cards", SCP, "baseball cards"),
+    ("basketball-cards", SCP, "basketball cards"),
+    ("football-cards", SCP, "football cards"),
+    ("hockey-cards", SCP, "hockey cards"),
 ]
 
 # Their documented limit is one CSV every ten minutes. 2026-07-28 evidence:
@@ -226,11 +239,13 @@ def _normalise_guides(raw) -> list[dict]:
         PriceCharting    /price-guide/download-custom?t=..&category=pokemon-cards
         SportsCardsPro   /price-guide/download-custom?t=..&console-uids=G155
 
-    Sending `category=baseball-cards` to SportsCardsPro returns HTTP 403 even
-    for a Legendary subscriber, which looked like a subscription problem and
-    was not. Correcting the selector then revealed the real wall: that host
-    is behind a Cloudflare challenge, so these entries are expected to fail
-    from a script and be satisfied by a browser download instead.
+    `console-uids` is the selector the site's own "Download Price List"
+    link uses for a single set, and is known to work. Whether that host
+    ALSO accepts a whole-catalogue `category=baseball-cards` is unsettled:
+    it used to 403, but every SportsCardsPro request was being challenged
+    by Cloudflare at the time, so the 403 says nothing about the parameter.
+    Now that curl_cffi clears the challenge, the catalogue slugs are back in
+    DEFAULT_GUIDES to be judged on their own evidence.
     """
     out: list[dict] = []
     for entry in raw or []:
@@ -470,10 +485,16 @@ def main() -> int:
 
     ok = 0
     failures: list[tuple[str, str, str]] = []
-    # A host that refuses us for a subscription reason will refuse every one
-    # of its categories. Recording that lets the rest of its files fail fast
-    # instead of costing a quarter of an hour each.
-    blocked_hosts: dict[str, tuple[str, str]] = {}
+    # A host that refuses us for a subscription reason will refuse every
+    # other request OF THE SAME SHAPE. Recording that lets the rest fail
+    # fast instead of costing a quarter of an hour each.
+    #
+    # Keyed by (host, selector) rather than host alone: SportsCardsPro
+    # answers `console-uids` requests we know work, so a refusal of a
+    # whole-catalogue `category` request must not skip them. Keying on the
+    # host would have let one speculative catalogue poison a set download
+    # that was already proven good.
+    blocked_hosts: dict[tuple[str, str], tuple[str, str]] = {}
     pending = list(todo)
     waited = False
     while pending:
@@ -481,8 +502,9 @@ def main() -> int:
         slug, host, name, path = (g["category"] or "", g["host"], g["name"],
                                   g["path"])
         uids = g["console_uids"]
-        if host in blocked_hosts:
-            kind, why = blocked_hosts[host]
+        selector = "console-uids" if uids else "category"
+        if (host, selector) in blocked_hosts:
+            kind, why = blocked_hosts[(host, selector)]
             print(f"  skipping {name} - {_host_label(host)} already refused "
                   f"this request ({why})")
             failures.append((name, why, kind))
@@ -515,9 +537,9 @@ def main() -> int:
         print(f"    FAILED  {detail}")
         failures.append((name, detail, kind))
         if kind in (KIND_NOT_COVERED, KIND_CHALLENGE):
-            # Both refuse every category on that host, so stop paying 15
-            # minutes each to be told the same thing.
-            blocked_hosts[host] = (kind, detail)
+            # Both refuse every request of this shape on that host, so stop
+            # paying 15 minutes each to be told the same thing.
+            blocked_hosts[(host, selector)] = (kind, detail)
 
     print()
     print(f"Downloaded {ok} of {len(todo)}.")
