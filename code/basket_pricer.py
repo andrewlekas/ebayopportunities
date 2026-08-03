@@ -686,7 +686,17 @@ def main(argv=None) -> int:
     guide = PriceGuide(config)
     exact = ExactIndex(index.rows)
     budget = [max(0, args.api_cap)]
-    priced = [price_row(r, exact, guide, budget) for r in rows]
+
+    # Cards the local CSVs cannot answer go to the paid guide at one call
+    # per second, so a long basket is a long silence. Say what is happening.
+    print(f"  pricing {len(rows)} line item(s) from "
+          f"{len(index):,} guide products...", flush=True)
+    priced = []
+    for n, row in enumerate(rows, start=1):
+        priced.append(price_row(row, exact, guide, budget))
+        if n % 10 == 0 or n == len(rows):
+            got = sum(1 for r in priced if r["price"] is not None)
+            print(f"    {n}/{len(rows)}  ({got} priced)", flush=True)
 
     basket_name = os.path.basename(args.infile)
     out = args.out or os.path.join(
