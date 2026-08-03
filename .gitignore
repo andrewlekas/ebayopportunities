@@ -41,3 +41,7 @@ __pycache__/
 *.xlsx
 *.xls
 *.log
+
+# basket pricer: your card lists and their priced output are your data
+baskets/
+reports/basket_*.xlsx

@@ -10,6 +10,7 @@ test_results.log), or:
 """
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -5095,6 +5096,179 @@ class TestSourceOnboarding(unittest.TestCase):
             self.assertEqual(rows[0].listing_id, "lot-7")
             self.assertEqual(rows[0].buyer_fee_rate, 0.20)
             self.assertEqual(rows[0].shipping, 12)
+
+
+class TestCustomBasketPricer(unittest.TestCase):
+    """Prices a user-supplied list of cards from the local guide CSVs.
+
+    The scanner must refuse ambiguity because strangers write its input.
+    Here the user names the card, so an exact (set, name) hit is allowed to
+    be decisive - but a name that spans several sets is still reported,
+    never resolved by guessing.
+    """
+
+    def _mod(self):
+        import basket_pricer
+        return basket_pricer
+
+    def _rows(self):
+        """Rows in the shape guide_csv actually produces.
+
+        It converts "$343,098.00" to an integer number of CENTS at load
+        time, so a fixture holding dollar strings is not a smaller version
+        of the real thing - it is a different thing, and every price reads
+        as missing.
+        """
+        def row(console, name, **prices):
+            base = {"console-name": console, "product-name": name,
+                    "loose-price": "", "cib-price": "", "new-price": "",
+                    "graded-price": "", "box-only-price": "",
+                    "manual-only-price": "", "bgs-10-price": "",
+                    "condition-17-price": "", "condition-18-price": ""}
+            base.update({k.replace("_", "-"): round(v * 100)
+                         for k, v in prices.items()})
+            return base
+        return [
+            row("Pokemon Base Set", "Charizard [1st Edition] #4",
+                loose_price=3099.45, graded_price=23000.00,
+                manual_only_price=343098.00),
+            row("Pokemon Base Set", "Charizard [Shadowless] #4",
+                loose_price=1005.00, manual_only_price=30100.00),
+            # A plain "Charizard #4" really does exist in five different
+            # sets. Leaving it in only one made the ambiguity test pass for
+            # the wrong reason - the fixture, not the code, was deciding.
+            row("Pokemon Base Set", "Charizard #4",
+                loose_price=370.37, manual_only_price=30100.00),
+            row("Pokemon Base Set 2", "Charizard #4",
+                loose_price=95.00, manual_only_price=3000.00),
+            row("Pokemon Base Set", "Booster Box [1st Edition]",
+                loose_price=14179.19),
+            row("Pokemon Base Set", "Dratini [1st Edition] #26",
+                loose_price=20.00, manual_only_price=900.00),
+            row("Pokemon Base Set", "Fighting Energy [1st Edition] #97",
+                loose_price=9.00, manual_only_price=400.00),
+        ]
+
+    def _price(self, name, grade="", set_name=""):
+        m = self._mod()
+        index = m.ExactIndex(self._rows())
+        row = {"name": name, "grade": grade, "set": set_name, "line": 2}
+        return m.price_row(row, index, guide=None, api_budget=[0])
+
+    def test_set_plus_name_is_decisive(self):
+        got = self._price("Charizard [1st Edition] #4", "PSA 10",
+                          "Pokemon Base Set")
+        self.assertEqual(got["price"], 343098.00)
+        self.assertEqual(got["how"], "manual-only-price")
+        self.assertIn("local CSV", got["source"])
+
+    def test_an_ambiguous_name_is_reported_not_guessed(self):
+        """'Charizard #4' is three different products between $3,000 and
+        $343,098. The scanner refuses this and so does the basket."""
+        got = self._price("Charizard #4", "PSA 10")
+        self.assertIsNone(got["price"])
+        self.assertIn("ambiguous", got["note"])
+        self.assertIn("Pokemon Base Set 2", got["note"])
+
+    def test_grade_routing_is_the_scanners_own(self):
+        """Not a reimplementation: same ladder, same cross-grader shift,
+        same refusal to round a grade up."""
+        cases = [
+            ("PSA 10", 343098.00, "manual-only-price"),
+            ("PSA 9", 23000.00, "graded-price"),
+            ("", 3099.45, "loose (ungraded)"),
+        ]
+        for grade, want, how in cases:
+            got = self._price("Charizard [1st Edition] #4", grade,
+                              "Pokemon Base Set")
+            self.assertAlmostEqual(got["price"], want, places=2, msg=grade)
+            self.assertEqual(got["how"], how)
+
+    def test_sealed_product_is_left_out_of_a_seeded_set(self):
+        """A $14,179 booster box priced as a PSA 10 card silently inflated
+        the 1st Edition Base Set total by ~$32k."""
+        m = self._mod()
+        cards, sealed = m.seed_set(self._rows(), "Pokemon Base Set")
+        names = [c["name"] for c in cards]
+        self.assertIn("Booster Box [1st Edition]",
+                      [s["name"] for s in sealed])
+        self.assertNotIn("Booster Box [1st Edition]", names)
+        cards2, sealed2 = m.seed_set(self._rows(), "Pokemon Base Set",
+                                     include_sealed=True)
+        self.assertFalse(sealed2)
+        self.assertIn("Booster Box [1st Edition]",
+                      [c["name"] for c in cards2])
+
+    def test_sealed_detection_uses_word_boundaries(self):
+        """Regression: a substring test called 'Dratini' and 'Fighting
+        Energy' sealed product, because both contain 'tin'. Two real cards
+        would have vanished from the set silently."""
+        m = self._mod()
+        cards, _ = m.seed_set(self._rows(), "Pokemon Base Set")
+        names = [c["name"] for c in cards]
+        self.assertIn("Dratini [1st Edition] #26", names)
+        self.assertIn("Fighting Energy [1st Edition] #97", names)
+        self.assertFalse(m._is_sealed("Dratini [1st Edition] #26"))
+        self.assertTrue(m._is_sealed("Booster Box [1st Edition]"))
+
+    def test_the_api_cap_is_honoured(self):
+        """A 500-row basket must not be able to drain the run's quota."""
+        m = self._mod()
+        index = m.ExactIndex(self._rows())
+        calls = []
+
+        class FakeGuide:
+            def quote(self, ident, category=None):
+                calls.append(ident)
+                class Q:
+                    value = None; match = "none"; how = ""; note = "miss"
+                    product_name = console_name = ""
+                return Q()
+
+        budget = [2]
+        for i in range(6):
+            m.price_row({"name": f"Unknown Card {i}", "grade": "",
+                         "set": "", "line": i}, index, FakeGuide(), budget)
+        self.assertEqual(len(calls), 2, "cap must stop further API lookups")
+
+        capped = m.price_row({"name": "Another", "grade": "", "set": "",
+                              "line": 9}, index, FakeGuide(), budget)
+        self.assertIn("API cap reached", capped["note"])
+
+    def test_grades_are_floats_before_they_reach_the_ladder(self):
+        """grade_info reports strings; _guide_cents compares numerically.
+        Passing them through raised TypeError on the first graded row."""
+        got = self._price("Charizard [1st Edition] #4", "PSA 9",
+                          "Pokemon Base Set")
+        self.assertIsInstance(got["effective_grade"], float)
+        self.assertIsNone(got["note"] or None)
+
+    def test_reads_a_csv_basket_with_loose_headers(self):
+        m = self._mod()
+        tmp = os.path.join(tempfile.mkdtemp(), "b.csv")
+        with open(tmp, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["Item Name", "Console-Name", "Condition"])
+            w.writerow(["Charizard [1st Edition] #4", "Pokemon Base Set",
+                        "PSA 10"])
+        rows, warnings = m.read_basket(tmp)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "Charizard [1st Edition] #4")
+        self.assertEqual(rows[0]["grade"], "PSA 10")
+        self.assertEqual(rows[0]["set"], "Pokemon Base Set")
+        self.assertFalse(warnings)
+
+    def test_a_basket_over_the_limit_is_truncated_loudly(self):
+        m = self._mod()
+        tmp = os.path.join(tempfile.mkdtemp(), "big.csv")
+        with open(tmp, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["Card", "Grade"])
+            for i in range(m.MAX_ROWS + 25):
+                w.writerow([f"Card {i}", "PSA 9"])
+        rows, warnings = m.read_basket(tmp)
+        self.assertEqual(len(rows), m.MAX_ROWS)
+        self.assertTrue(any("ignoring the rest" in w for w in warnings))
 
 
 if __name__ == "__main__":
