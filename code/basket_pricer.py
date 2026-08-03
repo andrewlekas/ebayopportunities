@@ -305,10 +305,20 @@ class ExactIndex:
 # Words that change WHAT THE OBJECT IS rather than describing it. If your
 # list says one of these and the closest product does not, they are not the
 # same asset, however well the rest of the name lines up.
+#
+# Deliberately NARROW. Autograph, relic and parallel are already modelled as
+# structured fields on CardIdentity and enforced by conflicts_with(), which
+# compares identities rather than guessing from a product name. Listing them
+# here too would double-refuse: a product legitimately catalogued as
+# "Mike Trout #BCP111" with the autograph expressed elsewhere would be
+# thrown out for not having "auto" in its title.
+#
+# What is left is vocabulary the identity system does not model, where the
+# only signal IS the words. "Michael Jordan 1986 Fleer Sticker RC" resolved
+# to the base rookie "Michael Jordan #57" and priced at $15,604.
 _DISTINGUISHING = (
-    "sticker", "promo", "error", "refractor", "prizm", "patch", "jersey",
-    "auto", "autograph", "relic", "insert", "box topper", "oversized",
-    "mini", "die-cut", "die cut", "reprint", "proof", "blank back",
+    "sticker", "promo", "error", "reprint", "proof", "box topper",
+    "oversized", "blank back", "puzzle", "wrapper",
 )
 
 
@@ -418,7 +428,15 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
                    how=quote.how, matched_name=quote.product_name or "",
                    matched_set=quote.console_name or "")
     else:
-        out["note"] = quote.note or "not found in CSVs or guide"
+        # "no guide host configured" is what the guide says when the local
+        # CSVs could not land it and no paid host was allowed. Told to a
+        # person staring at a Mike Trout that did not price, that is not an
+        # explanation - so say which of the two actually happened.
+        note = quote.note or "not found in CSVs or guide"
+        if not paid_allowed and "no guide host" in note:
+            note = ("no local guide covers this card - re-run without "
+                    "--api-cap 0 so the paid guide can answer it")
+        out["note"] = note
     return out
 
 
