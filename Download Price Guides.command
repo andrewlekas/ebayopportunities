@@ -13,7 +13,7 @@
 #
 # Not every failure is a timing problem. If a site refuses the subscription,
 # the rest of that site's categories are skipped immediately rather than
-# costing fifteen minutes each, and the summary says so. CSV download is a
+# costing eleven minutes each, and the summary says so. CSV download is a
 # per-site premium feature - a subscription on one site does not
 # automatically include the other.
 #

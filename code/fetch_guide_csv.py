@@ -12,9 +12,11 @@ full scan, so this is the difference between minutes and seconds.
 
 Two limits shape how this behaves, both from PriceCharting's own docs:
 
-  * CSV requests are limited to ONE EVERY TEN MINUTES. We wait 15 by
-    default for headroom (guide_csv.cooldown_seconds). A first run covering
-    several categories takes a while; that is the provider's rule.
+  * CSV requests are limited to ONE EVERY TEN MINUTES. We wait 11 by
+    default (guide_csv.cooldown_seconds). It was briefly 15 while the
+    SportsCardsPro refusals were still thought to be a rate limit; they
+    were a bot challenge, so the extra four minutes bought nothing. A run
+    covering several categories still takes a while; that is their rule.
     NOTE: not every refusal is a timing problem. Diagnosing the 2026-07-28
     SportsCardsPro 403s took three wrong turns, so the record is:
       * NOT a rate limit - all four PriceCharting categories succeeded at
@@ -33,7 +35,7 @@ Two limits shape how this behaves, both from PriceCharting's own docs:
         itself the signal. If curl_cffi is missing we fall back to plain
         requests with no spoofed headers.
     Refusals that waiting cannot fix are skipped immediately rather than
-    costing 15 minutes each.
+    costing eleven minutes each.
   * The upstream files may regenerate daily, but collectible guide prices do
     not need daily refreshes for this scanner. The default refresh target is
     once per week and can be changed with guide_csv.fresh_hours.
@@ -100,12 +102,12 @@ DEFAULT_GUIDES = [
 
 # Their documented limit is one CSV every ten minutes. 2026-07-28 evidence:
 # four PriceCharting categories downloaded cleanly at 10m13s / 11m08s / 10m31s
-# spacing, so ten minutes IS sufficient for that host. The default is now 15
-# minutes purely for headroom; override with guide_csv.cooldown_seconds.
-CSV_COOLDOWN_SECONDS = 900
+# spacing, so ten minutes IS sufficient for that host. Eleven is a one-minute
+# safety margin; override with guide_csv.cooldown_seconds.
+CSV_COOLDOWN_SECONDS = 660
 FRESH_HOURS = 168                 # weekly refresh; older files remain usable
 
-# Why a download failed decides what to do next. Sleeping fifteen minutes
+# Why a download failed decides what to do next. Sleeping eleven minutes
 # between files that are all going to be refused for the same reason wastes
 # an hour and teaches us nothing.
 KIND_OK = "ok"
@@ -538,7 +540,7 @@ def main() -> int:
         failures.append((name, detail, kind))
         if kind in (KIND_NOT_COVERED, KIND_CHALLENGE):
             # Both refuse every request of this shape on that host, so stop
-            # paying 15 minutes each to be told the same thing.
+            # paying eleven minutes each to be told the same thing.
             blocked_hosts[(host, selector)] = (kind, detail)
 
     print()

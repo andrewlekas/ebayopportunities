@@ -100,6 +100,10 @@ GAME_RE = re.compile(
 CARD_RE = re.compile(
     r"\b(psa|bgs|sgc|cgc|bvg|topps|bowman|panini|upper\s*deck|fleer|"
     r"donruss|leaf|score|pinnacle|refractor|prizm|rookie\s*card|\brc\b|"
+    # A Rookie Patch Auto names neither its maker nor, often, a grader:
+    # "2019 IMMACULATE #132 PJ WASHINGTON JR TRUE RPA ROOKIE PATCH AUTO /99"
+    # matched nothing here and came out object_class "unknown".
+    r"patch\s*auto|auto\s*patch|\brpa\b|rookie\s*patch|"
     r"card\s*#|holo|carddass|topsun)\b", re.I)
 
 # CGC and SGC grade comics as well as cards, so the graders cannot be used
@@ -109,7 +113,47 @@ CARD_RE = re.compile(
 CARD_ONLY_RE = re.compile(
     r"\b(topps|bowman|panini|upper\s*deck|fleer|donruss|leaf|pinnacle|"
     r"refractor|prizm|rookie\s*card|\brc\b|card\s*#|holo|carddass|"
+    # 2026-08-02: a Rookie Patch Auto is a CARD, but its title is nothing
+    # but memorabilia nouns and it rarely names its manufacturer, so
+    # "National Treasures ... Patch Auto Jersey PSA 9" was filed as Sports
+    # Memorabilia. That quietly emptied the Sports Cards tab of exactly the
+    # modern sports product the watchlist targets most.
+    r"patch\s*auto|auto\s*patch|\brpa\b|rookie\s*patch|"
     r"topsun)\b", re.I)
+
+# Memorabilia nouns split by whether a CARD can legitimately carry them.
+#
+# "Jersey", "patch", "bat" and "ball" are all over relic cards - a 2022
+# National Treasures Rookie Patch Auto is a card with a jersey swatch in it.
+# "Photo", "flag", "canvas" and "poster" are not: no card is a canvas.
+#
+# Only the second group may outrank a brand name. Letting the first group do
+# it stripped 68 genuine jersey/relic cards out of Sports Cards when this was
+# first attempted, which is the opposite of the problem being fixed.
+# NB: "patch" is deliberately absent. Adding it to this list swept in every
+# National Treasures / The Cup "Rookie Patch Auto" - 178 real cards in one
+# pass - because a patch card's title is nothing but memorabilia nouns.
+SWATCH_NOUNS = (r"shirt|jersey|cap|hat|glove|helmet|bat\b|ball\b|puck|"
+                r"club|driver|ticket")
+NEVER_A_CARD = (r"photo|photograph|flag|pennant|banner|poster|print|plaque|"
+                r"lithograph|canvas|program|magazine|"
+                r"cut\s*signature|display\s*case|(video\s*)?game\s*cover|"
+                r"blow[-\s]*up\s*card|custom\s*framed|"
+                r"tourney\s*worn|tournament\s*worn|game\s*worn|match\s*worn")
+
+# 2026-08-02: "Upper Deck" is in CARD_ONLY_RE because Upper Deck makes
+# cards - but Upper Deck Authenticated is their signed-MEMORABILIA arm. A
+# brand name therefore proved cardness for a signed photo, a signed
+# video-game cover, a Masters flag and a signed canvas, and four such Tiger
+# Woods items were most of what the Sports Cards tab contained.
+STRONG_MEMORABILIA_RE = re.compile(rf"\b({NEVER_A_CARD})\b", re.I)
+
+# The narrow set of card vocabulary allowed to overrule even those, because
+# it names a card product rather than a manufacturer.
+CARD_PRODUCT_RE = re.compile(
+    r"\b(refractor|prizm|rookie\s*card|\brc\b|card\s*#|carddass|topsun|"
+    r"patch\s*auto|auto\s*patch|\brpa\b|photo\s*variation|photo\s*var\b|"
+    r"short\s*print|parallel|insert|die[-\s]*cut)\b", re.I)
 
 # Video-game graders must not turn a sealed game into a "card" just because
 # the title says graded.  Card graders are the card signal.
@@ -120,12 +164,7 @@ GAME_GRADERS = {"wata", "vga"}
 # "Tiger Woods Framed Photo UDA" and "Tourney Worn Shirt" were object_class
 # "unknown", conflicted with nothing, and sat happily in the ask pool for a
 # rookie CARD - one of the ways 149 mongrel asks became a single $1,799.10.
-MEMORABILIA_RE = re.compile(
-    r"\b(photo|photograph|flag|pennant|banner|poster|print|plaque|"
-    r"shirt|jersey|cap|hat|glove|helmet|bat\b|ball\b|puck|club|driver|"
-    r"ticket|program|magazine|cut\s*signature|display\s*case|"
-    r"lithograph|blow[-\s]*up\s*card|custom\s*framed|"
-    r"tourney\s*worn|game\s*worn|match\s*worn)\b", re.I)
+MEMORABILIA_RE = re.compile(rf"\b({NEVER_A_CARD}|{SWATCH_NOUNS})\b", re.I)
 
 OBJECT_CLASSES = ("watch_part", "watch", "figure", "wrapper", "pack",
                   "coupon", "comic", "game", "memorabilia", "card", "unknown")
@@ -156,6 +195,10 @@ def object_class(text: str) -> str:
     # photos, jerseys and cuts. ``PSA/DNA signed photo`` must not become a
     # card merely because the title contains PSA. Real jersey/relic cards
     # retain explicit card-product vocabulary and continue below.
+    # A noun no card can carry - photo, flag, canvas, game cover - outranks
+    # a brand name. Only card-PRODUCT vocabulary overrules it.
+    if STRONG_MEMORABILIA_RE.search(t) and not CARD_PRODUCT_RE.search(t):
+        return "memorabilia"
     if MEMORABILIA_RE.search(t) and not CARD_ONLY_RE.search(t):
         return "memorabilia"
     grader = (grader_of(t) or "").lower()

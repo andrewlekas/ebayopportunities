@@ -3697,10 +3697,17 @@ class TestGuideCsvDownloader(unittest.TestCase):
                          "a genuine rate limit deserves one retry")
         self.assertEqual(rc, 0)
 
-    def test_the_cooldown_is_configurable(self):
+    def test_the_cooldown_clears_the_documented_limit(self):
+        """One CSV per ten minutes is the provider's rule, so the default
+        must exceed 600s - but only just. It was briefly 900 while the
+        SportsCardsPro 403s were still thought to be a rate limit; they
+        were a bot challenge, and the extra four minutes bought nothing
+        except an hour added to a four-file run."""
         m = self._mod()
-        self.assertGreaterEqual(m.CSV_COOLDOWN_SECONDS, 900,
-                                "default is now 15 minutes for headroom")
+        self.assertGreater(m.CSV_COOLDOWN_SECONDS, 600,
+                           "must clear the documented one-per-10-minutes")
+        self.assertLessEqual(m.CSV_COOLDOWN_SECONDS, 720,
+                             "headroom, not an hour of dead time")
 
     # --- per-host selector ---------------------------------------------
     # 2026-07-28: every SportsCardsPro download returned 403 and looked like
@@ -5096,6 +5103,81 @@ class TestSourceOnboarding(unittest.TestCase):
             self.assertEqual(rows[0].listing_id, "lot-7")
             self.assertEqual(rows[0].buyer_fee_rate, 0.20)
             self.assertEqual(rows[0].shipping, 12)
+
+
+class TestMemorabiliaVersusCard(unittest.TestCase):
+    """2026-08-02: the Sports Cards tab was mostly Tiger Woods, and none of
+    those rows were cards - a signed photo, a signed video-game cover, two
+    signed Renditions pieces, flags and canvases.
+
+    Cause: CARD_ONLY_RE counts manufacturer names as proof of a card, and
+    "Upper Deck" is in it. Upper Deck Authenticated is Upper Deck's signed
+    MEMORABILIA arm, so the brand pointed the wrong way.
+    """
+
+    def _class(self, title):
+        from valuation.identity import object_class
+        return object_class(title)
+
+    def _category(self, query, title):
+        from report import _category
+        return _category(query, title)
+
+    def test_uda_memorabilia_is_not_a_card(self):
+        for title in [
+            'Tiger Woods Signed "Tiger Woods PGA Tour 10" Video Game Cover',
+            "Tiger Woods Signed 2008 US Open Champion Photo Upper Deck UDA",
+            "Tiger Woods PGA Masters Champ Upper Deck Renditions Signed "
+            "Autograph Photo UDA",
+            "1997 Masters Golf Flag Tiger Woods UDA Upper Deck Authenticated",
+            "Legends of Golf Canvas Signed By Palmer, Nicklaus, Woods UDA",
+            "Tiger Woods 2002 Upper Deck Authenticated Tournament worn shirt",
+        ]:
+            self.assertEqual(self._class(title), "memorabilia", title)
+            self.assertEqual(
+                self._category("Tiger Woods UDA", title), "Sports Memorabilia",
+                title)
+
+    def test_relic_and_patch_cards_are_still_cards(self):
+        """The first attempt at this fix dropped brands entirely and moved
+        68 genuine jersey/relic CARDS out of Sports Cards - the opposite of
+        the problem. A patch card's title is all memorabilia nouns."""
+        for title in [
+            "2022 National Treasures Skyy Moore Rookie Patch Auto Green "
+            "Jersey #/24 PSA 9",
+            "2023 National Treasures Jahmyr Gibbs Green Rookie Jersey Patch "
+            "Auto #/26 BGS 7",
+            "2004-05 Upper Deck SPx Nenad Krstic Rookie Auto Jersey #108",
+            "2016 Topps Gypsy Queen Mark McGwire Jersey #GQR-MMC Cardinals",
+            "2018-19 Upper Deck Chronology Luc Robitaille Jersey Auto /50",
+            "2019 IMMACULATE #132 PJ WASHINGTON JR TRUE RPA ROOKIE PATCH "
+            "AUTO /99",
+        ]:
+            self.assertEqual(self._class(title), "card", title)
+
+    def test_patch_is_not_a_memorabilia_noun(self):
+        """Adding 'patch' to the memorabilia nouns swept in 178 National
+        Treasures / The Cup Rookie Patch Autos in a single pass."""
+        from valuation.identity import MEMORABILIA_RE, STRONG_MEMORABILIA_RE
+        self.assertFalse(MEMORABILIA_RE.search("Rookie Patch Auto RPA /99"))
+        self.assertFalse(STRONG_MEMORABILIA_RE.search("Rookie Patch Auto"))
+        self.assertTrue(STRONG_MEMORABILIA_RE.search("Signed 8x10 Photo"))
+
+    def test_card_product_words_outrank_a_memorabilia_noun(self):
+        """'Photo Variation' and 'Short Print' are card vocabulary even
+        though 'photo' and 'print' are memorabilia nouns."""
+        self.assertEqual(
+            self._class("2020 Topps Series 1 SP Photo Variation McGwire 289"),
+            "card")
+        self.assertEqual(
+            self._class("Upper Deck 1991 Michael Jordan Short Print SP1 "
+                        "White Sox PSA 6"), "card")
+
+    def test_plain_cards_are_untouched(self):
+        for title in ["1986 Fleer Michael Jordan Rookie #57 PSA 9 (OC)",
+                      "2003-04 Topps Chrome #111 LeBron James RC PSA 9",
+                      "1909-11 T206 Ty Cobb PSA 1.5 Tigers Green Portrait"]:
+            self.assertEqual(self._class(title), "card", title)
 
 
 class TestCustomBasketPricer(unittest.TestCase):
