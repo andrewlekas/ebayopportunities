@@ -754,11 +754,19 @@ class PriceGuide:
                     match=MATCH_NONE, score=best_score,
                     product_name=best.get("product-name"),
                     console_name=best.get("console-name"),
-                    note=(f"ambiguous: {best.get('product-name')!r} "
+                    # Name the SET on both sides. Two candidates called
+                    # "Barry Bonds #11T" read as nonsense - they are the
+                    # same card twice - until you see that one is Topps
+                    # Traded and the other Topps Traded Tiffany, which is
+                    # the whole reason it cannot choose.
+                    note=(f"ambiguous: "
+                          f"{best.get('product-name')!r} in "
+                          f"{best.get('console-name') or '?'!r} "
                           f"({best_score:.0%}) vs "
-                          f"{rival[1].get('product-name')!r} "
-                          f"({rival[0]:.0%}) - only {margin:.0%} apart, "
-                          "cannot tell which card this is"))
+                          f"{rival[1].get('product-name')!r} in "
+                          f"{rival[1].get('console-name') or '?'!r} "
+                          f"({rival[0]:.0%}) - only {margin:.0%} apart. "
+                          "Name the set to choose between them."))
 
         pid = str(best.get("id") or "")
         product = fetch(best) if fetch else best

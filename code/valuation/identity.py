@@ -339,6 +339,21 @@ SET_WORDS = {
     "heritage", "allen", "ginter", "gypsy", "queen", "sapphire", "sterling",
     "immaculate", "flawless", "contenders", "exquisite", "sp", "spx",
     "metal", "ultra", "sportflics", "starting", "lineup", "star",
+    # 2026-08-02: this list knew MANUFACTURERS but not PRODUCT LINES, and
+    # the line is what separates two cards of the same player in the same
+    # year. "Barry Bonds 1986 Topps Tiffany" scored `topps` only, so the
+    # Tiffany and the base Topps candidates tied at 70% and the margin gate
+    # refused a card that was perfectly identifiable - the one word that
+    # told them apart was dropped before scoring. Same for Panini Noir,
+    # The Cup, National Treasures, Bowman's Best and OPC.
+    "tiffany", "noir", "cup", "national", "treasures", "best", "opc",
+    "o-pee-chee", "parkhurst", "sporting", "news", "autographics",
+    "scoreboard", "sott", "artifacts", "ultimate", "spectrum",
+    "definitive", "obsidian", "spectra", "origins", "impeccable",
+    "certified", "absolute", "prestige", "elite", "limited", "playoff",
+    "revolution", "illusions", "phoenix", "encased", "clearly",
+    "immaculate", "triple", "quad", "threads", "rookies", "signatures",
+    "refractor", "superfractor", "atomic", "reactive", "bowman's",
     # Pokemon and TCG sets
     "base", "jungle", "fossil", "rocket", "gym", "neo", "expedition",
     "aquapolis", "skyridge", "topsun", "carddass", "vending", "promo",

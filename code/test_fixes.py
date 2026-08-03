@@ -5136,6 +5136,53 @@ class TestSourceOnboarding(unittest.TestCase):
             self.assertEqual(rows[0].shipping, 12)
 
 
+class TestSetTokensIncludeProductLines(unittest.TestCase):
+    """2026-08-02, from a real basket run. SET_WORDS knew MANUFACTURERS but
+    not PRODUCT LINES, and the line is what separates two cards of the same
+    player in the same year.
+
+        ambiguous: 'Barry Bonds #11T' (70%) vs 'Barry Bonds #11T' (70%)
+                   - only 0% apart, cannot tell which card this is
+
+    Both candidates scored `topps` and nothing else, because "Tiffany" was
+    not a set token. The one word that told them apart was dropped before
+    scoring, so a perfectly identifiable card was refused."""
+
+    def test_the_product_line_is_a_set_token(self):
+        from valuation.identity import identity_of
+        cases = {
+            "Barry Bonds 1986 Topps Tiffany RC": "tiffany",
+            "Luka Doncic 2018 Panini Noir RPA": "noir",
+            "Connor McDavid 2015 The Cup RPA": "cup",
+            "Victor Wembanyama Bowman's Best Refractor Auto RC": "best",
+            "Tom Brady 2000 Fleer Autographics RC": "autographics",
+            "Steve Yzerman 1984 OPC RC": "opc",
+            "Honus Wagner 1910 Sporting News": "sporting",
+        }
+        for text, token in cases.items():
+            self.assertIn(token, identity_of(text).set_tokens, text)
+
+    def test_tiffany_now_beats_base_topps_by_more_than_the_margin(self):
+        from valuation.identity import identity_of
+        ident = identity_of("Barry Bonds 1986 Topps Tiffany RC")
+        tiffany = ident.score_candidate(
+            "Barry Bonds #11T", "Baseball Cards 1986 Topps Traded Tiffany")
+        base = ident.score_candidate(
+            "Barry Bonds #11T", "Baseball Cards 1986 Topps Traded")
+        self.assertGreater(tiffany, base)
+        self.assertGreater(tiffany - base, 0.06,
+                           "must clear algorithm.guide_match_margin")
+
+    def test_the_ambiguity_note_names_the_set(self):
+        """Two candidates called 'Barry Bonds #11T' read as nonsense until
+        you can see one is Traded and the other Traded Tiffany."""
+        import inspect
+        from valuation import price_guide
+        src = inspect.getsource(price_guide.PriceGuide._quote_from_rows)
+        self.assertIn("console-name", src.split("ambiguous:")[1][:400],
+                      "the note must show the set, not just the card name")
+
+
 class TestMemorabiliaNeverInheritsCardPrices(unittest.TestCase):
     """2026-08-02, the only defect found this session that produced a
     confidently WRONG NUMBER rather than a misfiled row:
