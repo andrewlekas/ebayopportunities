@@ -20,6 +20,14 @@ NOTE_BLOCKERS = (
     # parallels once shared one $1,069.60 with 84% comps/guide "agreement",
     # because both sources agreed at the WRONG level of specificity.
     ("IDENTITY UNRESOLVED", "card identity not resolved"),
+    # 2026-08-02: when eBay opens the comp breaker the scan keeps running on
+    # cached sold prices - correct, since stale beats none. But nothing
+    # recorded that the evidence was frozen, so a row whose comps had not
+    # moved in over a week reached Action looking exactly like one priced
+    # from this morning's sales. Browsing on old comps is fine; bidding on
+    # them is not. The threshold is database.stale_comp_block_hours, and
+    # "AGING COMPS" is the softer marker that annotates without blocking.
+    ("STALE COMPS", "comp evidence frozen by a blocked source"),
 )
 
 

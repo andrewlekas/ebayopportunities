@@ -478,6 +478,33 @@ class TestObservationSchema(unittest.TestCase):
             conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0], 1)
         conn.close()
 
+    def test_comp_cache_reports_its_own_age(self):
+        """cached_comps(allow_stale=True) hands back week-old rows without
+        saying so. Without an age the report cannot distinguish evidence
+        from this morning from evidence frozen before a breaker opened."""
+        conn = histdb.connect(self.db)
+        self.assertIsNone(histdb.comp_cache_age_hours(conn, "nothing cached"))
+
+        comp = SoldComp(title="1986 Fleer Jordan PSA 8", price=1000.0,
+                        sold_date=datetime.now(timezone.utc)
+                        - timedelta(days=9),
+                        url="https://www.ebay.com/itm/1", site="ebay")
+        histdb.save_comps(conn, "jordan", [comp])
+        # save_comps stamps scanned_at = now, so backdate it to simulate a
+        # cache written before the source went down.
+        old = (datetime.now(timezone.utc) - timedelta(hours=200)).isoformat()
+        conn.execute("UPDATE comps SET scanned_at=? WHERE query=?",
+                     (old, "jordan"))
+        conn.commit()
+
+        age = histdb.comp_cache_age_hours(conn, "jordan")
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 200, delta=1)
+        self.assertTrue(histdb.cached_comps(conn, "jordan", 24,
+                                            allow_stale=True),
+                        "still returned - stale beats none - but now dated")
+        conn.close()
+
     def test_records_the_evidence(self):
         conn = histdb.connect(self.db)
         listing = Listing(site="ebay", title="Gengar PSA 9",
@@ -2131,6 +2158,96 @@ class TestCompIdentity(unittest.TestCase):
             original.close()
 
 
+class TestStaleCompEvidenceEndToEnd(unittest.TestCase):
+    """2026-08-02. quality.py and db.py were unit-tested for this, but the
+    wiring that joins them lives in run_live - and this session already
+    shipped two changes that passed their unit tests and failed in the
+    real run. So drive the whole path: blocked comp source, stale cache on
+    disk, and assert the note reaches the valuation and the row leaves the
+    decision set."""
+
+    def _config(self, db_path, cache_age_hours):
+        return {
+            "sites": ["ebay"],
+            "watchlist": [{"query": "1986 Fleer Michael Jordan PSA 8"}],
+            "database": {"file": db_path, "comp_cache_hours": 24,
+                         "stale_comp_block_hours": 72},
+            "scraping": {"use_130point": False, "use_html_comps": True},
+            "algorithm": {}, "filters": {}, "economics": {},
+        }
+
+    def _seed_stale_cache(self, db_path, query, age_hours):
+        conn = histdb.connect(db_path)
+        comps = [SoldComp(title=f"1986 Fleer Michael Jordan #57 PSA 8 copy {i}",
+                          price=1000.0 + i,
+                          sold_date=datetime.now(timezone.utc)
+                          - timedelta(days=30),
+                          url=f"https://www.ebay.com/itm/9{i:011d}",
+                          site="ebay") for i in range(8)]
+        histdb.save_comps(conn, query, comps)
+        old = (datetime.now(timezone.utc)
+               - timedelta(hours=age_hours)).isoformat()
+        conn.execute("UPDATE comps SET scanned_at=?", (old,))
+        conn.commit()
+        conn.close()
+
+    def _run(self, age_hours):
+        import main as scanner
+        from valuation.engine import ValuationEngine
+        query = "1986 Fleer Michael Jordan PSA 8"
+        db_path = os.path.join(tempfile.mkdtemp(), "h.db")
+        self._seed_stale_cache(db_path, query, age_hours)
+        config = self._config(db_path, age_hours)
+
+        listing = Listing(
+            site="ebay", title="1986 Fleer Michael Jordan #57 PSA 8",
+            url="https://www.ebay.com/itm/123456789012",
+            current_price=300.0, bid_count=2, listing_id="123456789012",
+            query=query,
+            end_time=datetime.now(timezone.utc) + timedelta(hours=5))
+
+        class BlockedEbay:
+            site = "ebay"
+            tripped = True
+            def search_sold(self, *a, **kw):
+                return []                 # the breaker is open
+            def search(self, *a, **kw):
+                return [listing]
+            def close(self, *a, **kw):
+                return None
+            def _get_token(self, *a, **kw):
+                return "token"
+            def __getattr__(self, name):
+                # any other search_* the pipeline reaches for returns an
+                # empty result set, not None - these get concatenated
+                return lambda *a, **kw: []
+
+        with mock.patch.object(scanner, "scraper_registry",
+                               lambda cfg: {"ebay": lambda c: BlockedEbay()}), \
+             mock.patch.object(scanner, "_search_marketplaces",
+                               lambda *a, **kw: [listing]):
+            opps = scanner.run_live(config, ValuationEngine(config), "all")
+        return opps
+
+    def test_a_blocked_comp_lane_marks_and_disqualifies_old_evidence(self):
+        from quality import tradeability_rejection
+        opps = self._run(age_hours=200)          # 8.3 days, past the block
+        self.assertTrue(opps, "the row should still be produced for research")
+        notes = " | ".join(str(n).upper()
+                           for o in opps for n in o.valuation.notes)
+        self.assertIn("STALE COMPS", notes)
+        self.assertTrue(
+            all(tradeability_rejection(o) for o in opps),
+            "evidence frozen for 8 days must not be a bid target")
+
+    def test_a_short_outage_annotates_without_disqualifying(self):
+        opps = self._run(age_hours=30)           # stale, but inside 72h
+        notes = " | ".join(str(n).upper()
+                           for o in opps for n in o.valuation.notes)
+        self.assertIn("AGING COMPS", notes)
+        self.assertNotIn("STALE COMPS", notes)
+
+
 class TestUnifiedTrustGates(unittest.TestCase):
     def _opp(self, *, note="", disputed=False, regraded=False,
              discovery=False, n_comps=8, fair=1000.0, item_id="123456789012",
@@ -2163,10 +2280,25 @@ class TestUnifiedTrustGates(unittest.TestCase):
              "suspicious listing"),
             (self._opp(disputed=True), "disputed valuation"),
             (self._opp(discovery=True), "discovery query"),
+            (self._opp(note="STALE COMPS - fresh fetch blocked, evidence "
+                            "is 8.4d old"),
+             "comp evidence frozen by a blocked source"),
         ]
         for opp, expected in cases:
             self.assertEqual(tradeability_rejection(opp), expected)
         self.assertIsNone(tradeability_rejection(self._opp()))
+
+    def test_aging_comps_annotate_but_do_not_block(self):
+        """2026-08-02. eBay opens the comp breaker often enough that
+        blocking on ANY staleness would mute the Action sheet routinely,
+        which teaches you to ignore it. Only evidence past the block
+        threshold is disqualifying; short outages are merely labelled."""
+        from quality import tradeability_rejection
+        opp = self._opp(note="AGING COMPS - fresh fetch blocked, evidence "
+                             "is 1.2d old")
+        self.assertIsNone(tradeability_rejection(opp))
+        self.assertIn("AGING COMPS", opp.valuation.notes[0],
+                      "but the row must still say so on its face")
 
     def test_regrade_and_collection_failure_never_enter_learning(self):
         from quality import evidence_rejection, is_tradeable

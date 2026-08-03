@@ -650,6 +650,10 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
     dbc = config.get("database", {})
     conn = histdb.connect(dbc.get("file", "history.db"))
     cache_hours = dbc.get("comp_cache_hours", 24)
+    # Past this, comps fetched under a blocked lane stop being decision
+    # evidence. 72h is deliberately generous: these are SOLD prices, which
+    # age slowly, and an eBay breaker can stay open for 8 hours at a time.
+    stale_block_hours = float(dbc.get("stale_comp_block_hours", 72))
 
     registry = scraper_registry(config)
     scrapers = {site: registry[site](config)
@@ -781,6 +785,10 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
         raw_by_query[entry["query"]] += len(listings)
     raw_count = sum(raw_by_site.values())
     n_comp_junk = [0]        # list so the loop below can accumulate into it
+    # query -> age in hours of the newest comp we had to fall back on. Only
+    # populated when a FRESH fetch was blocked, so an entry here means the
+    # evidence behind every row of that query is frozen.
+    stale_comp_age: dict[str, float | None] = {}
     t_val = time.monotonic()
     prepared = []
     for entry, cached, fetched, listings in results:
@@ -803,8 +811,11 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
                 comps = histdb.cached_comps(conn, query, cache_hours,
                                             allow_stale=True) or []
                 if comps:
+                    age = histdb.comp_cache_age_hours(conn, query)
+                    stale_comp_age[query] = age
                     log.info("  using stale comp cache for %s "
-                             "(fresh fetch blocked)", query)
+                             "(fresh fetch blocked%s)", query,
+                             f", {age / 24:.1f}d old" if age else "")
         # Screen the COMPS with the same keyword blacklist the listings get.
         # It was only ever applied to listings, so 415 of 8,114 cached comps
         # were "reprint" / "you pick" lots quietly setting fair values - the
@@ -997,6 +1008,23 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
             opp = engine.evaluate(
                 listing, comps, asks, specific_comps=specific)
             v = opp.valuation
+            if query in stale_comp_age and not specific:
+                # The comp lane was blocked, so this fair value rests on
+                # frozen evidence. Two levels on purpose: eBay challenges
+                # us often enough that blocking on ANY staleness would mute
+                # the Action sheet routinely, which trains you to ignore it.
+                # Past the block threshold the row is still worth reading,
+                # it is just not something to bid on sight.
+                age = stale_comp_age[query]
+                days = (age or 0) / 24.0
+                if age is None or age >= stale_block_hours:
+                    v.notes.append(
+                        f"STALE COMPS - fresh fetch blocked, evidence is "
+                        f"{days:.1f}d old")
+                else:
+                    v.notes.append(
+                        f"AGING COMPS - fresh fetch blocked, evidence is "
+                        f"{days:.1f}d old")
             if len(listing.matched_queries) > 1:
                 alternatives = [
                     query for query in listing.matched_queries

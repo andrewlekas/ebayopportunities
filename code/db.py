@@ -334,6 +334,29 @@ def cached_comps(conn, query: str, max_age_hours: float = 24.0,
     return out
 
 
+def comp_cache_age_hours(conn, query: str) -> float | None:
+    """Hours since the newest cached comp for this query, or None if empty.
+
+    `cached_comps(allow_stale=True)` deliberately returns old rows when the
+    comp lane is blocked - stale beats none. But the caller then had no way
+    to say HOW old, so a valuation built on week-old evidence looked exactly
+    like one built on this morning's. This is what lets the row carry that
+    fact into the report and out of the decision sheets.
+    """
+    row = conn.execute(
+        "SELECT MAX(scanned_at) FROM comps WHERE query=?", (query,)).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        seen = datetime.fromisoformat(row[0])
+    except (TypeError, ValueError):
+        return None
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - seen).total_seconds() / 3600.0
+    return max(0.0, age)
+
+
 # ---------------- fair-value trend ----------------
 def record_fair(conn, query: str, fair: float, n_comps: int) -> None:
     conn.execute(
