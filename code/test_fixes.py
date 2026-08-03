@@ -3697,6 +3697,54 @@ class TestGuideCsvDownloader(unittest.TestCase):
                          "a genuine rate limit deserves one retry")
         self.assertEqual(rc, 0)
 
+    def _csv_file(self, consoles):
+        path = os.path.join(tempfile.mkdtemp(), "g.csv")
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["id", "console-name", "product-name", "loose-price"])
+            for i, console in enumerate(consoles):
+                w.writerow([i, console, f"Item {i}", "$1.00"])
+        return path
+
+    def test_a_card_guide_full_of_video_games_is_rejected(self):
+        """2026-08-01: four SportsCardsPro 'sports' downloads arrived as
+        122,330 rows of ZX Spectrum, PS4 and Switch. That host ignores
+        `category=` and serves its default catalogue rather than erroring,
+        so HTTP 200, right size, right filename, wrong contents.
+
+        The sportscardspro-- prefix is what lets rows price Sports Cards,
+        so keeping the file was worse than having nothing."""
+        m = self._mod()
+        games = self._csv_file(["ZX Spectrum", "Playstation 4",
+                                "Nintendo Switch", "PAL Playstation 4"] * 30)
+        why = m.verify_contents(games, {"category": "baseball-cards",
+                                        "host": m.SCP})
+        self.assertIn("video games", why)
+        self.assertIn("default catalogue", why)
+
+    def test_a_real_card_guide_passes(self):
+        m = self._mod()
+        cards = self._csv_file(["Basketball Cards 1986 Fleer"] * 50)
+        self.assertEqual(
+            m.verify_contents(cards, {"console_uids": "G155",
+                                      "host": m.SCP}), "")
+
+    def test_a_video_game_guide_is_not_rejected_for_being_video_games(self):
+        """The check must fire on a mismatch, not on games as such - the
+        PriceCharting default catalogue is legitimately video games."""
+        m = self._mod()
+        games = self._csv_file(["Playstation 4", "Nintendo Switch"] * 40)
+        self.assertEqual(
+            m.verify_contents(games, {"category": "", "host": m.PC}), "")
+
+    def test_defaults_send_no_category_to_sportscardspro(self):
+        """Reverted 2026-08-02. The four sport slugs were restored on 08-01
+        after Cloudflare stopped hiding them, and downloaded video games."""
+        m = self._mod()
+        scp = [g for g in m._normalise_guides(m.DEFAULT_GUIDES)
+               if "sportscardspro" in g["host"]]
+        self.assertEqual(scp, [], "SCP selects sets by console-uids only")
+
     def test_the_cooldown_clears_the_documented_limit(self):
         """One CSV per ten minutes is the provider's rule, so the default
         must exceed 600s - but only just. It was briefly 900 while the
@@ -4019,23 +4067,6 @@ class TestGuideCsvDownloader(unittest.TestCase):
                 m.PC, "", "tok", os.path.join(tempfile.mkdtemp(), "x.csv"))
         self.assertTrue(ok)
         self.assertEqual(used, ["plain"])
-
-    def test_defaults_cover_the_four_sports_catalogues(self):
-        """Restored 2026-08-01. They were dropped for returning 403, but at
-        the time EVERY request to that host was being challenged, so the 403
-        was not evidence about the parameter. Sports is the largest guide
-        gap and a whole sport per file dwarfs a set at a time, so they are
-        back - failing cheaply now if the site really does refuse them."""
-        m = self._mod()
-        scp = [g for g in m._normalise_guides(m.DEFAULT_GUIDES)
-               if "sportscardspro" in g["host"]]
-        self.assertEqual(sorted(g["category"] for g in scp),
-                         ["baseball-cards", "basketball-cards",
-                          "football-cards", "hockey-cards"])
-        for g in scp:
-            self.assertIsNone(g["console_uids"],
-                              "a catalogue entry selects by category, and "
-                              "sending both selectors is ambiguous")
 
     def test_each_default_sends_exactly_one_selector(self):
         """`download` sends console-uids if present, category otherwise. An
@@ -5365,29 +5396,43 @@ class TestCustomBasketPricer(unittest.TestCase):
         self.assertFalse(m._is_sealed("Dratini [1st Edition] #26"))
         self.assertTrue(m._is_sealed("Booster Box [1st Edition]"))
 
-    def test_the_api_cap_is_honoured(self):
-        """A 500-row basket must not be able to drain the run's quota."""
+    def test_the_api_cap_limits_paid_calls_but_not_free_ones(self):
+        """A 500-row basket must not drain the quota - but the fallback
+        reads the LOCAL CSVs before it reaches the API, so the cap must gate
+        only the paid part.
+
+        Gating the whole call made --api-cap 0 mean 'resolve nothing': a
+        37-row list of free-text names priced 0 of 37 with the guide data
+        for most of them sitting on disk.
+        """
         m = self._mod()
         index = m.ExactIndex(self._rows())
-        calls = []
+        seen_hosts = []
 
         class FakeGuide:
+            guide_hosts = ["https://www.pricecharting.com"]
+
             def quote(self, ident, category=None):
-                calls.append(ident)
+                seen_hosts.append(list(self.guide_hosts))
                 class Q:
                     value = None; match = "none"; how = ""; note = "miss"
                     product_name = console_name = ""
                 return Q()
 
+        guide = FakeGuide()
         budget = [2]
-        for i in range(6):
+        for i in range(5):
             m.price_row({"name": f"Unknown Card {i}", "grade": "",
-                         "set": "", "line": i}, index, FakeGuide(), budget)
-        self.assertEqual(len(calls), 2, "cap must stop further API lookups")
+                         "set": "", "line": i}, index, guide, budget)
 
-        capped = m.price_row({"name": "Another", "grade": "", "set": "",
-                              "line": 9}, index, FakeGuide(), budget)
-        self.assertIn("API cap reached", capped["note"])
+        self.assertEqual(len(seen_hosts), 5, "every row is still resolved")
+        self.assertTrue(all(seen_hosts[i] for i in (0, 1)),
+                        "the first two may reach the paid API")
+        self.assertTrue(all(not seen_hosts[i] for i in (2, 3, 4)),
+                        "after the cap, resolution continues LOCAL-ONLY")
+        self.assertEqual(guide.guide_hosts,
+                         ["https://www.pricecharting.com"],
+                         "and the guide is left as it was found")
 
     def test_grades_are_floats_before_they_reach_the_ladder(self):
         """grade_info reports strings; _guide_cents compares numerically.

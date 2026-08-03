@@ -85,19 +85,23 @@ DEFAULT_GUIDES = [
     ("pokemon-cards", PC, "Pokemon cards"),
     ("comic-books", PC, "comic books"),
     ("other-cards", PC, "other non-TCG cards"),
-    # Restored 2026-08-01. These four were removed on 2026-07-28 because
-    # they returned 403, which I read as "this host selects by console-uids,
-    # not category". That conclusion is no longer supported: the 403 was a
-    # Cloudflare challenge, and every SportsCardsPro request was getting one
-    # regardless of parameters. With curl_cffi clearing the challenge, the
-    # slugs deserve a fair test - a whole sport per file is worth far more
-    # than a set at a time, and sports cards are the largest guide gap.
-    # If they really are unsupported the run now says so in one cheap
-    # failure instead of four expensive ones.
-    ("baseball-cards", SCP, "baseball cards"),
-    ("basketball-cards", SCP, "basketball cards"),
-    ("football-cards", SCP, "football cards"),
-    ("hockey-cards", SCP, "hockey cards"),
+    # NO SportsCardsPro entries. Restoring the four sport slugs on
+    # 2026-08-01 was a mistake, and the way it failed is worth recording.
+    #
+    # They were dropped on 07-28 for returning 403, which read as "this host
+    # selects by console-uids, not category". Clearing Cloudflare with
+    # curl_cffi made the 403 go away, so the slugs went back in and all four
+    # downloaded - 19MB each, apparently a huge coverage win.
+    #
+    # They were video games. `category=baseball-cards` is IGNORED by that
+    # host, which silently serves its default catalogue: 122,330 rows of ZX
+    # Spectrum, PS4 and Switch. The 07-28 conclusion had been right; the
+    # 403 was hiding it, and success looked identical to failure.
+    #
+    # Worse than useless, because the sportscardspro-- filename prefix is
+    # exactly what lets rows price Sports Cards - so half a million
+    # video-game rows became eligible to value a Mantle. `verify_contents`
+    # below now refuses a file whose contents do not match the request.
 ]
 
 # Their documented limit is one CSV every ten minutes. 2026-07-28 evidence:
@@ -132,6 +136,59 @@ _CHALLENGE_MARKERS = (
 def _looks_like_challenge(text: str) -> bool:
     low = (text or "").casefold()
     return any(marker in low for marker in _CHALLENGE_MARKERS)
+
+
+# A CSV that downloads cleanly can still be the wrong catalogue. On
+# 2026-08-01 four SportsCardsPro "sports" files arrived as 122,330 rows of
+# video games, because that host ignores `category=` and serves its default
+# catalogue rather than erroring. HTTP 200, correct size, correct filename,
+# entirely wrong contents - and the sportscardspro-- prefix then made every
+# one of those rows eligible to price a sports card.
+_GAME_CONSOLE_MARKERS = (
+    "playstation", "nintendo", "xbox", "sega", "atari", "gameboy",
+    "game boy", "zx spectrum", "commodore", "amiga", "dreamcast",
+    "gamecube", "wii", "switch", "steam", "pc games",
+)
+
+
+def verify_contents(path: str, guide: dict) -> str:
+    """"" if the file matches what was asked for, else why it does not.
+
+    Only checks what can be checked cheaply and certainly. The rule is
+    narrow on purpose: a CARD guide that is mostly games consoles is
+    definitely wrong, and that is the failure that actually happened.
+    """
+    import csv as _csv
+    wants_cards = ("card" in str(guide.get("category") or "").casefold()
+                   or bool(guide.get("console_uids"))
+                   or "sportscardspro" in str(guide.get("host") or ""))
+    if not wants_cards:
+        return ""
+    try:
+        with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+            reader = _csv.DictReader(fh)
+            consoles, rows = [], 0
+            for row in reader:
+                name = str(row.get("console-name") or "").casefold()
+                if name:
+                    consoles.append(name)
+                rows += 1
+                if rows >= 400:
+                    break
+    except (OSError, _csv.Error) as exc:                     # pragma: no cover
+        return f"could not be read ({exc.__class__.__name__})"
+    if not consoles:
+        return "no console-name column - not a price-guide CSV"
+    games = sum(1 for c in consoles
+                if any(m in c for m in _GAME_CONSOLE_MARKERS))
+    if games > len(consoles) / 2:
+        sample = sorted({c for c in consoles[:80]
+                         if any(m in c for m in _GAME_CONSOLE_MARKERS)})[:3]
+        return ("a card guide was requested but the file is video games "
+                f"({games}/{len(consoles)} sampled rows, e.g. "
+                f"{', '.join(sample)}) - the host ignored the request and "
+                "served its default catalogue")
+    return ""
 
 
 def _age_hours(path: str) -> float | None:
@@ -520,6 +577,19 @@ def main() -> int:
                                       console_uids=uids)
         waited = True
         if good:
+            wrong = verify_contents(path, g)
+            if wrong:
+                # Keeping it would be worse than having nothing: the
+                # filename prefix decides which categories these rows may
+                # value, so a mislabelled file quietly corrupts pricing.
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                print(f"    REJECTED  {wrong}")
+                failures.append((name, wrong, KIND_PAYLOAD))
+                blocked_hosts[(host, selector)] = (KIND_PAYLOAD, wrong)
+                continue
             ok += 1
             print(f"    saved  {os.path.basename(path)}  ({detail})")
             continue

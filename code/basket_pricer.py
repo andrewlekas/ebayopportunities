@@ -349,14 +349,27 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
             out["price"] = round(cents / 100.0, 2)
         return out
 
-    # No exact hit: fall back to the scanner's own resolution, which may
-    # reach the paid API. Capped so a 500-row basket cannot drain quota.
-    if api_budget[0] <= 0:
-        out["note"] = "not in local CSVs (API cap reached)"
+    # No exact hit: fall back to the scanner's own identity resolution.
+    #
+    # That path reads the LOCAL CSVs before it reaches for the API, so the
+    # budget must gate only the paid part. Gating the whole call made
+    # --api-cap 0 mean "resolve nothing" instead of "stay free", and a
+    # 37-row list of free-text names priced 0 of 37 with the guide data for
+    # most of them sitting on disk.
+    if guide is None:
+        out["note"] = "not found in local CSVs"
         return out
-    api_budget[0] -= 1
     query = f"{name} {grade_text}".strip()
-    quote = guide.quote(identity_of(query))
+    paid_allowed = api_budget[0] > 0
+    hosts = getattr(guide, "guide_hosts", [])
+    if not paid_allowed:
+        guide.guide_hosts = []
+    try:
+        quote = guide.quote(identity_of(query))
+    finally:
+        guide.guide_hosts = hosts
+    if paid_allowed:
+        api_budget[0] -= 1
     if quote.value:
         out.update(price=round(float(quote.value), 2),
                    source=f"guide lookup ({quote.match})",
