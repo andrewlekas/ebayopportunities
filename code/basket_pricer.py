@@ -322,6 +322,32 @@ _DISTINGUISHING = (
 )
 
 
+_BRACKETED = re.compile(r"\[[^\]]*\]")
+_CARD_NO = re.compile(r"#\S*")
+
+
+def _subject_mismatch(supplied: str, matched: str) -> str:
+    """A word in the matched product's SUBJECT that you never wrote.
+
+    2026-08-02: "Matt Stafford 2009 SPX RPA" matched "Matt Cain #12" and
+    priced at $1.64. Matt Cain is a baseball pitcher. It scored well enough
+    on the shared first name to clear the threshold.
+
+    The subject is the product name with bracketed variants and the card
+    number stripped - "Tom Brady [Autograph] #144" -> "Tom Brady" - so an
+    [Autograph] label does not have to appear in your list. What is left is
+    who the card is OF, and every word of it should be something you wrote.
+    """
+    core = _CARD_NO.sub(" ", _BRACKETED.sub(" ", str(matched or "")))
+    supplied_words = set(re.findall(r"[a-z]+", _norm(supplied)))
+    for word in re.findall(r"[a-z]+", _norm(core)):
+        if len(word) < 3 or word in ("the", "and", "jr", "sr"):
+            continue
+        if word not in supplied_words:
+            return word
+    return ""
+
+
 def _distinguishing_mismatch(supplied: str, matched: str) -> str:
     """The first identity-changing word present in one name and not the
     other, or "" when they agree."""
@@ -367,8 +393,10 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
         candidates = candidates[:1]
 
     if candidates:
-        missing = _distinguishing_mismatch(
-            name, candidates[0].get("product-name") or "")
+        missing = (_distinguishing_mismatch(
+                       name, candidates[0].get("product-name") or "")
+                   or _subject_mismatch(
+                       name, candidates[0].get("product-name") or ""))
         if missing:
             # 2026-08-02: "Michael Jordan 1986 Fleer Sticker RC" resolved to
             # "Michael Jordan #57" - the base rookie - and was priced at
@@ -416,7 +444,8 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
         # Same guard as the exact path. This is the branch the Jordan
         # STICKER actually came through: the identity resolver matched it
         # to the base rookie "Michael Jordan #57" and priced it $15,604.
-        missing = _distinguishing_mismatch(name, quote.product_name or "")
+        missing = (_distinguishing_mismatch(name, quote.product_name or "")
+                   or _subject_mismatch(name, quote.product_name or ""))
         if missing:
             out.update(matched_name=quote.product_name or "",
                        matched_set=quote.console_name or "",

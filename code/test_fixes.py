@@ -5428,6 +5428,29 @@ class TestCustomBasketPricer(unittest.TestCase):
                              "line": 3}, index, None, [0])
         self.assertAlmostEqual(plain["price"], 42639.45, places=2)
 
+    def test_the_matched_subject_must_be_someone_you_named(self):
+        """2026-08-02, from a real run: 'Matt Stafford 2009 SPX RPA' matched
+        'Matt Cain #12' and priced at $1.64. Matt Cain is a baseball
+        pitcher; the shared first name cleared the score threshold.
+
+        Bracketed variants and card numbers are stripped first, so an
+        [Autograph] label the user never wrote is not a mismatch."""
+        m = self._mod()
+        self.assertEqual(m._subject_mismatch(
+            "Matt Stafford 2009 SPX RPA", "Matt Cain #12"), "cain")
+        for supplied, matched in [
+                ("Michael Jordan 1986 Fleer RC", "Michael Jordan #57"),
+                ("Tom Brady 2000 Contenders Auto RC",
+                 "Tom Brady [Autograph] #144"),
+                ("Mike Trout 2009 Bowman Chrome Ref RC Auto",
+                 "Mike Trout [Autograph] #BDPP89"),
+                ("Ken Griffey Jr 1989 Fleer Auto RC",
+                 "Ken Griffey Jr. [Autograph] #548"),
+                ("Lebron James 2003 Chrome Refractor RC",
+                 "LeBron James [Refractor] #111")]:
+            self.assertEqual(m._subject_mismatch(supplied, matched), "",
+                             f"{matched} should be kept for {supplied}")
+
     def test_the_api_cap_limits_paid_calls_but_not_free_ones(self):
         """A 500-row basket must not drain the quota - but the fallback
         reads the LOCAL CSVs before it reaches the API, so the cap must gate
