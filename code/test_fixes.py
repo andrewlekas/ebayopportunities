@@ -5105,6 +5105,78 @@ class TestSourceOnboarding(unittest.TestCase):
             self.assertEqual(rows[0].shipping, 12)
 
 
+class TestMemorabiliaNeverInheritsCardPrices(unittest.TestCase):
+    """2026-08-02, the only defect found this session that produced a
+    confidently WRONG NUMBER rather than a misfiled row:
+
+        "1986 Fleer Michael Jordan #57 Signed Photo PSA 9"
+          -> $42,639.45  match=exact  from graded-price
+
+    That is the PSA 9 price of the rookie CARD, quoted for a photograph.
+
+    quote() emptied `hosts` for Sports Memorabilia, but the local-CSV
+    lookup ran ABOVE that line, so the gate stopped API calls and nothing
+    else. Downloading the four sports catalogues widened it sharply: far
+    more memorabilia titles now find a matching card row locally.
+    """
+
+    def _guide(self, rows):
+        from valuation.price_guide import PriceGuide
+
+        class FakeIndex:
+            def __init__(self, rows): self.rows = rows
+            def __len__(self): return len(self.rows)
+            def search(self, q, limit=60): return self.rows
+        guide = PriceGuide({"api_keys": {"pricecharting": {"token": "t"}}})
+        guide.csv_index = FakeIndex(rows)
+        return guide
+
+    def _jordan_row(self):
+        return {"console-name": "Basketball Cards 1986 Fleer",
+                "product-name": "Michael Jordan #57",
+                "_guide-host": "sportscardspro",
+                "loose-price": 455000, "cib-price": 1200000,
+                "new-price": 2500000, "graded-price": 4263945,
+                "manual-only-price": 30000000, "id": "1"}
+
+    def test_a_signed_photo_is_not_priced_as_the_card(self):
+        from valuation.identity import identity_of
+        guide = self._guide([self._jordan_row()])
+        q = guide.quote(
+            identity_of("1986 Fleer Michael Jordan #57 Signed Photo PSA 9"),
+            category="Sports Memorabilia")
+        self.assertIsNone(q.value)
+        self.assertIn("no card price guide", q.note)
+
+    def test_the_same_card_still_prices_normally(self):
+        """The gate must be about the CATEGORY, not the card."""
+        from valuation.identity import identity_of
+        guide = self._guide([self._jordan_row()])
+        q = guide.quote(identity_of("1986 Fleer Michael Jordan #57 PSA 9"),
+                        category="Sports Cards")
+        self.assertAlmostEqual(q.value, 42639.45, places=2)
+
+    def test_the_row_pricer_refuses_independently(self):
+        """Belt and braces: _quote_from_rows turns rows into money, so it
+        refuses too rather than trusting every caller to have checked."""
+        from valuation.identity import identity_of
+        guide = self._guide([self._jordan_row()])
+        q = guide._quote_from_rows(
+            identity_of("1986 Fleer Michael Jordan #57 Signed Photo PSA 9"),
+            [self._jordan_row()], source="local CSV",
+            category="Sports Memorabilia")
+        self.assertIsNone(q.value)
+
+    def test_no_api_call_is_made_for_memorabilia(self):
+        from valuation.identity import identity_of
+        guide = self._guide([self._jordan_row()])
+        calls = []
+        guide._pc_call = lambda *a, **kw: calls.append(a) or {}
+        guide.quote(identity_of("Tiger Woods Signed US Open Photo UDA"),
+                    category="Sports Memorabilia")
+        self.assertEqual(calls, [])
+
+
 class TestMemorabiliaVersusCard(unittest.TestCase):
     """2026-08-02: the Sports Cards tab was mostly Tiger Woods, and none of
     those rows were cards - a signed photo, a signed video-game cover, two

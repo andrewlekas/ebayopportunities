@@ -46,6 +46,12 @@ GUIDE_GRADE_LADDER = [
 RAW_FIELD = "loose-price"
 MIN_GRADED_RUNG = GUIDE_GRADE_LADDER[0][0]
 
+# Categories no card price guide may value, from any source - API or local
+# CSV. A signed photo, a match-worn shirt or a pin flag is not the card it
+# depicts, however exactly its title matches one. These rows are valued
+# from comps or not at all.
+NO_CARD_GUIDE = frozenset({"Sports Memorabilia"})
+
 # PriceCharting publishes a real market price for the top slab of each
 # grading company.  Until 2026-07-26 these were unused: a CGC 10 was shifted
 # down to PSA 9 by Andrew's cross-grader rule and read `graded-price`.  That
@@ -585,23 +591,41 @@ class PriceGuide:
         answer. Only rows that fail on the primary cost a second lookup, and
         every result is cached permanently per host.
         """
-        # Local CSVs first: same data, same columns, zero latency and zero
-        # quota. Every set you download is a set that stops costing calls.
-        if len(self.csv_index):
-            local = self._quote_from_rows(
-                ident, self.csv_index.search(ident.guide_query()),
-                source="local CSV", category=category)
-            if local.landed:
-                return local
-        best_miss = None
+        # Decide which card guide - if any - may speak for this category
+        # BEFORE consulting anything, including the local CSVs.
+        #
+        # 2026-08-02: this block used to sit below the CSV lookup, so
+        # emptying `hosts` for Sports Memorabilia stopped the API calls and
+        # nothing else. A signed photo went on matching the card:
+        #
+        #   "1986 Fleer Michael Jordan #57 Signed Photo PSA 9"
+        #     -> $42,639.45  match=exact  from graded-price
+        #
+        # which is the PSA 9 price of the rookie CARD, quoted at full
+        # confidence for a photograph. Downloading the four sports
+        # catalogues made it worse, because far more memorabilia titles now
+        # find a matching card row locally.
         hosts = list(self.guide_hosts)
         if category == "Sports Cards":
             hosts = [host for host in hosts if "sportscardspro" in host]
         elif category in {"Video Games", "Pokemon Cards", "Other"}:
             primary = [host for host in hosts if "sportscardspro" not in host]
             hosts = primary or hosts
-        if category == "Sports Memorabilia":
+        if category in NO_CARD_GUIDE:
             hosts = []
+
+        # Local CSVs first: same data, same columns, zero latency and zero
+        # quota. Every set you download is a set that stops costing calls.
+        if category not in NO_CARD_GUIDE and len(self.csv_index):
+            local = self._quote_from_rows(
+                ident, self.csv_index.search(ident.guide_query()),
+                source="local CSV", category=category)
+            if local.landed:
+                return local
+        if category in NO_CARD_GUIDE:
+            return GuideQuote(note=f"no card price guide applies to "
+                                   f"{category} - comps only")
+        best_miss = None
         for host in hosts:
             q = self._quote_from(ident, host, category=category)
             if q.landed:
@@ -654,6 +678,13 @@ class PriceGuide:
         nothing scores well enough, we return no value and say why.
         """
         q = ident.guide_query()
+        # Belt and braces with the gate in quote(). This is the function
+        # that actually turns a row into money, so it refuses categories no
+        # card guide may value even if a future caller forgets to check.
+        if category in NO_CARD_GUIDE:
+            return GuideQuote(match=MATCH_NONE,
+                              note=f"no card price guide applies to "
+                                   f"{category} - comps only")
         candidates = [r for r in (rows or []) if isinstance(r, dict)]
         if category == "Sports Cards":
             guarded = []
