@@ -26,9 +26,11 @@ Condition for grade, and Paid / Basis for cost.
          and totals. Leave it out and you get a plain valuation.
 
   Set    optional but recommended. Without it, a card whose name
-         exists in several sets is reported as ambiguous instead of
-         being guessed at. "Charizard #4" is five products between
-         $3,000 and $343,098, so guessing is not a favour.
+         exists in several sets is priced from the best candidate and
+         flagged BEST GUESS in the Confidence column, with the other
+         sets listed. Naming the set removes the guesswork.
+         Use --strict if you would rather have a blank than an
+         estimate.
 
 Up to 500 rows. More than that and it prices the first 500 and says so.
 

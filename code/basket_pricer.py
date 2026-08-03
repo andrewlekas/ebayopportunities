@@ -13,10 +13,20 @@ refusal is correct there and is the whole point of the margin gate.
 
 Here YOU supply the card, so the ambiguity mostly disappears. Give a Set
 and a Name and the match is exact and deterministic - no scoring, no
-guessing. Free-text names still work, but they run through the SAME
-identity resolution the scanner uses and are refused the same way when
-they are genuinely ambiguous. An ambiguous row is reported with its
-candidates; it is never silently resolved.
+guessing. Free-text names run through the SAME identity resolution the
+scanner uses.
+
+Where this DELIBERATELY differs from the scanner: on a near-tie it takes
+the best candidate rather than refusing. A wrong guess in the scanner
+becomes a wrong bid; here it is a slightly-off valuation of a card you
+already own, and a blank cell is worse. Guessed rows are marked
+"BEST GUESS" in the Confidence column and say what else they could have
+been. `--strict` restores the scanner's refusal.
+
+The guards that stop a guess being nonsense stay on in both modes: the
+matched card must be OF someone you named (this is what caught
+"Matt Stafford" resolving to "Matt Cain"), and identity-changing words -
+sticker, promo, error, reprint - must agree.
 
 Pricing itself is not reimplemented. Grade routing calls the scanner's own
 `_guide_cents`, so a PSA 8.5 interpolates between rungs here exactly as it
@@ -359,8 +369,19 @@ def _distinguishing_mismatch(supplied: str, matched: str) -> str:
 
 
 def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
-              api_budget: list[int]) -> dict:
-    """Price one basket line. Never guesses between conflicting products."""
+              api_budget: list[int], strict: bool = False) -> dict:
+    """Price one basket line.
+
+    The scanner refuses near-ties because a wrong guess there becomes a
+    wrong BID. Here you own the card and you named it, so the cost of a
+    close guess is a slightly-off valuation, and the cost of refusing is a
+    blank cell. Best guess wins by default; --strict restores the scanner's
+    behaviour.
+
+    The guards that stop a guess being nonsense stay on in both modes:
+    the matched card must be OF someone you named, and identity-changing
+    words (sticker, promo, error) must agree.
+    """
     name, set_name, grade_text = row["name"], row["set"], row["grade"]
 
     # Grade parsing is the scanner's, so "PSA 8.5", "BGS 9", "CGC 10",
@@ -375,7 +396,8 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
 
     out = dict(row, grader=grader or "", printed_grade=printed,
                effective_grade=eff, price=None, source="", how="",
-               matched_name="", matched_set="", note="")
+               matched_name="", matched_set="", note="", guess=False,
+               confidence="")
 
     candidates, how_matched = index.lookup(name, set_name)
     if not candidates:
@@ -387,9 +409,14 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
         sets = {_norm(c.get("console-name")) for c in candidates}
         if len(sets) > 1:
             shown = sorted({str(c.get("console-name")) for c in candidates})
-            out["note"] = ("ambiguous: matches %d sets - add a Set column "
-                           "to choose (%s)" % (len(sets), "; ".join(shown[:4])))
-            return out
+            if strict:
+                out["note"] = ("ambiguous: matches %d sets - add a Set "
+                               "column to choose (%s)"
+                               % (len(sets), "; ".join(shown[:4])))
+                return out
+            out["guess"] = True
+            out["note"] = ("best guess - also in %d other set(s): %s"
+                           % (len(sets) - 1, "; ".join(shown[1:4])))
         candidates = candidates[:1]
 
     if candidates:
@@ -455,7 +482,13 @@ def price_row(row: dict, index: ExactIndex, guide: PriceGuide,
         out.update(price=round(float(quote.value), 2),
                    source=f"guide lookup ({quote.match})",
                    how=quote.how, matched_name=quote.product_name or "",
-                   matched_set=quote.console_name or "")
+                   matched_set=quote.console_name or "",
+                   confidence=f"{quote.match} {quote.score:.0%}")
+        if quote.match not in ("exact", "strong"):
+            out["guess"] = True
+            if not out["note"]:
+                out["note"] = (f"best guess - {quote.match} match at "
+                               f"{quote.score:.0%}; name the set to confirm")
     else:
         # "no guide host configured" is what the guide says when the local
         # CSVs could not land it and no paid host was allowed. Told to a
@@ -554,7 +587,8 @@ def write_report(path: str, priced: list[dict], warnings: list[str],
         headers += ["Cost", "Value", "PnL"]
     else:
         headers += ["Value"]
-    headers += ["Matched Product", "Matched Set", "Source", "Price Field"]
+    headers += ["Matched Product", "Matched Set", "Confidence",
+                "Source", "Price Field"]
     ws.append(headers)
     for r in ok:
         row = [r["line"], r["name"], r["set"], r["grade"]]
@@ -564,13 +598,16 @@ def write_report(path: str, priced: list[dict], warnings: list[str],
             row += [cost, r["price"], pnl]
         else:
             row += [r["price"]]
-        row += [r["matched_name"], r["matched_set"], r["source"], r["how"]]
+        row += [r["matched_name"], r["matched_set"],
+                ("BEST GUESS - " + r["confidence"] if r.get("guess")
+                 else r.get("confidence") or "match"),
+                r["source"], r["how"]]
         ws.append(row)
     for c in ws[1]:
         c.font = Font(bold=True)
     ws.freeze_panes = "A2"
     widths = ([6, 42, 26, 10] + ([14, 14, 14] if has_cost else [14])
-              + [42, 26, 26, 34])
+              + [42, 26, 24, 26, 34])
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     money_first, money_last = 5, (7 if has_cost else 5)
@@ -656,6 +693,9 @@ def main(argv=None) -> int:
                         "(e.g. '1st Edition')")
     p.add_argument("--api-cap", type=int, default=50,
                    help="most rows allowed to reach the paid API (default 50)")
+    p.add_argument("--strict", action="store_true",
+                   help="refuse near-ties instead of taking the best guess "
+                        "(the scanner's behaviour)")
     p.add_argument("--include-sealed", action="store_true",
                    help="keep booster boxes/packs in a seeded set "
                         "(default: cards only)")
@@ -716,13 +756,21 @@ def main(argv=None) -> int:
     exact = ExactIndex(index.rows)
     budget = [max(0, args.api_cap)]
 
+    # The margin gate exists so the SCANNER never bids on a coin flip. In a
+    # basket you already own the card and told us what it is, so refusing a
+    # near-tie just leaves a blank cell where a good estimate belongs. Take
+    # the best candidate and label it; --strict restores the gate.
+    if not args.strict:
+        guide.match_margin = 0.0
+
     # Cards the local CSVs cannot answer go to the paid guide at one call
     # per second, so a long basket is a long silence. Say what is happening.
     print(f"  pricing {len(rows)} line item(s) from "
           f"{len(index):,} guide products...", flush=True)
     priced = []
     for n, row in enumerate(rows, start=1):
-        priced.append(price_row(row, exact, guide, budget))
+        priced.append(price_row(row, exact, guide, budget,
+                                strict=args.strict))
         if n % 10 == 0 or n == len(rows):
             got = sum(1 for r in priced if r["price"] is not None)
             print(f"    {n}/{len(rows)}  ({got} priced)", flush=True)

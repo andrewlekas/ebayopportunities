@@ -5394,13 +5394,30 @@ class TestCustomBasketPricer(unittest.TestCase):
         self.assertEqual(got["how"], "manual-only-price")
         self.assertIn("local CSV", got["source"])
 
-    def test_an_ambiguous_name_is_reported_not_guessed(self):
-        """'Charizard #4' is three different products between $3,000 and
-        $343,098. The scanner refuses this and so does the basket."""
-        got = self._price("Charizard #4", "PSA 10")
+    def test_strict_mode_refuses_an_ambiguous_name(self):
+        """'Charizard #4' is several products between $3,000 and $343,098.
+        --strict restores the scanner's refusal."""
+        m = self._mod()
+        index = m.ExactIndex(self._rows())
+        got = m.price_row({"name": "Charizard #4", "grade": "PSA 10",
+                           "set": "", "line": 2}, index, None, [0],
+                          strict=True)
         self.assertIsNone(got["price"])
         self.assertIn("ambiguous", got["note"])
         self.assertIn("Pokemon Base Set 2", got["note"])
+
+    def test_by_default_a_near_tie_is_priced_and_labelled(self):
+        """You own the card and you named it, so a blank cell is worse than
+        a close estimate. The row is priced, flagged as a guess, and told
+        what else it could have been."""
+        m = self._mod()
+        index = m.ExactIndex(self._rows())
+        got = m.price_row({"name": "Charizard #4", "grade": "PSA 10",
+                           "set": "", "line": 2}, index, None, [0])
+        self.assertIsNotNone(got["price"])
+        self.assertTrue(got["guess"])
+        self.assertIn("best guess", got["note"])
+        self.assertIn("other set", got["note"])
 
     def test_grade_routing_is_the_scanners_own(self):
         """Not a reimplementation: same ladder, same cross-grader shift,
