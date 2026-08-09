@@ -368,6 +368,14 @@ def download(host: str, slug: str, token: str, path: str,
                             KIND_CHALLENGE)
                 return (False, f"HTTP {r.status_code} - {reason}",
                         KIND_NOT_COVERED)
+            if r.status_code in (500, 502, 503, 504):
+                # Server-side and transient - the provider generates these
+                # CSVs on demand and the 50MB comic guide sometimes fails
+                # to build in time. KIND_RATE gets the one wait-and-retry
+                # that the rate-limit path already has, which is exactly
+                # the right medicine; the old KIND_HTTP just gave up.
+                return (False, f"HTTP {r.status_code} (server-side, usually "
+                        "temporary)", KIND_RATE)
             if r.status_code != 200:
                 return False, f"HTTP {r.status_code}", KIND_HTTP
             head = ""

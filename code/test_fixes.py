@@ -3745,6 +3745,28 @@ class TestGuideCsvDownloader(unittest.TestCase):
                if "sportscardspro" in g["host"]]
         self.assertEqual(scp, [], "SCP selects sets by console-uids only")
 
+    def test_a_503_is_transient_and_gets_the_retry_path(self):
+        """2026-08-08: the 50MB comic guide 503'd - server-side, usually a
+        generation timeout - and the downloader gave up instead of taking
+        the one wait-and-retry the rate-limit path already had."""
+        m = self._mod()
+        for code in (500, 502, 503, 504):
+            class FakeResp:
+                status_code = code
+                content = b""
+                def close(self): pass
+                def iter_content(self, chunk_size=0): yield b""
+            with mock.patch.object(m, "curl_requests", None), \
+                    mock.patch.object(m.requests, "get",
+                                      lambda *a, **kw: FakeResp()):
+                ok, detail, kind = m.download(
+                    m.PC, "comic-books", "tok",
+                    os.path.join(tempfile.mkdtemp(), "x.csv"))
+            self.assertFalse(ok)
+            self.assertEqual(kind, m.KIND_RATE,
+                             f"{code} must take the retry path")
+            self.assertIn("temporary", detail)
+
     def test_the_cooldown_clears_the_documented_limit(self):
         """One CSV per ten minutes is the provider's rule, so the default
         must exceed 600s - but only just. It was briefly 900 while the
