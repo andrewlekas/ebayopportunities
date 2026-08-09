@@ -164,6 +164,7 @@ def configured_scan_entries(config: dict) -> list[dict]:
     ordered = (set_need_entries(config)
                + sports_target_entries(config)
                + sports_target_entries(config, key="pokemon_targets")
+               + sports_target_entries(config, key="other_targets")
                + list(config.get("watchlist") or []))
     out: list[dict] = []
     positions: dict[str, int] = {}

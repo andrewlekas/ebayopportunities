@@ -87,6 +87,28 @@ class TestStructuredSportsTargets(unittest.TestCase):
                       mm(q, "1986 Fleer Michael Jordan #57 raw",
                          grade_min=7, grade_max=10) or "")
 
+    def test_pokemon_and_other_targets_use_the_same_machinery(self):
+        """Non-sports cards are still ONE specific card, so they get the
+        same exact-target contract. 2026-08-08: Andrew's list included a
+        1931 Wills Cinema Stars Disney and a 1940 Gum Inc Superman #1 -
+        the CARD, not the comic."""
+        from targets import configured_scan_entries
+        config = {
+            "pokemon_targets": [{
+                "player": "Charizard", "year": 1999,
+                "set": "Base Set 1st Edition", "card_number": "4",
+                "grade": 8}],
+            "other_targets": [{
+                "subject": "Superman", "year": 1940, "set": "Gum Inc",
+                "card_number": "1", "grade_band": [1, 5]}],
+        }
+        entries = {e["query"]: e for e in configured_scan_entries(config)}
+        chz = entries["1999 Base Set 1st Edition Charizard #4"]
+        self.assertEqual((chz["grade_min"], chz["grade_max"]), (7.0, 10.0))
+        self.assertTrue(chz["structured_target"])
+        sup = entries["1940 Gum Inc Superman #1"]
+        self.assertEqual((sup["grade_min"], sup["grade_max"]), (1.0, 5.0))
+
     def test_set_need_merges(self):
         config = {
             "sports_targets": [{
