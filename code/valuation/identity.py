@@ -763,7 +763,12 @@ class CardIdentity:
         console = (console_name or "").strip()
         if not name and not console:
             return 0.0
-        other = CardIdentity.from_text(f"{name} {console}".strip())
+        # identity_of, not from_text: a product name is parsed once per
+        # SCAN this way instead of once per listing that scores against it.
+        # 2026-08-08 profile: 11,958 from_text calls for 150 evaluations,
+        # ~80 per listing, nearly all of them re-parsing the same catalogue
+        # rows. CardIdentity is frozen, so sharing one is safe.
+        other = identity_of(f"{name} {console}".strip())
         declared = catalogue_parallel(name)
         if declared:
             other = replace(other, parallel=declared)

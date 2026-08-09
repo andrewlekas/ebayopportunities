@@ -26,6 +26,7 @@ is genuinely useful - every set you add is a set that stops costing calls.
 from __future__ import annotations
 
 import csv
+import heapq
 import glob
 import logging
 import os
@@ -77,6 +78,8 @@ class GuideCsvIndex:
         self.rows: list[dict] = []
         self._index: dict[str, list[int]] = {}
         self.files: list[str] = []
+        self._common_at = 2000        # replaced in load(); safe if unloaded
+        self._pool_cap = 6000         # most candidates worth scoring
 
     # -- loading -------------------------------------------------------
     def load(self) -> "GuideCsvIndex":
@@ -88,6 +91,13 @@ class GuideCsvIndex:
             except (OSError, csv.Error) as exc:
                 log.warning("price CSV %s could not be read: %s",
                             os.path.basename(path), exc)
+        # A token in more than this share of the catalogue cannot narrow
+        # anything, so searching it is pure cost. 2% of 641k rows is ~12,800:
+        # "charizard" (5k) survives, "pokemon" (92k) and "comic" (348k) do
+        # not. Recomputed on every load because it scales with the files
+        # you have downloaded.
+        self._common_at = max(2000, int(len(self.rows) * 0.02))
+        self._pool_cap = 6000
         if self.rows:
             log.info("price guide CSVs: %d rows from %d file(s) - these cost "
                      "no API calls", len(self.rows), len(self.files))
@@ -148,13 +158,46 @@ class GuideCsvIndex:
         tokens = set(_TOKEN_RE.findall((query or "").casefold()))
         if not tokens:
             return []
-        hits: dict[int, int] = {}
-        for token in tokens:
-            for position in self._index.get(token, ()):
-                hits[position] = hits.get(position, 0) + 1
-        if not hits:
+
+        # SHORTLIST on the rarest tokens, then SCORE on all of them.
+        #
+        # 2026-08-08 profile: this was 63% of valuation at 48ms a call,
+        # because a title containing "comic" walked 347,716 postings and one
+        # containing "the" walked 86,073 - just to add every row to a tally
+        # that then had to be sorted.
+        #
+        # Simply ignoring common tokens was tried first and was wrong: card
+        # NUMBERS are common tokens ("2" is in 45,064 products) and they are
+        # decisive, so "pokemon jungle electrode #2" started answering
+        # Electrode #101. Only 67% of queries kept their top candidate.
+        #
+        # So the split is between finding candidates and ranking them. The
+        # rarest token - "electrode", a few hundred rows - is enough to find
+        # every plausible row. Ranking then counts ALL the query's tokens
+        # against each candidate, exactly as before, so "#2" still decides
+        # between Electrode #2 and Electrode #101.
+        ranked = sorted(tokens, key=lambda t: len(self._index.get(t, ())))
+        pool: list[int] = []
+        seen: set[int] = set()
+        for token in ranked:
+            postings = self._index.get(token, ())
+            if pool and (len(postings) > self._common_at
+                         or len(pool) >= self._pool_cap):
+                break
+            for position in postings:
+                if position not in seen:
+                    seen.add(position)
+                    pool.append(position)
+        if not pool:
             return []
-        best = sorted(hits.items(), key=lambda kv: -kv[1])[:limit]
+
+        hits: dict[int, int] = {}
+        for position in pool:
+            row = self.rows[position]
+            blob = f"{row['product-name']} {row['console-name']}".casefold()
+            hits[position] = len(tokens & set(_TOKEN_RE.findall(blob)))
+        # nlargest beats a full sort when we want 60 out of thousands.
+        best = heapq.nlargest(limit, hits.items(), key=lambda kv: kv[1])
         return [self.rows[position] for position, _ in best]
 
     def __len__(self) -> int:

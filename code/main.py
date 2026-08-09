@@ -678,6 +678,15 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
     # The window between is picked-over inventory.
     bin_dead_from = float(flt.get("bin_dead_zone_from_days", 0) or 0)
     bin_dead_to = float(flt.get("bin_dead_zone_to_days", 0) or 0)
+    # A full scan reports auctions; the BIN sweep reports fixed price.
+    # Set scanning.auctions_only false to put them back in one workbook.
+    drop_fixed = (mode != "bin"
+                  and bool(config.get("scanning", {}).get(
+                      "auctions_only", True)))
+    # Fetch only what we will keep. The relevance-loop filter stays as a
+    # belt-and-braces guard: a source that ignores the auction filter (or
+    # an HTML fallback that cannot express it) must not smuggle BINs in.
+    fetch_mode = "auctions" if (drop_fixed and mode == "all") else mode
     exclude = flt.get("exclude_keywords") or []
     # Case-SENSITIVE, whole-token. See _qualifier_excluded.
     qualifiers = flt.get("exclude_qualifiers") or []
@@ -768,8 +777,13 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
             # queries (that's where the cross-market edge is), unless disabled
             intl = priority or not intl_pri_only
 
+            # Ask the sources for auctions only when that is all we will
+            # keep. mode "all" fetches auctions AND fixed price, so a full
+            # scan was making roughly double the network calls and then
+            # discarding half - 593s of a 27-minute run went on fetch.
+            # "auctions" is an existing mode with exactly the right meaning.
             listings = _search_marketplaces(
-                scrapers, mode, query, max_results, intl,
+                scrapers, fetch_mode, query, max_results, intl,
                 entry.get("query_ja"),
                 max_results_by_site=max_results_by_site)
 
@@ -864,6 +878,23 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
         log.info("  %d sold comps (%s)", len(comps), query)
 
         min_match = flt.get("min_listing_match", 0.6)
+        # Fixed-price listings leave the full scan here, before anything
+        # expensive touches them. Two reasons, and the second is why this
+        # sits at the very top of the loop rather than in the report:
+        #
+        #   * a full scan is an AUCTION product - BINs are the BIN sweep's
+        #     job, and mixing them buried the auctions;
+        #   * they were ~68% of everything valued (8,569 of 12,651 rows in
+        #     the 2026-08-08 workbook), and valuation was 912s of a 27-min
+        #     run. Dropping them here skips the identity work, the comp
+        #     statistics AND the paid guide lookup for every one of them.
+        if drop_fixed:
+            before = len(listings)
+            listings = [l for l in listings if l.listing_type != "fixed"]
+            if before != len(listings):
+                relevance_skips[
+                    "fixed price (Run BIN Sweep covers these)"] += (
+                        before - len(listings))
         listings, n_duplicates = _dedupe_listings(listings)
         relevance_skips["duplicate within query"] += n_duplicates
         relevant: list[tuple[str, object]] = []

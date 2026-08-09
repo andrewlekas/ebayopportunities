@@ -26,7 +26,8 @@ from security import redact_text
 
 from . import comps as comps_mod
 from .comps import title_match_score, grade_info, GRADE_RE
-from .identity import (CardIdentity, MATCH_EXACT, MATCH_NONE, MATCH_STRONG,
+from .identity import (CardIdentity, identity_of, MATCH_EXACT, MATCH_NONE,
+                       MATCH_STRONG,
                        MATCH_WEAK, genre_class, match_band)
 
 log = logging.getLogger(__name__)
@@ -695,7 +696,7 @@ class PriceGuide:
                 genre = genre_class(candidate.get("genre"))
                 if genre and genre != "card":
                     continue
-                other = CardIdentity.from_text(
+                other = identity_of(
                     f"{candidate.get('product-name', '')} "
                     f"{candidate.get('console-name', '')}".strip())
                 if ident.number and other.number != ident.number:
@@ -734,12 +735,12 @@ class PriceGuide:
         # rivals. If the listing says "1st Edition" and the winner is the 1st
         # Edition product, the unlimited printing sitting 5% behind is a
         # candidate we correctly rejected - not proof that we are guessing.
-        top_ident = CardIdentity.from_text(
+        top_ident = identity_of(
             f"{best.get('product-name', '')} "
             f"{best.get('console-name', '')}".strip())
         rival = None
         for score_i, cand in scored[1:]:
-            other = CardIdentity.from_text(
+            other = identity_of(
                 f"{cand.get('product-name', '')} "
                 f"{cand.get('console-name', '')}".strip())
             if ident.discriminates(top_ident, other):
