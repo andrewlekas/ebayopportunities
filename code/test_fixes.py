@@ -5136,6 +5136,52 @@ class TestSourceOnboarding(unittest.TestCase):
             self.assertEqual(rows[0].shipping, 12)
 
 
+class TestGradingQualifierExclusion(unittest.TestCase):
+    """PSA prints condition qualifiers on the slab: OC (off-centre), MK
+    (marks), ST (stain), MC (miscut), OF (out of focus), PD (print defect).
+    A PSA 9 (OC) trades far below a clean PSA 9, so valuing it against
+    clean comps overstates it - and one sat on the Action sheet.
+
+    It cannot go in exclude_keywords, which is a case-insensitive substring
+    test: 'oc' also appears in block, occasion, Knocks, Rockies, chocolate
+    and Ochoa. Whole token, capitals required, brackets optional.
+    """
+
+    QUALS = ["OC", "MK", "ST", "MC", "OF", "PD"]
+
+    def _x(self, title):
+        import main as scanner
+        return scanner._qualifier_excluded(title, self.QUALS)
+
+    def test_qualified_slabs_are_excluded(self):
+        for title in ["1986 Fleer Michael Jordan Rookie #57 PSA 9 (OC)",
+                      "1986 Fleer Michael Jordan #57 PSA 8 OC",
+                      "PSA 7 (MK) 1952 Topps Mantle",
+                      "1955 Topps Clemente PSA 4 ST"]:
+            self.assertTrue(self._x(title), title)
+
+    def test_ordinary_words_containing_the_letters_are_kept(self):
+        """The whole reason this is not exclude_keywords."""
+        for title in ["Colorado Rockies Team Set PSA 9",
+                      "Vintage Block Party Promo PSA 9",
+                      "Chocolate Wrapper 1952",
+                      "Knocks Out Boxing PSA 8",
+                      "Ochoa Rookie PSA 9",
+                      "Occasional Sports Illustrated",
+                      "2001 SPX Tiger Woods SOTT Auto PSA 9",
+                      "1986 Fleer Michael Jordan Rookie #57 PSA 9"]:
+            self.assertFalse(self._x(title), title)
+
+    def test_lowercase_is_not_the_qualifier(self):
+        """PSA never writes it lowercase, and requiring capitals is what
+        makes the whole-token match safe."""
+        self.assertFalse(self._x("psa 9 oc lowercase"))
+
+    def test_no_qualifiers_configured_is_a_no_op(self):
+        import main as scanner
+        self.assertFalse(scanner._qualifier_excluded("PSA 9 (OC)", []))
+
+
 class TestSetTokensIncludeProductLines(unittest.TestCase):
     """2026-08-02, from a real basket run. SET_WORDS knew MANUFACTURERS but
     not PRODUCT LINES, and the line is what separates two cards of the same

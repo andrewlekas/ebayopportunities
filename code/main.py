@@ -366,6 +366,38 @@ def _excluded(title: str, keywords: list[str]) -> bool:
     return any(k.lower() in t for k in keywords)
 
 
+# Grading qualifiers are SHORT and only mean anything in capitals. PSA's
+# off-centre qualifier is "OC", and a card that carries it is worth a
+# fraction of a clean one - but "oc" as a case-insensitive substring also
+# appears in block, occasion, Knocks, Rockies, chocolate and Ochoa, so it
+# cannot go in exclude_keywords with the others.
+#
+# Matched as a whole token, capitals required, optionally parenthesised:
+#   "1986 Fleer Jordan PSA 9 (OC)"   -> excluded
+#   "PSA 8 OC"                       -> excluded
+#   "Vintage Rockies Team Set"       -> kept
+#   "psa 9 oc"                       -> kept (lowercase is not the
+#                                      qualifier; PSA never writes it so)
+_QUALIFIER_CACHE: dict[tuple, "re.Pattern"] = {}
+
+
+def _qualifier_excluded(title: str, qualifiers: list[str]) -> bool:
+    """True when the title carries one of PSA's condition qualifiers."""
+    if not qualifiers or not title:
+        return False
+    key = tuple(qualifiers)
+    pattern = _QUALIFIER_CACHE.get(key)
+    if pattern is None:
+        alts = "|".join(re.escape(str(q).strip()) for q in qualifiers
+                        if str(q).strip())
+        if not alts:
+            return False
+        pattern = re.compile(rf"(?<![A-Za-z0-9])\(?({alts})\)?"
+                             rf"(?![A-Za-z0-9])")
+        _QUALIFIER_CACHE[key] = pattern
+    return bool(pattern.search(title))
+
+
 def within_auction_horizon(listing, max_hours: float | None) -> bool:
     """Is this auction close enough to act on?
 
@@ -647,6 +679,8 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
     bin_dead_from = float(flt.get("bin_dead_zone_from_days", 0) or 0)
     bin_dead_to = float(flt.get("bin_dead_zone_to_days", 0) or 0)
     exclude = flt.get("exclude_keywords") or []
+    # Case-SENSITIVE, whole-token. See _qualifier_excluded.
+    qualifiers = flt.get("exclude_qualifiers") or []
     dbc = config.get("database", {})
     conn = histdb.connect(dbc.get("file", "history.db"))
     cache_hours = dbc.get("comp_cache_hours", 24)
@@ -822,7 +856,9 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
         # Babe Ruth 1933 pool had a median of $6 because of them.
         if exclude and comps:
             n_raw = len(comps)
-            comps = [c for c in comps if not _excluded(c.title, exclude)]
+            comps = [c for c in comps
+                     if not _excluded(c.title, exclude)
+                     and not _qualifier_excluded(c.title, qualifiers)]
             if n_raw != len(comps):
                 n_comp_junk[0] += n_raw - len(comps)
         log.info("  %d sold comps (%s)", len(comps), query)
@@ -834,6 +870,12 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
         for listing in listings:
             if _excluded(listing.title, exclude):
                 relevance_skips["excluded keyword"] += 1
+                continue
+            # A qualifier is a defect on the slab, not a word in the title:
+            # a PSA 9 (OC) is off-centre and trades far below a clean 9,
+            # so valuing it against clean comps overstates it badly.
+            if _qualifier_excluded(listing.title, qualifiers):
+                relevance_skips["grading qualifier (OC/MK/ST)"] += 1
                 continue
             if entry.get("structured_target"):
                 mismatch = structured_target_mismatch(
@@ -984,7 +1026,9 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
 
     if exclude:
         for target_query, pool in list(targeted_pools.items()):
-            clean = [c for c in pool if not _excluded(c.title, exclude)]
+            clean = [c for c in pool
+                     if not _excluded(c.title, exclude)
+                     and not _qualifier_excluded(c.title, qualifiers)]
             n_comp_junk[0] += len(pool) - len(clean)
             targeted_pools[target_query] = clean
     if target_queries:
