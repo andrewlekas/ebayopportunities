@@ -910,7 +910,9 @@ def run_live(config: dict, engine: ValuationEngine, mode: str,
                 continue
             if entry.get("structured_target"):
                 mismatch = structured_target_mismatch(
-                    str(entry.get("target_identity") or query), listing.title)
+                    str(entry.get("target_identity") or query), listing.title,
+                    grade_min=entry.get("grade_min"),
+                    grade_max=entry.get("grade_max"))
                 if mismatch:
                     relevance_skips[
                         f"structured target mismatch: {mismatch}"] += 1

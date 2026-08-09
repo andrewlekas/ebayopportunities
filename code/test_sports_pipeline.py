@@ -45,7 +45,49 @@ class TestSportsIdentityHardening(unittest.TestCase):
 
 
 class TestStructuredSportsTargets(unittest.TestCase):
-    def test_targets_expand_per_grade_and_set_need_merges(self):
+    def test_a_grade_list_becomes_ONE_banded_query(self):
+        """2026-08-08. Expanding every grade into its own eBay search made
+        35 cards at five grades each cost 175 queries, and fetch was
+        already 593s of a 27-minute run. A band is one query whose RESULTS
+        are filtered - the same information for a fifth of the network.
+
+        The grade is deliberately absent from the query text: asking eBay
+        for "PSA 8" hides the PSA 7 and 9 copies the band also wants."""
+        from targets import sports_target_entries, grade_band
+        config = {"sports_targets": [{
+            "player": "Michael Jordan", "year": 1986, "set": "Fleer",
+            "card_number": "57", "grades": ["PSA 8", "PSA 9"]}]}
+        entries = sports_target_entries(config)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["query"], "1986 Fleer Michael Jordan #57")
+        self.assertEqual((entries[0]["grade_min"], entries[0]["grade_max"]),
+                         (8.0, 9.0))
+
+    def test_a_single_grade_widens_by_andrews_rule(self):
+        """One lower, two higher is still the card he wants."""
+        from targets import grade_band
+        self.assertEqual(grade_band({"grade": 8}), (7.0, 10.0))
+        self.assertEqual(grade_band({"grade": 2}), (1.0, 4.0))
+        self.assertEqual(grade_band({"grade": 9}), (8.0, 10.0))
+        self.assertEqual(grade_band({"grade_band": [1, 5]}), (1.0, 5.0))
+
+    def test_the_band_is_enforced_on_returned_titles(self):
+        """The query carries no grade, so the band is the only grade test."""
+        from targets import structured_target_mismatch as mm
+        q = "1986 Fleer Michael Jordan #57"
+        ok = "1986 Fleer Michael Jordan #57 PSA 8"
+        self.assertIsNone(mm(q, ok, grade_min=7, grade_max=10))
+        self.assertIn("below target band",
+                      mm(q, "1986 Fleer Michael Jordan #57 PSA 5",
+                         grade_min=7, grade_max=10) or "")
+        self.assertIn("above target band",
+                      mm(q, "1986 Fleer Michael Jordan #57 PSA 10",
+                         grade_min=1, grade_max=5) or "")
+        self.assertIn("graded card",
+                      mm(q, "1986 Fleer Michael Jordan #57 raw",
+                         grade_min=7, grade_max=10) or "")
+
+    def test_set_need_merges(self):
         config = {
             "sports_targets": [{
                 "player": "Michael Jordan", "year": 1986, "set": "Fleer",
@@ -60,9 +102,6 @@ class TestStructuredSportsTargets(unittest.TestCase):
             }],
         }
         entries = configured_scan_entries(config)
-        queries = [entry["query"] for entry in entries]
-        self.assertIn("1986 Fleer Michael Jordan #57 PSA 8", queries)
-        self.assertIn("1986 Fleer Michael Jordan #57 PSA 9", queries)
         trader = [entry for entry in entries if "Pokemon Trader" in entry["query"]]
         self.assertEqual(len(trader), 1)
         self.assertTrue(trader[0]["set_need"])
