@@ -552,6 +552,7 @@ def main() -> int:
 
     ok = 0
     failures: list[tuple[str, str, str]] = []
+    needs_uid: list[str] = []
     # A host that refuses us for a subscription reason will refuse every
     # other request OF THE SAME SHAPE. Recording that lets the rest fail
     # fast instead of costing a quarter of an hour each.
@@ -569,6 +570,13 @@ def main() -> int:
         slug, host, name, path = (g["category"] or "", g["host"], g["name"],
                                   g["path"])
         uids = g["console_uids"]
+        # A SportsCardsPro entry with no uid cannot be fetched - that host
+        # ignores category= and would silently serve video games (the
+        # 2026-08-01 incident). Skip it loudly instead, and collect the
+        # names so the summary can say exactly what to go and collect.
+        if "sportscardspro" in host and not uids and not slug:
+            needs_uid.append(name)
+            continue
         selector = "console-uids" if uids else "category"
         if (host, selector) in blocked_hosts:
             kind, why = blocked_hosts[(host, selector)]
@@ -623,6 +631,16 @@ def main() -> int:
 
     print()
     print(f"Downloaded {ok} of {len(todo)}.")
+    if needs_uid:
+        print()
+        print(f"{len(needs_uid)} set(s) are waiting for their console-uids:")
+        for name in needs_uid:
+            print(f"    {name}")
+        print()
+        print("To collect one: open the set page on sportscardspro.com")
+        print("while logged in, right-click 'Download Price List', copy the")
+        print("link, and paste the console-uids= value into config.yaml")
+        print("next to that set's name. They will download on the next run.")
     if failures:
         print()
         print("Failures:")

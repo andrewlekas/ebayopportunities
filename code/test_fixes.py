@@ -3745,6 +3745,48 @@ class TestGuideCsvDownloader(unittest.TestCase):
                if "sportscardspro" in g["host"]]
         self.assertEqual(scp, [], "SCP selects sets by console-uids only")
 
+    def test_a_set_without_a_uid_is_skipped_with_instructions(self):
+        """25 sets were queued on 2026-08-08 with uids still to be
+        collected. An SCP entry with no uid must never be fetched - that
+        host ignores category= and serves video games (the 08-01 incident)
+        - and the summary must say which sets are waiting and how to get
+        their uids."""
+        m = self._mod()
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "guide_csv"), exist_ok=True)
+        tried, sleeps = [], []
+
+        def fake_download(host, slug, token, path, console_uids=None):
+            tried.append((m._host_label(host), console_uids or slug))
+            with open(path, "w") as fh:
+                fh.write("id,product-name,console-name\n1,a,Basketball\n")
+            return True, "1 KB", m.KIND_OK
+
+        guides = [
+            {"name": "1986 Fleer Basketball", "host": m.SCP,
+             "console_uids": "G155"},
+            {"name": "T206", "host": m.SCP, "console_uids": None},
+            {"name": "1933 Goudey Baseball", "host": m.SCP},
+        ]
+        printed = []
+        with mock.patch.object(m, "FOLDER", os.path.join(tmp, "guide_csv")), \
+             mock.patch.object(m, "download", fake_download), \
+             mock.patch.object(m.time, "sleep", lambda s: sleeps.append(s)), \
+             mock.patch.object(m.scanner, "load_config", lambda p: {
+                 "api_keys": {"pricecharting": {"token": "t"}},
+                 "guide_csv": {"guides": guides}}), \
+             mock.patch("builtins.print",
+                        lambda *a, **kw: printed.append(" ".join(map(str, a)))), \
+             mock.patch.object(m.sys, "argv", ["x"]):
+            m.main()
+
+        self.assertEqual(tried, [("SportsCardsPro", "G155")],
+                         "only the set WITH a uid is fetched")
+        text = "\n".join(printed)
+        self.assertIn("T206", text)
+        self.assertIn("1933 Goudey Baseball", text)
+        self.assertIn("console-uids", text)
+
     def test_a_503_is_transient_and_gets_the_retry_path(self):
         """2026-08-08: the 50MB comic guide 503'd - server-side, usually a
         generation timeout - and the downloader gave up instead of taking
