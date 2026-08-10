@@ -4603,9 +4603,12 @@ class TestSheetOrder(unittest.TestCase):
             self.assertIn(name, back)
             self.assertNotIn(name, front)
 
-    def test_discovery_sits_just_before_watches(self):
+    def test_discovery_stays_near_the_back_of_the_card_tabs(self):
+        """Reordered 2026-08-09: category tabs first, then Grails and
+        Discovery - browse material reads after decision material."""
         front = report_mod.SHEET_ORDER_FRONT
-        self.assertEqual(front[front.index("Discovery") + 1], "Watches")
+        self.assertGreater(front.index("Discovery"),
+                           front.index("Sports Cards"))
 
     def test_today_leads_the_book(self):
         self.assertEqual(report_mod.SHEET_ORDER_FRONT[0], "Today")
@@ -5199,6 +5202,64 @@ class TestSourceOnboarding(unittest.TestCase):
             self.assertEqual(rows[0].listing_id, "lot-7")
             self.assertEqual(rows[0].buyer_fee_rate, 0.20)
             self.assertEqual(rows[0].shipping, 12)
+
+
+class TestWorkbookReadingOrder(unittest.TestCase):
+    """Andrew's rule, 2026-08-09: card tabs at the front, data at the back.
+
+    And card rows ordered by interest - EV discounted by confidence - not
+    by priority stars or ROI ratios. Raw EV would rank a shaky $2,000
+    guess over a solid $400 edge; ROI buries big absolute edges on
+    expensive cards. The tier colouring is a reading aid, never a gate.
+    """
+
+    def _opp(self, ev, conf, unresolved=False, priority=False):
+        from models import Listing, Valuation, Opportunity
+        l = Listing(site="ebay", title="t", url="https://www.ebay.com/itm/1",
+                    current_price=100.0, listing_id="1", query="q",
+                    priority=priority)
+        v = Valuation(fair_value=500.0, expected_value=ev, confidence=conf,
+                      n_comps=9,
+                      notes=["MIXED POOL: broad"] if unresolved else [])
+        return Opportunity(listing=l, valuation=v)
+
+    def test_rows_sort_by_believable_dollars(self):
+        from report import _sorted
+        solid_400 = self._opp(400, 0.8)
+        shaky_2000 = self._opp(2000, 0.1)          # 2000 x 0.1 = 200
+        small_sure = self._opp(50, 0.9)
+        starred_but_small = self._opp(30, 0.9, priority=True)
+        rows = _sorted([small_sure, shaky_2000, starred_but_small, solid_400])
+        self.assertEqual(rows[0].valuation.expected_value, 400,
+                         "solid $400 outranks shaky $2,000")
+        self.assertEqual(rows[1].valuation.expected_value, 2000)
+        self.assertEqual(rows[-1].valuation.expected_value, 30,
+                         "a priority star no longer outranks bigger edges")
+
+    def test_unresolved_rows_always_sink(self):
+        from report import _sorted, _interest_tier
+        big_broad = self._opp(5000, 0.9, unresolved=True)
+        modest_real = self._opp(60, 0.5)
+        rows = _sorted([big_broad, modest_real])
+        self.assertEqual(rows[0].valuation.expected_value, 60,
+                         "a broad-median value never outranks a real one")
+        self.assertEqual(_interest_tier(big_broad), "browse")
+
+    def test_tiers(self):
+        from report import _interest_tier
+        self.assertEqual(_interest_tier(self._opp(400, 0.8)), "high")
+        self.assertEqual(_interest_tier(self._opp(100, 0.5)), "medium")
+        self.assertEqual(_interest_tier(self._opp(50, 0.2)), "low")
+
+    def test_card_tabs_front_data_tabs_back(self):
+        from report import SHEET_ORDER_FRONT, SHEET_ORDER_BACK
+        for name in ("Trade Blotter", "Portfolio", "Movers",
+                     "Research-Filtered", "About"):
+            self.assertIn(name, SHEET_ORDER_BACK, name)
+            self.assertNotIn(name, SHEET_ORDER_FRONT, name)
+        self.assertEqual(SHEET_ORDER_FRONT[0], "Today")
+        for name in ("Sports Cards", "Pokemon Cards", "Grails", "Discovery"):
+            self.assertIn(name, SHEET_ORDER_FRONT, name)
 
 
 class TestGradingQualifierExclusion(unittest.TestCase):

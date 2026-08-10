@@ -162,6 +162,12 @@ def _fill_sheet(ws, opps: list[Opportunity]) -> None:
     band = PatternFill("solid", fgColor="F5F7FA")
     amber = PatternFill("solid", fgColor="FFF2CC")
     green = PatternFill("solid", fgColor="E2EFDA")
+    # The Rank cell carries the interest tier as colour: green = high
+    # (EV x conf >= $100), amber = medium (>= $25), plain = low, grey =
+    # browse-only. A colour costs no column and survives re-sorting.
+    tier_fill = {"high": PatternFill("solid", fgColor="C6EFCE"),
+                 "medium": PatternFill("solid", fgColor="FFEB9C"),
+                 "browse": PatternFill("solid", fgColor="D9D9D9")}
     type_font = {"AUCTION": Font(color="1F4E79"),
                  "BIN": Font(color="2E7D32", bold=True),
                  "BIN+OBO": Font(color="1B5E20", bold=True)}
@@ -169,6 +175,9 @@ def _fill_sheet(ws, opps: list[Opportunity]) -> None:
     for i, o in enumerate(opps, 1):
         l, v = o.listing, o.valuation
         row = i + 1
+        tier = _interest_tier(o)
+        if tier in tier_fill:
+            ws.cell(row=row, column=1).fill = tier_fill[tier]
         ltype = ("BIN+OBO" if l.listing_type == "fixed" and l.best_offer
                  else "BIN" if l.listing_type == "fixed" else "AUCTION")
         timing, hl = _timing(l)
@@ -266,15 +275,43 @@ def _is_unresolved(o) -> bool:
     return any(m in notes for m in UNRESOLVED_MARKERS)
 
 
+def _interest(o) -> float:
+    """Dollars you can believe in: expected value discounted by confidence.
+
+    Andrew asked for card rows ordered "by some sort of interest score/ev"
+    (2026-08-09). Raw EV alone would rank a shaky $2,000 guess above a
+    solid $400 edge; raw Score (ROI x Conf x Capture) buries big absolute
+    edges on expensive cards because ROI is a ratio. EV x confidence keeps
+    the unit in dollars and lets trust scale it.
+    """
+    ev = o.valuation.expected_value or 0.0
+    conf = o.valuation.confidence or 0.0
+    return ev * max(conf, 0.1)
+
+
+# The visible split Andrew asked for. Boundaries are config-free on
+# purpose: they are reading aids, not gates - nothing is filtered by tier.
+def _interest_tier(o) -> str:
+    score = _interest(o)
+    if _is_unresolved(o):
+        return "browse"
+    if score >= 100:
+        return "high"
+    if score >= 25:
+        return "medium"
+    return "low"
+
+
 def _sorted(opps):
-    """Identified rows first, then by priority and score.
+    """Identified rows first, then by interest (EV x confidence).
 
     A row valued from its own card outranks one valued from a query-wide
-    median, however large the median made its apparent edge look.
+    median, however large the median made its apparent edge look - so
+    resolved-first stays the outer key. Within that, pure interest:
+    priority stars no longer outrank a bigger believable edge.
     """
     return sorted(opps, key=lambda o: (not _is_unresolved(o),
-                                       o.listing.priority,
-                                       o.valuation.opportunity_score),
+                                       _interest(o)),
                   reverse=True)
 
 
@@ -1091,11 +1128,17 @@ def write_report(opps: list[Opportunity], path: str,
 # Reading order, front to back. Decision tabs first, then the research book,
 # then the diagnostics you only open to ask "why is this row missing?".
 # Anything not named here keeps its position between the two groups.
-SHEET_ORDER_FRONT = ("Today", "Action", "Trade Blotter", "Set Needs",
-                     "Pokemon Cards", "Sports Cards", "Sports Memorabilia",
-                     "Video Games", "Discovery", "Watches", "Other",
-                     "Grails", "Crossover", "Portfolio", "Movers")
-SHEET_ORDER_BACK = ("Sports Coverage", "Source Health", "Filter Waterfall",
+# Andrew's rule, 2026-08-09: every tab with CARDS on it at the front of
+# the book, every data/check/ledger tab at the back. Trade Blotter,
+# Portfolio and Movers moved back - the blotter is a ledger you edit via
+# its CSV, Portfolio is holdings not opportunities, Movers is query-level
+# trend data with no listings on it.
+SHEET_ORDER_FRONT = ("Today", "Action", "Set Needs",
+                     "Sports Cards", "Pokemon Cards", "Sports Memorabilia",
+                     "Video Games", "Watches", "Other",
+                     "Grails", "Discovery", "Crossover")
+SHEET_ORDER_BACK = ("Trade Blotter", "Portfolio", "Movers",
+                    "Sports Coverage", "Source Health", "Filter Waterfall",
                     "Research-Filtered", "About")
 
 
