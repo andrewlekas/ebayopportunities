@@ -89,6 +89,33 @@ class YahooJpScraper(BaseScraper):
         self.import_duty_rate = jp.get("import_duty_rate", 0.15)
         self.fx_spread_rate = jp.get("fx_spread_rate", 0.03)
 
+    _captured_this_run = False
+
+    def _capture_failure(self, html: str, q: str) -> None:
+        """Save the page a failed parse actually saw, once per run.
+
+        A parser bug can only be fixed from the markup that broke it, and
+        that markup is unreachable after the fact (Buyee is not fetchable
+        from every environment, and the page differs by session). The
+        capture lands in debug/ - public search HTML, nothing sensitive.
+        """
+        if YahooJpScraper._captured_this_run or not html:
+            return
+        YahooJpScraper._captured_this_run = True
+        try:
+            import os
+            folder = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))), "debug")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "buyee_last_failure.html")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"<!-- query: {q} -->\n")
+                fh.write(html[:2_000_000])
+            log.warning("yahoo_jp/buyee: page saved to %s - the parser can "
+                        "be fixed from this file", path)
+        except OSError:
+            pass
+
     def search_auctions(self, query: str, max_results: int = 50,
                         query_ja: str | None = None) -> list[Listing]:
         q = query_ja or translate_query(query)
@@ -99,10 +126,15 @@ class YahooJpScraper(BaseScraper):
         soup = BeautifulSoup(r.text, "html.parser")
         cards = soup.select("li.itemCard")
         if not cards:
-            # empty page or layout change: make it loud enough to notice
+            # empty page or layout change: make it loud enough to notice,
+            # and SAVE THE EVIDENCE. This parser failed 71/71 times on
+            # 2026-08-09 and there was nothing to debug from - the markup
+            # it saw was gone by the time anyone looked. One capture per
+            # run is enough to fix the selectors offline.
             note_api("yahoo_jp/parse", "failed")
             log.warning("yahoo_jp/buyee: no item cards for %r (ja: %r) - "
                         "empty result or markup changed", query, q)
+            self._capture_failure(r.text, q)
             return []
         note_api("yahoo_jp/parse", "ok")
         out = []

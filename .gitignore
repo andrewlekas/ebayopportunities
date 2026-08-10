@@ -47,3 +47,6 @@ baskets/
 !baskets/README.txt
 reports/basket_*.xlsx
 reports/basket pricer/
+
+# parser failure captures - session HTML, regenerated on demand
+debug/
