@@ -61,6 +61,8 @@ class EbayScraper(BaseScraper):
         self.client_id = creds.get("client_id")
         self.client_secret = creds.get("client_secret")
         self.marketplaces = config.get("marketplaces") or ["EBAY_US"]
+        self.intl_max_results = int(config.get("scraping", {}).get(
+            "intl_max_results", 25))
         self.fx = {**DEFAULT_FX, **(config.get("fx_rates") or {})}
         self._token = None
         # OAuth circuit breaker: without this, a dead auth endpoint gets
@@ -175,14 +177,26 @@ class EbayScraper(BaseScraper):
         def fetch(mp: str) -> list[Listing]:
             found = []
             offset = 0
+            # Non-US marketplaces are capped separately (Andrew, 2026-08-09:
+            # "keep the hits low... looking for my top grail type stuff").
+            # A grail either shows up in the first page of a foreign market
+            # or it is not there; depth costs requests and finds commons.
+            mp_max = (max_results if mp == "EBAY_US"
+                      else min(max_results, self.intl_max_results))
             # eBay requires every non-zero offset to be an exact multiple
             # of the requested page limit. Keep one page size throughout
             # pagination and slice the last response locally.
-            page_limit = min(max_results, 200)
-            while len(found) < max_results:
+            page_limit = min(mp_max, 200)
+            while len(found) < mp_max:
+                filters = [f"buyingOptions:{{{buying}}}"]
+                if mp != "EBAY_US":
+                    # A foreign listing that will not ship to the US is
+                    # noise however cheap it is. deliveryCountry makes the
+                    # marketplace return only what you could actually buy.
+                    filters.append("deliveryCountry:US")
                 params = {
                     "q": query,
-                    "filter": f"buyingOptions:{{{buying}}}",
+                    "filter": ",".join(filters),
                     "limit": page_limit,
                 }
                 if offset:
@@ -204,7 +218,7 @@ class EbayScraper(BaseScraper):
                     l = self._parse_summary(it, query, mp)
                     if l:
                         found.append(l)
-                        if len(found) >= max_results:
+                        if len(found) >= mp_max:
                             break
                 if not payload.get("next") or not items:
                     break
@@ -215,14 +229,21 @@ class EbayScraper(BaseScraper):
                 if next_offset <= offset:
                     break
                 offset = next_offset
-            return found[:max_results]
+            return found[:mp_max]
 
         if len(mps) == 1:
             return fetch(mps[0])
         out = []
         with ThreadPoolExecutor(max_workers=len(mps)) as ex:
-            for found in ex.map(fetch, mps):
-                out.extend(found)
+            per_mp = list(zip(mps, ex.map(fetch, mps)))
+        for _mp, found in per_mp:
+            out.extend(found)
+        intl_counts = {mp: len(found) for mp, found in per_mp
+                       if mp != "EBAY_US" and found}
+        if intl_counts:
+            # The one line that proves the international lane delivers.
+            log.info("    ebay intl: %s", ", ".join(
+                f"{mp[5:]}={n}" for mp, n in intl_counts.items()))
         return out
 
     # ---------------- HTML fallback ----------------

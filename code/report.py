@@ -179,7 +179,14 @@ def _fill_sheet(ws, opps: list[Opportunity]) -> None:
         ltype = ("BIN+OBO" if l.listing_type == "fixed" and l.best_offer
                  else "BIN" if l.listing_type == "fixed" else "AUCTION")
         timing, hl = _timing(l)
-        values = [i, "★" if l.priority else "", ltype, l.site, l.title,
+        # A Berlin listing and a Boston one both said "ebay", which made
+        # the international lane unverifiable from the workbook - nobody
+        # could say whether EBAY_GB/DE had ever delivered a row.
+        site_label = l.site
+        mp = (getattr(l, "marketplace", "") or "").upper()
+        if l.site == "ebay" and mp.startswith("EBAY_") and mp != "EBAY_US":
+            site_label = f"ebay {mp[5:]}"
+        values = [i, "★" if l.priority else "", ltype, site_label, l.title,
                   l.query, l.current_price, l.shipping, l.bid_count, timing,
                   v.fair_value, v.trend_30d, v.comps_value, v.guide_value,
                   v.n_comps, v.expected_cost, v.expected_value, v.edge_now,

@@ -5204,6 +5204,71 @@ class TestSourceOnboarding(unittest.TestCase):
             self.assertEqual(rows[0].shipping, 12)
 
 
+class TestEbayInternationalLane(unittest.TestCase):
+    """2026-08-09: Andrew wants more venues. EBAY_GB/DE were configured for
+    weeks but every marketplace rendered as plain 'ebay', so nobody could
+    say whether the lane had ever delivered a listing. Now: FR/IT/CA/AU
+    added, the Site column names the market, results are capped per foreign
+    marketplace, and foreign markets only return what ships to the US."""
+
+    def _scraper(self, marketplaces=None, intl_max=25):
+        from scrapers.ebay import EbayScraper
+        return EbayScraper({
+            "api_keys": {"ebay": {"client_id": "c", "client_secret": "s"}},
+            "marketplaces": marketplaces or ["EBAY_US", "EBAY_GB"],
+            "scraping": {"intl_max_results": intl_max},
+            "fx_rates": {"GBP": 1.25, "EUR": 1.10},
+        })
+
+    def test_gbp_prices_convert_and_keep_their_marketplace(self):
+        sc = self._scraper()
+        listing = sc._parse_summary({
+            "title": "1999 Pokemon Base Set 1st Edition Charizard PSA 8",
+            "itemWebUrl": "https://www.ebay.co.uk/itm/1",
+            "itemId": "v1|1|0",
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "1000", "currency": "GBP"},
+            "bidCount": 3,
+        }, "charizard", "EBAY_GB")
+        self.assertEqual(listing.current_price, 1250.0,
+                         "GBP 1000 at 1.25 = USD 1250")
+        self.assertEqual(listing.marketplace, "EBAY_GB")
+        self.assertEqual(listing.currency, "GBP")
+
+    def test_the_workbook_names_the_marketplace(self):
+        from report import _fill_sheet
+        from models import Listing, Valuation, Opportunity
+        from openpyxl import Workbook
+        l = Listing(site="ebay", title="t", url="https://www.ebay.de/itm/1",
+                    current_price=100.0, listing_id="1", query="q",
+                    marketplace="EBAY_DE")
+        us = Listing(site="ebay", title="t2", url="https://www.ebay.com/itm/2",
+                     current_price=100.0, listing_id="2", query="q",
+                     marketplace="EBAY_US")
+        v = Valuation(fair_value=500.0, expected_value=50.0, confidence=0.5,
+                      n_comps=9)
+        ws = Workbook().active
+        _fill_sheet(ws, [Opportunity(listing=l, valuation=v),
+                         Opportunity(listing=us, valuation=v)])
+        sites = {ws.cell(row=2, column=4).value,
+                 ws.cell(row=3, column=4).value}
+        self.assertEqual(sites, {"ebay DE", "ebay"},
+                         "a Berlin listing must not look like a Boston one")
+
+    def test_intl_config_ships_six_foreign_markets(self):
+        import yaml
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "config.yaml")
+        if not os.path.isfile(path):
+            self.skipTest("live config.yaml not present")
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        mps = cfg.get("marketplaces") or []
+        for mp in ("EBAY_US", "EBAY_GB", "EBAY_DE", "EBAY_FR",
+                   "EBAY_IT", "EBAY_CA", "EBAY_AU"):
+            self.assertIn(mp, mps, mp)
+
+
 class TestWorkbookReadingOrder(unittest.TestCase):
     """Andrew's rule, 2026-08-09: card tabs at the front, data at the back.
 
