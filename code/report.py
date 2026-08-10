@@ -176,8 +176,6 @@ def _fill_sheet(ws, opps: list[Opportunity]) -> None:
         l, v = o.listing, o.valuation
         row = i + 1
         tier = _interest_tier(o)
-        if tier in tier_fill:
-            ws.cell(row=row, column=1).fill = tier_fill[tier]
         ltype = ("BIN+OBO" if l.listing_type == "fixed" and l.best_offer
                  else "BIN" if l.listing_type == "fixed" else "AUCTION")
         timing, hl = _timing(l)
@@ -197,6 +195,9 @@ def _fill_sheet(ws, opps: list[Opportunity]) -> None:
             c = ws.cell(row=row, column=col, value=val)
             if i % 2 == 0:
                 c.fill = band
+        # After the zebra banding, or even rows lose their tier colour.
+        if tier in tier_fill:
+            ws.cell(row=row, column=1).fill = tier_fill[tier]
         for col in MONEY_COLS:
             cell = ws.cell(row=row, column=col)
             cell.number_format = _money_fmt(cell.value or 0)
