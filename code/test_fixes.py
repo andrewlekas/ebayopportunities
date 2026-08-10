@@ -4321,7 +4321,8 @@ class TestAuctionHorizonFilter(unittest.TestCase):
         with open(path) as fh:
             cfg = yaml.safe_load(fh) or {}
         self.assertEqual(
-            (cfg.get("filters") or {}).get("max_auction_hours"), 72)
+            (cfg.get("filters") or {}).get("max_auction_hours"), 120,
+            "5-day horizon chosen 2026-08-09: 72h dropped 3,693 auctions")
         self.assertEqual(
             (cfg.get("algorithm") or {}).get("auction_pricing"), "live")
 

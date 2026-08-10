@@ -109,6 +109,38 @@ class TestStructuredSportsTargets(unittest.TestCase):
         sup = entries["1940 Gum Inc Superman #1"]
         self.assertEqual((sup["grade_min"], sup["grade_max"]), (1.0, 5.0))
 
+    def test_a_zero_floor_survives_the_watchlist_merge(self):
+        """0.0 == False in Python, so the old merge guard read a zero
+        value_floor_override as unset and let a watchlist duplicate
+        clobber it to its own floor. Flagged 2026-07-31, bit today."""
+        from targets import configured_scan_entries
+        config = {
+            "set_needs": [{"query": "1999 1st Edition Pokemon Trader PSA 9",
+                           "min_value": 0}],
+            "watchlist": [{"query": "1999 1st Edition Pokemon Trader PSA 9",
+                           "value_floor_override": 9999.0}],
+        }
+        entries = configured_scan_entries(config)
+        trader = [e for e in entries if "Trader" in e["query"]]
+        self.assertEqual(len(trader), 1)
+        self.assertEqual(trader[0]["value_floor_override"], 0.0,
+                         "the explicit zero floor must win")
+
+    def test_structured_targets_carry_the_target_floor(self):
+        """Grant Hill PSA 8-10 was valued 154 times on 2026-08-09 and never
+        reached the tab: his cards are \$20-\$300 against a \$500 category
+        floor. A named target is an explicit want, so it carries its own
+        \$100 floor (per-target min_value overrides)."""
+        from targets import sports_target_entries
+        config = {"sports_targets": [
+            {"player": "Grant Hill", "year": 1994, "grade_band": [8, 10]},
+            {"player": "Frank Gore", "year": 2005, "grade_band": [8, 10],
+             "min_value": 250},
+        ]}
+        e = sports_target_entries(config)
+        self.assertEqual(e[0]["value_floor_override"], 100.0)
+        self.assertEqual(e[1]["value_floor_override"], 250.0)
+
     def test_set_need_merges(self):
         config = {
             "sports_targets": [{

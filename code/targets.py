@@ -13,6 +13,12 @@ from valuation.comps import grade_conflict, grade_info, years_in
 from valuation.identity import identity_of
 
 
+# The browse floor for EXPLICIT targets. The category floors ($500) exist
+# to keep broad-query junk off the tabs; a named card the scan was told to
+# hunt is not that. $100 still keeps true commons out.
+STRUCTURED_TARGET_FLOOR = 100.0
+
+
 def _query_for_target(target: dict, grade: str | None = None) -> str:
     parts = [
         str(target.get("year") or "").strip(),
@@ -108,6 +114,14 @@ def sports_target_entries(config: dict,
                 "target_identity": query,
                 "grade_min": band[0],
                 "grade_max": band[1],
+                # An explicit target is a named want, not the broad junk the
+                # $500 category floor exists to hide - Grant Hill PSA 8-10
+                # was valued 154 times on 2026-08-09 and never reached the
+                # tab because his cards are $20-$300. Named targets use
+                # their own floor (Andrew chose $100), overridable per
+                # target with min_value. Action gates are untouched.
+                "value_floor_override": float(
+                    target.get("min_value", STRUCTURED_TARGET_FLOOR)),
                 "resale_channel": target.get("resale_channel"),
                 "max_buy_price": target.get("max_buy_price"),
             })
@@ -183,7 +197,13 @@ def configured_scan_entries(config: dict) -> list[dict]:
             continue
         current = out[positions[key]]
         for field, value in entry.items():
-            if field not in current or current[field] in (None, "", False):
+            # `in (None, "", False)` was the old test, and 0.0 == False in
+            # Python - so a set-need's value_floor_override of 0.0 (or a
+            # target floor lowered to 0) read as "unset" and was clobbered
+            # by whatever the watchlist duplicate carried. Only genuinely
+            # missing values may be filled in.
+            if field not in current or current[field] is None \
+                    or current[field] == "":
                 current[field] = value
         current["priority"] = bool(
             current.get("priority") or entry.get("priority"))
