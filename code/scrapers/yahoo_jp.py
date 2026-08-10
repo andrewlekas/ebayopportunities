@@ -41,7 +41,15 @@ from .base import BaseScraper, note_api
 
 log = logging.getLogger(__name__)
 
-SEARCH_URL = "https://buyee.jp/item/search/query/{q}?translationType=98"
+# 2026-08-09: Buyee's search moved behind an AWS WAF JavaScript challenge
+# (debug/buyee_last_failure.html is the challenge page itself), which no
+# HTTP client can pass - that was the entire story of 71/71 parse failures.
+# Search therefore goes to Yahoo! Auctions Japan DIRECTLY, which serves
+# plain server-rendered HTML, and Buyee remains only the PURCHASE route:
+# its item pages reconstruct from the auction ID, so the proxy-fee
+# economics are unchanged.
+SEARCH_URL = "https://auctions.yahoo.co.jp/search/search?p={q}"
+BUYEE_SEARCH_URL = "https://buyee.jp/item/search/query/{q}?translationType=98"
 AUCTION_ID_RE = re.compile(r"/jdirectitems/auction/([a-z]\d+)", re.I)
 PAYPAY_ID_RE = re.compile(r"/paypayfleamarket/item/([a-z0-9]+)", re.I)
 YEN_RE = re.compile(r"([\d,]+)\s*YEN", re.I)
@@ -89,6 +97,69 @@ class YahooJpScraper(BaseScraper):
         self.import_duty_rate = jp.get("import_duty_rate", 0.15)
         self.fx_spread_rate = jp.get("fx_spread_rate", 0.03)
 
+    def _parse_yahoo_direct(self, cards, query: str, q: str,
+                            max_results: int) -> list:
+        """Parse auctions.yahoo.co.jp search results.
+
+        Everything needed rides on data- attributes of one anchor per
+        card (verified against debug/yahoo_direct.html, 2026-08-09):
+
+            data-auction-id="p1240099548"
+            data-auction-title="1円〜 トップサン ポケモンカード リザードン..."
+            data-auction-price="103999"          # yen, integer
+            data-cl-params="...;st:1786180722;end:1786623522;..."
+
+        The end epoch means REAL end times - something the Buyee page
+        never gave us. The purchase link is Buyee's item page for the
+        same auction ID, so the human still buys through the proxy the
+        economics are modelled on.
+        """
+        from datetime import datetime, timezone
+        out = []
+        for it in cards:
+            a = it.select_one("a[data-auction-id]")
+            if not a:
+                continue
+            aid = a.get("data-auction-id", "").strip()
+            title = a.get("data-auction-title", "").strip()
+            if not (aid and title):
+                continue
+            try:
+                yen = float(a.get("data-auction-price", "0") or 0)
+            except ValueError:
+                continue
+            if yen <= 0:
+                continue
+            end_time = None
+            m = re.search(r"end:(\d{9,11})", a.get("data-cl-params", ""))
+            if m:
+                end_time = datetime.fromtimestamp(int(m.group(1)),
+                                                  tz=timezone.utc)
+            bid_el = it.select_one(".Product__bid")
+            try:
+                bids = int(bid_el.get_text(strip=True)) if bid_el else 0
+            except ValueError:
+                bids = 0
+            out.append(Listing(
+                site="yahoo_jp", title=title,
+                url=f"https://buyee.jp/item/jdirectitems/auction/{aid}",
+                current_price=round(yen * self.fx_jpy, 2),
+                shipping=self.domestic_shipping,
+                buyer_fees=self.proxy_fee,
+                international_shipping=self.international_shipping,
+                insurance_rate=self.insurance_rate,
+                import_duty_rate=self.import_duty_rate,
+                fx_spread_rate=self.fx_spread_rate,
+                bid_count=bids, end_time=end_time,
+                listing_id=aid, query=query,
+                listing_type="auction", marketplace="YAHOO_JP",
+                currency="JPY",
+            ))
+            if len(out) >= max_results:
+                break
+        note_api("yahoo_jp/parse", "ok")
+        return out
+
     _captured_this_run = False
 
     def _capture_failure(self, html: str, q: str) -> None:
@@ -120,10 +191,14 @@ class YahooJpScraper(BaseScraper):
                         query_ja: str | None = None) -> list[Listing]:
         q = query_ja or translate_query(query)
         r = self._get(SEARCH_URL.format(q=quote(q)),
-                      headers={"Accept-Language": "en"})
+                      headers={"Accept-Language": "ja,en;q=0.8"})
         if not r:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
+        cards = soup.select("li.Product")
+        if cards:
+            return self._parse_yahoo_direct(cards, query, q, max_results)
+        # legacy Buyee markup, kept for the day their WAF opens again
         cards = soup.select("li.itemCard")
         if not cards:
             # empty page or layout change: make it loud enough to notice,

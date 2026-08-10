@@ -5204,6 +5204,56 @@ class TestSourceOnboarding(unittest.TestCase):
             self.assertEqual(rows[0].shipping, 12)
 
 
+class TestYahooJpDirectParser(unittest.TestCase):
+    """2026-08-09: Buyee's search moved behind an AWS WAF JS challenge and
+    the lane silently produced nothing for weeks (71/71 parse failures).
+    Search now goes to auctions.yahoo.co.jp directly; Buyee is only the
+    purchase link, rebuilt from the auction ID.
+
+    The fixture is a REAL card from debug/yahoo_direct.html, so this test
+    is a parser canary: when Yahoo redesigns, this fails instead of the
+    scan silently losing Japan again."""
+
+    CARD = """<li class="Product"><div class="Product__image"><a
+        class="Product__imageLink" data-auction-id="p1240099548"
+        data-auction-title="1円〜 トップサン ポケモンカード リザードン 1995年"
+        data-auction-price="103999"
+        data-cl-params="_cl_vmodule:aal;st:1786180722;end:1786623522;prat:0;"
+        href="https://auctions.yahoo.co.jp/jp/auction/p1240099548"></a></div>
+        <div class="Product__otherInfo"><div class="Product__bidWrap">
+        <dd class="Product__bid">32</dd></div></div></li>"""
+
+    def _scraper(self):
+        from scrapers.yahoo_jp import YahooJpScraper
+        return YahooJpScraper({"fx_rates": {"JPY": 0.0063},
+                               "japan": {"proxy_fee_usd": 10.0}})
+
+    def test_parses_the_real_captured_card(self):
+        from bs4 import BeautifulSoup
+        sc = self._scraper()
+        cards = BeautifulSoup(self.CARD, "html.parser").select("li.Product")
+        out = sc._parse_yahoo_direct(cards, "Topsun Charizard", "q", 10)
+        self.assertEqual(len(out), 1)
+        l = out[0]
+        self.assertEqual(l.listing_id, "p1240099548")
+        self.assertEqual(l.bid_count, 32)
+        self.assertAlmostEqual(l.current_price, 103999 * 0.0063, places=2)
+        self.assertEqual(l.url,
+                         "https://buyee.jp/item/jdirectitems/auction/"
+                         "p1240099548",
+                         "the human still buys through Buyee - the proxy "
+                         "the economics are modelled on")
+        self.assertIsNotNone(l.end_time,
+                             "the end epoch rides in data-cl-params")
+        self.assertEqual(l.marketplace, "YAHOO_JP")
+
+    def test_search_url_is_yahoo_not_buyee(self):
+        import scrapers.yahoo_jp as m
+        self.assertIn("auctions.yahoo.co.jp", m.SEARCH_URL)
+        self.assertIn("buyee.jp", m.BUYEE_SEARCH_URL,
+                      "kept for the day their WAF opens again")
+
+
 class TestEbayInternationalLane(unittest.TestCase):
     """2026-08-09: Andrew wants more venues. EBAY_GB/DE were configured for
     weeks but every marketplace rendered as plain 'ebay', so nobody could
